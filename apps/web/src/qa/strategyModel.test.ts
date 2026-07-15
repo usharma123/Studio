@@ -11,6 +11,7 @@ describe("QA strategy views", () => {
         revision: 3,
         generationStatus: "complete",
         reviewStatus: "pending",
+        rejectionNote: "Address the blocking scope comment.",
         sections: [
           {
             id: "risks",
@@ -39,6 +40,7 @@ describe("QA strategy views", () => {
     const view = strategyDocumentView(snapshot);
     expect(view?.sections.map((section) => section.id)).toEqual(["scope", "risks"]);
     expect(view?.coverage).toMatchObject({ percent: 75, uncoveredRequirementIds: ["br-4"] });
+    expect(view?.rejectionNote).toBe("Address the blocking scope comment.");
   });
 
   it("groups replies under their persisted parent comment", () => {

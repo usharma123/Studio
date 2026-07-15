@@ -18,6 +18,9 @@ import { selectActiveRightPanel, useRightPanelStore } from "../rightPanelStore";
 import { useThreadSelectionStore } from "../threadSelectionStore";
 import { stackedThreadToast, toastManager } from "~/components/ui/toast";
 import { primaryServerKeybindingsAtom } from "~/state/server";
+import { DESKTOP_DEVELOPMENT_PROFILE } from "~/branding";
+import { useEnterpriseModeStore } from "~/enterpriseModeStore";
+import { isQaApproverDesktopProfile } from "~/qa/qaRole";
 
 function ChatRouteGlobalShortcuts() {
   const clearSelection = useThreadSelectionStore((state) => state.clearSelection);
@@ -25,6 +28,8 @@ function ChatRouteGlobalShortcuts() {
   const { activeDraftThread, activeThread, defaultProjectRef, handleNewThread, routeThreadRef } =
     useHandleNewThread();
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
+  const isQaMode = useEnterpriseModeStore((state) => state.mode === "qa");
+  const isQaApproverUi = isQaMode && isQaApproverDesktopProfile(DESKTOP_DEVELOPMENT_PROFILE);
   const terminalOpen = useTerminalUiStateStore((state) =>
     routeThreadRef
       ? selectThreadTerminalUiState(state.terminalUiStateByThreadKey, routeThreadRef).terminalOpen
@@ -63,6 +68,7 @@ function ChatRouteGlobalShortcuts() {
       if (command === "chat.newLocal") {
         event.preventDefault();
         event.stopPropagation();
+        if (isQaApproverUi) return;
         void startNewLocalThreadFromContext({
           activeDraftThread,
           activeThread: activeThread ?? undefined,
@@ -75,6 +81,7 @@ function ChatRouteGlobalShortcuts() {
       if (command === "chat.new") {
         event.preventDefault();
         event.stopPropagation();
+        if (isQaApproverUi) return;
         void startNewThreadFromContext({
           activeDraftThread,
           activeThread: activeThread ?? undefined,
@@ -137,6 +144,7 @@ function ChatRouteGlobalShortcuts() {
     activeThread,
     clearSelection,
     handleNewThread,
+    isQaApproverUi,
     keybindings,
     defaultProjectRef,
     previewOpen,

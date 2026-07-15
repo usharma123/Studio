@@ -87,6 +87,7 @@ import {
   getEnterpriseModeDefinition,
   useEnterpriseModeStore,
 } from "../enterpriseModeStore";
+import { isQaApproverDesktopProfile } from "../qa/qaRole";
 import { useOpenPrLink } from "../lib/openPullRequestLink";
 import { isTerminalFocused } from "../lib/terminalFocus";
 import { isMacPlatform } from "../lib/utils";
@@ -2661,8 +2662,12 @@ export function SidebarBrand() {
   const mode = useEnterpriseModeStore((state) => state.mode);
   const selectMode = useEnterpriseModeStore((state) => state.selectMode);
   const selectedMode = getEnterpriseModeDefinition(mode);
-  const desktopRole = DESKTOP_DEVELOPMENT_PROFILE
-    ? DESKTOP_ROLE_PRESENTATION[DESKTOP_DEVELOPMENT_PROFILE]
+  const presentedDesktopProfile =
+    mode === "qa" && DESKTOP_DEVELOPMENT_PROFILE === "root"
+      ? "qa:approver"
+      : DESKTOP_DEVELOPMENT_PROFILE;
+  const desktopRole = presentedDesktopProfile
+    ? DESKTOP_ROLE_PRESENTATION[presentedDesktopProfile]
     : null;
   return (
     <Menu>
@@ -2824,6 +2829,7 @@ const SidebarProjectsContent = function SidebarProjectsContent(props: SidebarPro
   const navigate = useNavigate();
   const { isMobile, setOpenMobile } = useSidebar();
   const isQaMode = useEnterpriseModeStore((state) => state.mode === "qa");
+  const isQaApproverUi = isQaMode && isQaApproverDesktopProfile(DESKTOP_DEVELOPMENT_PROFILE);
   const closeMobileSidebar = () => {
     if (isMobile) {
       setOpenMobile(false);
@@ -2869,24 +2875,26 @@ const SidebarProjectsContent = function SidebarProjectsContent(props: SidebarPro
     <SidebarContent className="gap-0">
       <SidebarGroup className="px-2 pt-2 pb-2">
         <SidebarMenu>
-          <SidebarMenuItem>
-            <SidebarMenuButton
-              size="sm"
-              className="gap-2.5 px-2 py-2 text-foreground/85 hover:bg-accent hover:text-foreground"
-              data-testid="sidebar-new-task"
-              onClick={handleNewTaskClick}
-            >
-              <SquarePenIcon className="size-4 text-muted-foreground/80" />
-              <span className="flex-1 truncate text-left text-sm">
-                {isQaMode ? "New QA release" : "New task"}
-              </span>
-              {newThreadShortcutLabel ? (
-                <Kbd className="h-4 min-w-0 rounded-sm px-1.5 text-[10px]">
-                  {newThreadShortcutLabel}
-                </Kbd>
-              ) : null}
-            </SidebarMenuButton>
-          </SidebarMenuItem>
+          {!isQaApproverUi ? (
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                size="sm"
+                className="gap-2.5 px-2 py-2 text-foreground/85 hover:bg-accent hover:text-foreground"
+                data-testid="sidebar-new-task"
+                onClick={handleNewTaskClick}
+              >
+                <SquarePenIcon className="size-4 text-muted-foreground/80" />
+                <span className="flex-1 truncate text-left text-sm">
+                  {isQaMode ? "New QA release" : "New task"}
+                </span>
+                {newThreadShortcutLabel ? (
+                  <Kbd className="h-4 min-w-0 rounded-sm px-1.5 text-[10px]">
+                    {newThreadShortcutLabel}
+                  </Kbd>
+                ) : null}
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          ) : null}
           <SidebarMenuItem>
             <CommandDialogTrigger
               render={
@@ -2970,24 +2978,26 @@ const SidebarProjectsContent = function SidebarProjectsContent(props: SidebarPro
               onProjectGroupingModeChange={handleProjectGroupingModeChange}
               onThreadPreviewCountChange={handleThreadPreviewCountChange}
             />
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <button
-                    type="button"
-                    aria-label={isQaMode ? "Create QA project" : "Add project"}
-                    data-testid="sidebar-add-project-trigger"
-                    className="inline-flex h-6 min-w-6 cursor-pointer items-center justify-center rounded-md px-[calc(--spacing(1)-1px)] text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
-                    onClick={openAddProject}
-                  />
-                }
-              >
-                <FolderPlusIcon className="size-3.5" />
-              </TooltipTrigger>
-              <TooltipPopup side="right">
-                {isQaMode ? "Create QA project" : "Add project"}
-              </TooltipPopup>
-            </Tooltip>
+            {!isQaApproverUi ? (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      type="button"
+                      aria-label={isQaMode ? "Create QA project" : "Add project"}
+                      data-testid="sidebar-add-project-trigger"
+                      className="inline-flex h-6 min-w-6 cursor-pointer items-center justify-center rounded-md px-[calc(--spacing(1)-1px)] text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
+                      onClick={openAddProject}
+                    />
+                  }
+                >
+                  <FolderPlusIcon className="size-3.5" />
+                </TooltipTrigger>
+                <TooltipPopup side="right">
+                  {isQaMode ? "Create QA project" : "Add project"}
+                </TooltipPopup>
+              </Tooltip>
+            ) : null}
           </div>
         </div>
 

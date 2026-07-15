@@ -1,4 +1,4 @@
-import type { QaReleaseSnapshot } from "@t3tools/contracts";
+import type { QaReleaseSnapshot, QaReviewThread } from "@t3tools/contracts";
 import {
   AlertTriangle,
   Check,
@@ -22,15 +22,31 @@ import {
 } from "../scenarioModel";
 import type { QaStageTabId } from "../stageRouting";
 import { WorkbookGrid, type WorkbookColumn } from "../WorkbookGrid";
+import {
+  AnchoredReviewThreads,
+  type QaReviewThreadActions,
+  type QaReviewThreadPermissions,
+} from "../AnchoredReviewThreads";
+import { openBlockingReviewThreadIds } from "../reviewThreadUi";
 
 interface ScenarioStageProps {
   readonly snapshot: QaReleaseSnapshot;
   readonly selectedTab: QaStageTabId;
-  readonly readOnly: boolean;
+  readonly artifactReadOnly: boolean;
+  readonly canSubmit: boolean;
+  readonly canReview: boolean;
+  readonly reviewThreads: readonly QaReviewThread[];
+  readonly reviewActions: QaReviewThreadActions;
+  readonly reviewPermissions: QaReviewThreadPermissions;
   readonly busy: boolean;
   readonly onSaveScenarios: (scenarios: readonly ScenarioRowView[]) => Promise<void>;
   readonly onSubmit: () => Promise<boolean>;
-  readonly onReview: (decision: "approved" | "rejected", note?: string) => Promise<boolean>;
+  readonly onReview: (
+    decision: "approved" | "changes_requested",
+    summary?: string,
+    blockingCommentIds?: readonly string[],
+  ) => Promise<boolean>;
+  readonly onJumpToScenario: (scenarioId: string) => void;
 }
 
 const SCENARIO_COLUMNS: readonly WorkbookColumn<ScenarioRowView>[] = [
@@ -179,7 +195,7 @@ export function ScenarioStage(props: ScenarioStageProps) {
         rows={plan.scenarios}
         columns={SCENARIO_COLUMNS}
         getRowId={(row) => row.id}
-        readOnly={props.readOnly}
+        readOnly={props.artifactReadOnly}
         onSave={props.onSaveScenarios}
         emptyState="The release agent has not produced scenarios yet."
       />
@@ -255,8 +271,9 @@ function ScenarioCoverage(props: {
 
 function ScenarioReview(props: ScenarioStageProps & { readonly plan: ScenarioPlanView }) {
   const [confirmingApproval, setConfirmingApproval] = useState(false);
-  const [rejectionNote, setRejectionNote] = useState("");
+  const [changesSummary, setChangesSummary] = useState("");
   const coverage = scenarioCoverage(props.snapshot, props.plan.scenarios);
+  const openBlockingIds = openBlockingReviewThreadIds(props.reviewThreads);
   return (
     <div className="grid gap-3">
       <section className="overflow-hidden rounded-xl border bg-card shadow-sm">
@@ -268,22 +285,25 @@ function ScenarioReview(props: ScenarioStageProps & { readonly plan: ScenarioPla
           </span>
         </div>
         {props.plan.scenarios.map((scenario) => (
-          <div
+          <AnchoredReviewThreads
             key={scenario.id}
-            className="flex items-start gap-3 border-b px-4 py-3 last:border-b-0"
-          >
-            <span className="font-mono text-[10px] text-muted-foreground">
-              {scenario.externalId}
-            </span>
-            <div className="min-w-0 flex-1">
-              <p className="text-xs font-medium">{scenario.title}</p>
-              <p className="mt-0.5 text-[10px] text-muted-foreground">
-                {scenario.type} · {scenario.priority} priority · {scenario.requirementIds.length}{" "}
-                requirements
-              </p>
-            </div>
-            <StatusPill value={scenario.status} />
-          </div>
+            anchor={{
+              type: "scenario",
+              scenarioId: scenario.id,
+              label: `${scenario.externalId} · ${scenario.title}`,
+              quote: scenario.expectedOutcome.slice(0, 10_000) || null,
+            }}
+            threads={props.reviewThreads.filter(
+              (thread) =>
+                thread.anchor.type === "scenario" && thread.anchor.scenarioId === scenario.id,
+            )}
+            permissions={props.reviewPermissions}
+            busy={props.busy}
+            actions={props.reviewActions}
+            onJumpToAnchor={(anchor) => {
+              if (anchor.type === "scenario") props.onJumpToScenario(anchor.scenarioId);
+            }}
+          />
         ))}
       </section>
       <section className="rounded-xl border bg-card p-4 shadow-sm">
@@ -298,19 +318,22 @@ function ScenarioReview(props: ScenarioStageProps & { readonly plan: ScenarioPla
           <StatusPill value={props.plan.reviewStatus} />
         </div>
         {props.plan.rejectionNote ? (
-          <p className="mt-3 rounded-md border border-destructive/20 bg-destructive/5 px-3 py-2 text-[10px] text-destructive">
+          <p className="mt-3 border-l-2 border-amber-500/40 bg-amber-500/5 py-2 pl-2.5 pr-2 text-[10px] text-amber-700 dark:text-amber-300">
             {props.plan.rejectionNote}
           </p>
         ) : null}
-        {!props.readOnly && props.plan.reviewStatus === "draft" ? (
+        {props.canSubmit &&
+        (props.plan.reviewStatus === "draft" || props.plan.reviewStatus === "rejected") ? (
           <div className="mt-4 flex justify-end">
             <Button size="sm" disabled={props.busy} onClick={() => void props.onSubmit()}>
               {props.busy ? <LoaderCircle className="animate-spin" /> : <Send />}
-              Submit scenario plan
+              {props.plan.reviewStatus === "rejected"
+                ? "Re-submit scenario plan"
+                : "Submit scenario plan"}
             </Button>
           </div>
         ) : null}
-        {!props.readOnly && props.plan.reviewStatus === "pending_review" ? (
+        {props.canReview && props.plan.reviewStatus === "pending_review" ? (
           <div className="mt-4 border-t pt-4">
             {confirmingApproval ? (
               <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3">
@@ -324,7 +347,7 @@ function ScenarioReview(props: ScenarioStageProps & { readonly plan: ScenarioPla
                   </Button>
                   <Button
                     size="xs"
-                    disabled={props.busy}
+                    disabled={props.busy || openBlockingIds.length > 0}
                     onClick={() => void props.onReview("approved")}
                   >
                     <Check /> Confirm approval
@@ -334,25 +357,31 @@ function ScenarioReview(props: ScenarioStageProps & { readonly plan: ScenarioPla
             ) : (
               <div className="grid gap-2">
                 <textarea
-                  value={rejectionNote}
-                  aria-label="Scenario-plan rejection note"
-                  placeholder="Reason required when requesting changes"
+                  value={changesSummary}
+                  aria-label="Scenario-plan changes summary"
+                  placeholder="Optional summary"
                   rows={2}
                   className="w-full resize-y rounded-md border bg-background px-3 py-2 text-xs outline-none focus:border-ring"
-                  onChange={(event) => setRejectionNote(event.currentTarget.value)}
+                  onChange={(event) => setChangesSummary(event.currentTarget.value)}
                 />
                 <div className="flex justify-end gap-2">
                   <Button
                     size="xs"
                     variant="outline"
-                    disabled={props.busy || !rejectionNote.trim()}
-                    onClick={() => void props.onReview("rejected", rejectionNote.trim())}
+                    disabled={props.busy || openBlockingIds.length === 0}
+                    onClick={() =>
+                      void props.onReview(
+                        "changes_requested",
+                        changesSummary.trim() || undefined,
+                        openBlockingIds,
+                      )
+                    }
                   >
                     <X /> Request changes
                   </Button>
                   <Button
                     size="xs"
-                    disabled={props.busy}
+                    disabled={props.busy || openBlockingIds.length > 0}
                     onClick={() => setConfirmingApproval(true)}
                   >
                     <Check /> Approve scenario plan
@@ -430,9 +459,10 @@ function EditableSelect<const Value extends string>(props: {
 }
 
 function StatusPill({ value }: { readonly value: string }) {
+  const label = value === "rejected" ? "Changes requested" : value.replaceAll("_", " ");
   return (
     <span className="rounded-full border bg-muted/30 px-2 py-0.5 text-[9px] font-medium capitalize text-muted-foreground">
-      {value.replaceAll("_", " ")}
+      {label}
     </span>
   );
 }

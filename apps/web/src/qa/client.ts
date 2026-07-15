@@ -17,6 +17,16 @@ const releaseSerialConcurrency = {
 
 /** Typed client boundary for the durable QA control plane. */
 export const qaEnvironment = {
+  listAssignedReleases: createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
+    label: "environment-data:qa:assigned-releases",
+    tag: WS_METHODS.qaListAssignedReleases,
+    staleTimeMs: 10_000,
+  }),
+  releaseAccess: createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
+    label: "environment-data:qa:release-access",
+    tag: WS_METHODS.qaGetReleaseAccess,
+    staleTimeMs: 10_000,
+  }),
   snapshot: createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
     label: "environment-data:qa:snapshot",
     tag: WS_METHODS.qaGetSnapshot,
@@ -150,6 +160,41 @@ export const qaEnvironment = {
   review: createEnvironmentRpcCommand(connectionAtomRuntime, {
     label: "environment-data:qa:review",
     tag: WS_METHODS.qaReview,
+    scheduler: qaMutationScheduler,
+    concurrency: releaseSerialConcurrency,
+  }),
+  reviewThreads: createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
+    label: "environment-data:qa:review-threads",
+    tag: WS_METHODS.qaListReviewThreads,
+    staleTimeMs: 1_000,
+  }),
+  addReviewComment: createEnvironmentRpcCommand(connectionAtomRuntime, {
+    label: "environment-data:qa:add-review-comment",
+    tag: WS_METHODS.qaAddReviewComment,
+    scheduler: qaMutationScheduler,
+    concurrency: releaseSerialConcurrency,
+  }),
+  replyReviewComment: createEnvironmentRpcCommand(connectionAtomRuntime, {
+    label: "environment-data:qa:reply-review-comment",
+    tag: WS_METHODS.qaReplyReviewComment,
+    scheduler: qaMutationScheduler,
+    concurrency: releaseSerialConcurrency,
+  }),
+  runReviewCommentAiCheck: createEnvironmentRpcCommand(connectionAtomRuntime, {
+    label: "environment-data:qa:run-review-comment-ai-check",
+    tag: WS_METHODS.qaRunReviewCommentAiCheck,
+    scheduler: qaMutationScheduler,
+    concurrency: releaseSerialConcurrency,
+  }),
+  resolveReviewComment: createEnvironmentRpcCommand(connectionAtomRuntime, {
+    label: "environment-data:qa:resolve-review-comment",
+    tag: WS_METHODS.qaResolveReviewComment,
+    scheduler: qaMutationScheduler,
+    concurrency: releaseSerialConcurrency,
+  }),
+  markReviewRead: createEnvironmentRpcCommand(connectionAtomRuntime, {
+    label: "environment-data:qa:mark-review-read",
+    tag: WS_METHODS.qaMarkReviewRead,
     scheduler: qaMutationScheduler,
     concurrency: releaseSerialConcurrency,
   }),

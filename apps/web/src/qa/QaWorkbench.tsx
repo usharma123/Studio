@@ -1,12 +1,17 @@
 import type {
   ProjectId,
   QaReleaseSnapshot,
+  QaReviewAnchor,
+  QaReviewSeverity,
+  QaReviewThread,
+  QaUiRole,
   QaScript,
   QaTestCase,
   ScopedThreadRef,
 } from "@t3tools/contracts";
+import { AuthQaApproveScope, AuthQaMakeScope } from "@t3tools/contracts";
 import { AlertCircle, LoaderCircle, ShieldCheck, Sparkles } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   type AtomCommandResult,
   squashAtomCommandFailure,
@@ -15,6 +20,7 @@ import { Button } from "~/components/ui/button";
 import { ScrollArea } from "~/components/ui/scroll-area";
 import { useEnvironmentQuery } from "~/state/query";
 import { useAtomCommand } from "~/state/use-atom-command";
+import { DESKTOP_DEVELOPMENT_PROFILE } from "~/branding";
 import { qaEnvironment } from "./client";
 import { qaWorkflowErrorMessage } from "./errorMessage";
 import { QaStageHeader } from "./QaStageHeader";
@@ -27,6 +33,8 @@ import {
   type QaStageId,
   type QaStageTabId,
 } from "./stageRouting";
+import { qaUiRoleFromDesktopProfile } from "./qaRole";
+import type { QaReviewThreadActions, QaReviewThreadPermissions } from "./AnchoredReviewThreads";
 import { IntakeStage } from "./stages/IntakeStage";
 import { RequirementsStage } from "./stages/RequirementsStage";
 import { ReadinessStage } from "./stages/ReadinessStage";
@@ -55,6 +63,7 @@ type BusyAction =
   | "test-case"
   | "script"
   | "readiness"
+  | "review-thread"
   | null;
 export function QaWorkbench(props: QaWorkbenchProps) {
   return (
@@ -72,6 +81,12 @@ function useQaThreadWorkbenchContent(props: QaWorkbenchProps) {
     },
   });
   const query = useEnvironmentQuery(queryAtom);
+  const access = useEnvironmentQuery(
+    qaEnvironment.releaseAccess({
+      environmentId: props.threadRef.environmentId,
+      input: { threadId: props.threadRef.threadId },
+    }),
+  );
   const [latestSnapshot, setLatestSnapshot] = useState<QaReleaseSnapshot | null>(null);
   const [busy, setBusy] = useState<BusyAction>(null);
   const [error, setError] = useState<string | null>(null);
@@ -99,15 +114,6 @@ function useQaThreadWorkbenchContent(props: QaWorkbenchProps) {
   const updateStrategySection = useAtomCommand(qaEnvironment.updateStrategySection, {
     reportFailure: false,
   });
-  const addStrategyComment = useAtomCommand(qaEnvironment.addStrategyComment, {
-    reportFailure: false,
-  });
-  const replyStrategyComment = useAtomCommand(qaEnvironment.replyStrategyComment, {
-    reportFailure: false,
-  });
-  const resolveStrategyComment = useAtomCommand(qaEnvironment.resolveStrategyComment, {
-    reportFailure: false,
-  });
   const submitStrategy = useAtomCommand(qaEnvironment.submitStrategy, {
     reportFailure: false,
   });
@@ -115,6 +121,21 @@ function useQaThreadWorkbenchContent(props: QaWorkbenchProps) {
     reportFailure: false,
   });
   const review = useAtomCommand(qaEnvironment.review, {
+    reportFailure: false,
+  });
+  const addReviewComment = useAtomCommand(qaEnvironment.addReviewComment, {
+    reportFailure: false,
+  });
+  const replyReviewComment = useAtomCommand(qaEnvironment.replyReviewComment, {
+    reportFailure: false,
+  });
+  const runReviewCommentAiCheck = useAtomCommand(qaEnvironment.runReviewCommentAiCheck, {
+    reportFailure: false,
+  });
+  const resolveReviewComment = useAtomCommand(qaEnvironment.resolveReviewComment, {
+    reportFailure: false,
+  });
+  const markReviewRead = useAtomCommand(qaEnvironment.markReviewRead, {
     reportFailure: false,
   });
   const snapshot = newestSnapshot(
@@ -168,6 +189,102 @@ function useQaThreadWorkbenchContent(props: QaWorkbenchProps) {
           ...panelState,
           viewedStage,
         });
+  const fallbackUiRole = qaUiRoleFromDesktopProfile(DESKTOP_DEVELOPMENT_PROFILE);
+  const uiRole: QaUiRole = access.data?.uiRole ?? fallbackUiRole;
+  const canMake =
+    uiRole === "maker" &&
+    (access.data
+      ? access.data.capabilities.includes(AuthQaMakeScope)
+      : DESKTOP_DEVELOPMENT_PROFILE === "qa:maker");
+  const canApprove =
+    uiRole === "approver" &&
+    (access.data
+      ? access.data.capabilities.includes(AuthQaApproveScope)
+      : DESKTOP_DEVELOPMENT_PROFILE === "qa:approver" || DESKTOP_DEVELOPMENT_PROFILE === "root");
+  const stageHistoryReadOnly = snapshot ? isStageReadOnly(snapshot, viewedStage) : true;
+  const reviewArtifact =
+    viewedStage === "strategy" && snapshot?.strategy
+      ? { kind: "strategy" as const, id: snapshot.strategy.id }
+      : viewedStage === "scenarios" && snapshot?.scenarioPlan
+        ? {
+            kind: "scenario_plan" as const,
+            id: snapshot.scenarioPlan.id,
+          }
+        : null;
+  const reviewThreads = useEnvironmentQuery(
+    reviewArtifact
+      ? qaEnvironment.reviewThreads({
+          environmentId: props.threadRef.environmentId,
+          input: {
+            threadId: props.threadRef.threadId,
+            artifactKind: reviewArtifact.kind,
+            artifactId: reviewArtifact.id,
+          },
+        })
+      : null,
+  );
+  const approverDefaultRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (uiRole !== "approver" || (viewedStage !== "strategy" && viewedStage !== "scenarios")) {
+      return;
+    }
+    const key = `${props.threadRef.environmentId}:${props.threadRef.threadId}:${viewedStage}`;
+    if (approverDefaultRef.current === key) return;
+    approverDefaultRef.current = key;
+    selectTab(props.threadRef, viewedStage, "review");
+  }, [props.threadRef, selectTab, uiRole, viewedStage]);
+  const activeAiRun = reviewThreads.data?.reviewThreads.some(
+    (thread) => thread.latestAiRun?.status === "queued" || thread.latestAiRun?.status === "running",
+  );
+  useEffect(() => {
+    if (!activeAiRun) return;
+    const interval = window.setInterval(() => {
+      reviewThreads.refresh();
+      query.refresh();
+    }, 2_000);
+    return () => window.clearInterval(interval);
+  }, [activeAiRun, query.refresh, reviewThreads.refresh]);
+  const terminalAiRunMarker = reviewThreads.data?.reviewThreads
+    .map((thread) => thread.latestAiRun)
+    .flatMap((run) =>
+      run?.status === "completed" || run?.status === "failed"
+        ? [`${run.id}:${run.status}:${run.completedAt ?? "terminal"}`]
+        : [],
+    )
+    .join("|");
+  useEffect(() => {
+    if (terminalAiRunMarker) query.refresh();
+  }, [query.refresh, terminalAiRunMarker]);
+  const markingReadRef = useRef(new Set<string>());
+  useEffect(() => {
+    if (selectedTab !== "review" || !reviewThreads.data) return;
+    for (const thread of reviewThreads.data.reviewThreads) {
+      const latestEntry = thread.entries.at(-1);
+      if (!latestEntry) continue;
+      const marker = `${thread.id}:${latestEntry.id}`;
+      if (thread.unreadCount === 0 || markingReadRef.current.has(marker)) continue;
+      const throughEntryId = latestEntry.id;
+      markingReadRef.current.add(marker);
+      void markReviewRead({
+        environmentId: props.threadRef.environmentId,
+        input: {
+          threadId: props.threadRef.threadId,
+          reviewThreadId: thread.id,
+          throughEntryId,
+        },
+      }).then((result) => {
+        if (result._tag === "Success") reviewThreads.refresh();
+        else markingReadRef.current.delete(marker);
+      });
+    }
+  }, [
+    markReviewRead,
+    props.threadRef.environmentId,
+    props.threadRef.threadId,
+    reviewThreads.data,
+    reviewThreads.refresh,
+    selectedTab,
+  ]);
   const runMutation = async (
     kind: NonNullable<BusyAction>,
     execute: () => Promise<AtomCommandResult<QaReleaseSnapshot, unknown>>,
@@ -278,60 +395,10 @@ function useQaThreadWorkbenchContent(props: QaWorkbenchProps) {
           threadId: props.threadRef.threadId,
           strategyId: strategy.id,
           sectionId,
-          expectedRevision: strategy.revision,
+          expectedRevision: snapshot.revision,
           patch: {
             content,
           },
-        },
-      }),
-    );
-    return next !== null;
-  };
-  const handleAddStrategyComment = async (sectionId: string, body: string) => {
-    const strategy = snapshot?.strategy;
-    if (!strategy) return false;
-    const next = await runStrategyMutation(() =>
-      addStrategyComment({
-        environmentId: props.threadRef.environmentId,
-        input: {
-          threadId: props.threadRef.threadId,
-          strategyId: strategy.id,
-          sectionId,
-          expectedRevision: strategy.revision,
-          body,
-        },
-      }),
-    );
-    return next !== null;
-  };
-  const handleReplyStrategyComment = async (commentId: string, body: string) => {
-    const strategy = snapshot?.strategy;
-    if (!strategy) return false;
-    const next = await runStrategyMutation(() =>
-      replyStrategyComment({
-        environmentId: props.threadRef.environmentId,
-        input: {
-          threadId: props.threadRef.threadId,
-          strategyId: strategy.id,
-          commentId,
-          expectedRevision: strategy.revision,
-          body,
-        },
-      }),
-    );
-    return next !== null;
-  };
-  const handleResolveStrategyComment = async (commentId: string) => {
-    const strategy = snapshot?.strategy;
-    if (!strategy) return false;
-    const next = await runStrategyMutation(() =>
-      resolveStrategyComment({
-        environmentId: props.threadRef.environmentId,
-        input: {
-          threadId: props.threadRef.threadId,
-          strategyId: strategy.id,
-          commentId,
-          expectedRevision: strategy.revision,
         },
       }),
     );
@@ -346,13 +413,17 @@ function useQaThreadWorkbenchContent(props: QaWorkbenchProps) {
         input: {
           threadId: props.threadRef.threadId,
           strategyId: strategy.id,
-          expectedRevision: strategy.revision,
+          expectedRevision: snapshot.revision,
         },
       }),
     );
     return next !== null;
   };
-  const handleReviewStrategy = async (decision: "approved" | "rejected", note?: string) => {
+  const handleReviewStrategy = async (
+    decision: "approved" | "changes_requested",
+    summary?: string,
+    blockingCommentIds?: readonly string[],
+  ) => {
     const strategy = snapshot?.strategy;
     if (!strategy) return false;
     const next = await runStrategyMutation(() =>
@@ -361,18 +432,100 @@ function useQaThreadWorkbenchContent(props: QaWorkbenchProps) {
         input: {
           threadId: props.threadRef.threadId,
           strategyId: strategy.id,
-          expectedRevision: strategy.revision,
+          expectedRevision: snapshot.revision,
           decision,
-          ...(note
-            ? {
-                note,
-              }
+          ...(decision === "changes_requested" && blockingCommentIds
+            ? { blockingCommentIds: [...blockingCommentIds] }
             : {}),
+          ...(summary ? { summary } : {}),
         },
       }),
     );
     if (next && decision === "approved") await props.onKickoffAgent(next);
     return next !== null;
+  };
+  const reviewThreadById = (reviewThreadId: string): QaReviewThread | null =>
+    reviewThreads.data?.reviewThreads.find((thread) => thread.id === reviewThreadId) ?? null;
+  const runReviewThreadMutation = async (
+    execute: () => Promise<{ readonly _tag: string; readonly value?: unknown }>,
+  ): Promise<boolean> => {
+    setBusy("review-thread");
+    setError(null);
+    const result = await execute();
+    setBusy(null);
+    if (result._tag !== "Success" || !result.value) {
+      setError("The review-thread action could not be saved. Refresh and try again.");
+      return false;
+    }
+    const mutationSnapshot = (result.value as { readonly snapshot?: QaReleaseSnapshot }).snapshot;
+    if (mutationSnapshot) setLatestSnapshot(mutationSnapshot);
+    else query.refresh();
+    reviewThreads.refresh();
+    return true;
+  };
+  const reviewThreadActions: QaReviewThreadActions = {
+    add: async (anchor: QaReviewAnchor, severity: QaReviewSeverity, body: string) => {
+      if (!reviewArtifact || !snapshot) return false;
+      return runReviewThreadMutation(() =>
+        addReviewComment({
+          environmentId: props.threadRef.environmentId,
+          input: {
+            threadId: props.threadRef.threadId,
+            artifactKind: reviewArtifact.kind,
+            artifactId: reviewArtifact.id,
+            expectedRevision: snapshot.revision,
+            anchor,
+            severity,
+            body,
+          },
+        }),
+      );
+    },
+    reply: async (reviewThreadId, body) => {
+      const thread = reviewThreadById(reviewThreadId);
+      if (!thread || !snapshot) return false;
+      return runReviewThreadMutation(() =>
+        replyReviewComment({
+          environmentId: props.threadRef.environmentId,
+          input: {
+            threadId: props.threadRef.threadId,
+            reviewThreadId,
+            expectedRevision: snapshot.revision,
+            body,
+          },
+        }),
+      );
+    },
+    runAi: async (reviewThreadId) => {
+      const thread = reviewThreadById(reviewThreadId);
+      if (!thread || !snapshot) return false;
+      return runReviewThreadMutation(() =>
+        runReviewCommentAiCheck({
+          environmentId: props.threadRef.environmentId,
+          input: {
+            threadId: props.threadRef.threadId,
+            reviewThreadId,
+            expectedRevision: snapshot.revision,
+          },
+        }),
+      );
+    },
+    resolve: async (reviewThreadId, overrideReason) => {
+      const thread = reviewThreadById(reviewThreadId);
+      if (!thread?.latestAiRun || !snapshot) return false;
+      return runReviewThreadMutation(() =>
+        resolveReviewComment({
+          environmentId: props.threadRef.environmentId,
+          input: {
+            threadId: props.threadRef.threadId,
+            reviewThreadId,
+            aiRunId: thread.latestAiRun!.id,
+            expectedRevision: snapshot.revision,
+            ...(overrideReason ? { overrideReason } : {}),
+          },
+        }),
+      );
+    },
   };
   if (query.isPending && !snapshot) {
     return (
@@ -393,10 +546,16 @@ function useQaThreadWorkbenchContent(props: QaWorkbenchProps) {
             Create a durable release workspace that follows the active QA stage alongside this
             conversation.
           </p>
-          <Button className="mt-4" size="sm" disabled={busy !== null} onClick={handleInitialize}>
-            {busy === "initialize" ? <LoaderCircle className="animate-spin" /> : <Sparkles />}
-            Create release workspace
-          </Button>
+          {canMake ? (
+            <Button className="mt-4" size="sm" disabled={busy !== null} onClick={handleInitialize}>
+              {busy === "initialize" ? <LoaderCircle className="animate-spin" /> : <Sparkles />}
+              Create release workspace
+            </Button>
+          ) : (
+            <p className="mt-3 text-xs text-muted-foreground">
+              The maker has not initialized this release yet.
+            </p>
+          )}
           {query.error || error ? (
             <p className="mt-3 text-xs text-destructive">{query.error ?? error}</p>
           ) : null}
@@ -404,7 +563,16 @@ function useQaThreadWorkbenchContent(props: QaWorkbenchProps) {
       </div>
     );
   }
-  const readOnly = isStageReadOnly(snapshot, viewedStage);
+  const jumpToArtifact = (tab: QaStageTabId, selector: string) => {
+    selectTab(props.threadRef, viewedStage, tab);
+    window.setTimeout(() => {
+      const target = document.querySelector<HTMLElement>(selector);
+      if (!target) return;
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+      target.classList.add("ring-2", "ring-primary/40");
+      window.setTimeout(() => target.classList.remove("ring-2", "ring-primary/40"), 1_500);
+    }, 0);
+  };
   return (
     <ScrollArea className="min-h-0 flex-1 bg-muted/10">
       <div className="mx-auto grid w-full max-w-4xl gap-3 p-3 sm:p-4">
@@ -432,20 +600,36 @@ function useQaThreadWorkbenchContent(props: QaWorkbenchProps) {
           stage={viewedStage}
           selectedTab={selectedTab}
           snapshot={snapshot}
-          readOnly={readOnly}
+          permissions={{
+            stageHistoryReadOnly,
+            canMake,
+            canApprove,
+          }}
+          reviewThreads={reviewThreads.data?.reviewThreads ?? []}
+          reviewThreadsReady={reviewThreads.data !== null && !reviewThreads.isPending}
+          reviewThreadActions={reviewThreadActions}
+          reviewThreadPermissions={{
+            createComment: !stageHistoryReadOnly && canApprove,
+            reply: !stageHistoryReadOnly && canMake,
+            runAi: !stageHistoryReadOnly && canApprove,
+            resolve: !stageHistoryReadOnly && canApprove,
+          }}
           busy={busy}
           onFiles={handleFiles}
           onStartIngestion={handleStartIngestion}
           onReview={handleReview}
           onSaveStrategySection={handleSaveStrategySection}
-          onAddStrategyComment={handleAddStrategyComment}
-          onReplyStrategyComment={handleReplyStrategyComment}
-          onResolveStrategyComment={handleResolveStrategyComment}
           onSubmitStrategy={handleSubmitStrategy}
           onReviewStrategy={handleReviewStrategy}
+          onJumpToStrategySection={(sectionId) =>
+            jumpToArtifact("strategy", `[data-qa-strategy-section-id="${CSS.escape(sectionId)}"]`)
+          }
           onSaveScenarios={scenarioActions.saveScenarios}
           onSubmitScenarioPlan={scenarioActions.submit}
           onReviewScenarioPlan={scenarioActions.review}
+          onJumpToScenario={(scenarioId) =>
+            jumpToArtifact("scenarios", `[data-qa-workbook-row-id="${CSS.escape(scenarioId)}"]`)
+          }
           onSaveTestCases={testCaseActions.saveTestCases}
           onSubmitTestCasePlan={testCaseActions.submit}
           onReviewTestCasePlan={testCaseActions.review}
@@ -477,7 +661,15 @@ interface QaStageContentProps {
   readonly stage: QaStageId;
   readonly selectedTab: QaStageTabId;
   readonly snapshot: QaReleaseSnapshot;
-  readonly readOnly: boolean;
+  readonly permissions: {
+    readonly stageHistoryReadOnly: boolean;
+    readonly canMake: boolean;
+    readonly canApprove: boolean;
+  };
+  readonly reviewThreads: readonly QaReviewThread[];
+  readonly reviewThreadsReady: boolean;
+  readonly reviewThreadActions: QaReviewThreadActions;
+  readonly reviewThreadPermissions: QaReviewThreadPermissions;
   readonly busy: BusyAction;
   readonly onFiles: (files: FileList | null) => Promise<void> | void;
   readonly onStartIngestion: () => Promise<void> | void;
@@ -487,19 +679,23 @@ interface QaStageContentProps {
     decision: "approved" | "rejected",
   ) => Promise<void> | void;
   readonly onSaveStrategySection: (sectionId: string, content: string) => Promise<boolean>;
-  readonly onAddStrategyComment: (sectionId: string, body: string) => Promise<boolean>;
-  readonly onReplyStrategyComment: (commentId: string, body: string) => Promise<boolean>;
-  readonly onResolveStrategyComment: (commentId: string) => Promise<boolean>;
   readonly onSubmitStrategy: () => Promise<boolean>;
-  readonly onReviewStrategy: (decision: "approved" | "rejected", note?: string) => Promise<boolean>;
+  readonly onReviewStrategy: (
+    decision: "approved" | "changes_requested",
+    summary?: string,
+    blockingCommentIds?: readonly string[],
+  ) => Promise<boolean>;
+  readonly onJumpToStrategySection: (sectionId: string) => void;
   readonly onSaveScenarios: (
     scenarios: readonly import("./scenarioModel").ScenarioRowView[],
   ) => Promise<void>;
   readonly onSubmitScenarioPlan: () => Promise<boolean>;
   readonly onReviewScenarioPlan: (
-    decision: "approved" | "rejected",
-    note?: string,
+    decision: "approved" | "changes_requested",
+    summary?: string,
+    blockingCommentIds?: readonly string[],
   ) => Promise<boolean>;
+  readonly onJumpToScenario: (scenarioId: string) => void;
   readonly onSaveTestCases: (testCases: readonly QaTestCase[]) => Promise<void>;
   readonly onSubmitTestCasePlan: () => Promise<boolean>;
   readonly onReviewTestCasePlan: (
@@ -518,13 +714,15 @@ interface QaStageContentProps {
   ) => Promise<boolean>;
 }
 function QaStageContent(props: QaStageContentProps) {
+  const makerReadOnly = props.permissions.stageHistoryReadOnly || !props.permissions.canMake;
+  const approverReadOnly = props.permissions.stageHistoryReadOnly || !props.permissions.canApprove;
   if (props.stage === "intake") {
     return (
       <IntakeStage
         snapshot={props.snapshot}
         selectedTab={props.selectedTab}
-        readOnly={props.readOnly}
-        busy={props.busy}
+        readOnly={makerReadOnly}
+        busy={props.busy === "review-thread" ? null : props.busy}
         onFiles={props.onFiles}
         onStartIngestion={props.onStartIngestion}
       />
@@ -535,7 +733,7 @@ function QaStageContent(props: QaStageContentProps) {
       <RequirementsStage
         snapshot={props.snapshot}
         selectedTab={props.selectedTab}
-        readOnly={props.readOnly}
+        readOnly={approverReadOnly}
         reviewing={props.busy === "review"}
         onReview={props.onReview}
       />
@@ -546,14 +744,21 @@ function QaStageContent(props: QaStageContentProps) {
       <StrategyStage
         snapshot={props.snapshot}
         selectedTab={props.selectedTab}
-        readOnly={props.readOnly}
-        busy={props.busy === "strategy"}
+        artifactReadOnly={makerReadOnly}
+        canSubmit={!props.permissions.stageHistoryReadOnly && props.permissions.canMake}
+        canReview={
+          !props.permissions.stageHistoryReadOnly &&
+          props.permissions.canApprove &&
+          props.reviewThreadsReady
+        }
+        reviewThreads={props.reviewThreads}
+        reviewActions={props.reviewThreadActions}
+        reviewPermissions={props.reviewThreadPermissions}
+        busy={props.busy === "strategy" || props.busy === "review-thread"}
         onSaveSection={props.onSaveStrategySection}
-        onAddComment={props.onAddStrategyComment}
-        onReplyComment={props.onReplyStrategyComment}
-        onResolveComment={props.onResolveStrategyComment}
         onSubmit={props.onSubmitStrategy}
         onReview={props.onReviewStrategy}
+        onJumpToSection={props.onJumpToStrategySection}
       />
     );
   }
@@ -562,11 +767,21 @@ function QaStageContent(props: QaStageContentProps) {
       <ScenarioStage
         snapshot={props.snapshot}
         selectedTab={props.selectedTab}
-        readOnly={props.readOnly}
-        busy={props.busy === "scenario"}
+        artifactReadOnly={makerReadOnly}
+        canSubmit={!props.permissions.stageHistoryReadOnly && props.permissions.canMake}
+        canReview={
+          !props.permissions.stageHistoryReadOnly &&
+          props.permissions.canApprove &&
+          props.reviewThreadsReady
+        }
+        reviewThreads={props.reviewThreads}
+        reviewActions={props.reviewThreadActions}
+        reviewPermissions={props.reviewThreadPermissions}
+        busy={props.busy === "scenario" || props.busy === "review-thread"}
         onSaveScenarios={props.onSaveScenarios}
         onSubmit={props.onSubmitScenarioPlan}
         onReview={props.onReviewScenarioPlan}
+        onJumpToScenario={props.onJumpToScenario}
       />
     );
   }
@@ -575,7 +790,7 @@ function QaStageContent(props: QaStageContentProps) {
       <TestCaseStage
         snapshot={props.snapshot}
         selectedTab={props.selectedTab}
-        readOnly={props.readOnly}
+        readOnly={props.selectedTab === "review" ? approverReadOnly : makerReadOnly}
         busy={props.busy === "test-case"}
         onSaveTestCases={props.onSaveTestCases}
         onSubmit={props.onSubmitTestCasePlan}
@@ -588,7 +803,7 @@ function QaStageContent(props: QaStageContentProps) {
       <ScriptStage
         snapshot={props.snapshot}
         selectedTab={props.selectedTab}
-        readOnly={props.readOnly}
+        readOnly={props.selectedTab === "review" ? approverReadOnly : makerReadOnly}
         busy={props.busy === "script"}
         onSaveScripts={props.onSaveScripts}
         onSubmit={props.onSubmitScriptPlan}
@@ -601,7 +816,7 @@ function QaStageContent(props: QaStageContentProps) {
       <ReadinessStage
         snapshot={props.snapshot}
         selectedTab={props.selectedTab}
-        readOnly={props.readOnly}
+        readOnly={approverReadOnly}
         busy={props.busy === "readiness"}
         onReview={props.onReviewReadiness}
       />

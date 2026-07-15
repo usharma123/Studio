@@ -127,6 +127,7 @@ export function WorkbookGrid<Row>(props: WorkbookGridProps<Row>) {
                 return (
                   <tr
                     key={rowId}
+                    data-qa-workbook-row-id={rowId}
                     className="border-b bg-background last:border-b-0 hover:bg-muted/20"
                   >
                     {props.columns.map((column) => (

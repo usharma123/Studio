@@ -36,6 +36,7 @@ export interface StrategyDocumentView {
   readonly coverage: StrategyCoverageView;
   readonly updatedAt: string | null;
   readonly approvedAt: string | null;
+  readonly rejectionNote: string | null;
 }
 
 type UnknownRecord = Readonly<Record<string, unknown>>;
@@ -96,6 +97,7 @@ export function strategyDocumentView(snapshot: QaReleaseSnapshot): StrategyDocum
     },
     updatedAt: typeof strategy.updatedAt === "string" ? strategy.updatedAt : null,
     approvedAt: typeof strategy.approvedAt === "string" ? strategy.approvedAt : null,
+    rejectionNote: typeof strategy.rejectionNote === "string" ? strategy.rejectionNote : null,
   };
 }
 

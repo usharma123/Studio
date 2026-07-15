@@ -1,12 +1,10 @@
-import type { QaReleaseSnapshot } from "@t3tools/contracts";
+import type { QaReleaseSnapshot, QaReviewThread } from "@t3tools/contracts";
 import {
   AlertTriangle,
   Check,
   CheckCircle2,
   FileText,
   LoaderCircle,
-  MessageSquare,
-  Reply,
   Save,
   Send,
   ShieldCheck,
@@ -16,28 +14,38 @@ import {
 import { useState } from "react";
 
 import { Button } from "~/components/ui/button";
-import { cn } from "~/lib/utils";
 
 import {
-  strategyCommentThreads,
   strategyDocumentView,
-  type StrategyCommentView,
   type StrategyDocumentView,
   type StrategySectionView,
 } from "../strategyModel";
 import type { QaStageTabId } from "../stageRouting";
+import {
+  AnchoredReviewThreads,
+  type QaReviewThreadActions,
+  type QaReviewThreadPermissions,
+} from "../AnchoredReviewThreads";
+import { openBlockingReviewThreadIds } from "../reviewThreadUi";
 
 interface StrategyStageProps {
   readonly snapshot: QaReleaseSnapshot;
   readonly selectedTab: QaStageTabId;
-  readonly readOnly: boolean;
+  readonly artifactReadOnly: boolean;
+  readonly canSubmit: boolean;
+  readonly canReview: boolean;
+  readonly reviewThreads: readonly QaReviewThread[];
+  readonly reviewActions: QaReviewThreadActions;
+  readonly reviewPermissions: QaReviewThreadPermissions;
   readonly busy: boolean;
   readonly onSaveSection: (sectionId: string, content: string) => Promise<boolean>;
-  readonly onAddComment: (sectionId: string, body: string) => Promise<boolean>;
-  readonly onReplyComment: (commentId: string, body: string) => Promise<boolean>;
-  readonly onResolveComment: (commentId: string) => Promise<boolean>;
   readonly onSubmit: () => Promise<boolean>;
-  readonly onReview: (decision: "approved" | "rejected", note?: string) => Promise<boolean>;
+  readonly onReview: (
+    decision: "approved" | "changes_requested",
+    summary?: string,
+    blockingCommentIds?: readonly string[],
+  ) => Promise<boolean>;
+  readonly onJumpToSection: (sectionId: string) => void;
 }
 
 export function StrategyStage(props: StrategyStageProps) {
@@ -83,7 +91,7 @@ function StrategyDocument(props: StrategyStageProps & { readonly strategy: Strat
         <StrategySectionEditor
           key={`${section.id}:${section.updatedAt ?? "initial"}`}
           section={section}
-          readOnly={props.readOnly}
+          readOnly={props.artifactReadOnly}
           busy={props.busy}
           onSave={props.onSaveSection}
         />
@@ -107,7 +115,10 @@ function StrategySectionEditor(props: {
   const content = draftContent ?? props.section.content;
   const changed = draftContent !== null && draftContent !== props.section.content;
   return (
-    <section className="overflow-hidden rounded-xl border bg-card shadow-sm">
+    <section
+      data-qa-strategy-section-id={props.section.id}
+      className="scroll-mt-4 overflow-hidden rounded-xl border bg-card shadow-sm"
+    >
       <div className="flex items-center gap-2 border-b bg-muted/10 px-4 py-2.5">
         <span className="flex size-5 items-center justify-center rounded bg-muted text-[9px] font-semibold">
           {props.section.position + 1}
@@ -203,28 +214,37 @@ function StrategyCoverage(props: {
 
 function StrategyReview(props: StrategyStageProps & { readonly strategy: StrategyDocumentView }) {
   const [confirmingApproval, setConfirmingApproval] = useState(false);
-  const [rejectionNote, setRejectionNote] = useState("");
-  const threads = strategyCommentThreads(props.strategy.comments);
+  const [changesSummary, setChangesSummary] = useState("");
+  const openBlockingIds = openBlockingReviewThreadIds(props.reviewThreads);
   return (
     <div className="grid gap-3">
       <section className="overflow-hidden rounded-xl border bg-card shadow-sm">
         <div className="flex items-center gap-2 border-b px-4 py-3">
-          <MessageSquare className="size-4 text-muted-foreground" />
+          <ShieldCheck className="size-4 text-muted-foreground" />
           <h3 className="text-sm font-medium">Review comments</h3>
           <span className="ml-auto text-[10px] text-muted-foreground">
-            {props.strategy.comments.filter((comment) => !comment.resolved).length} open
+            {props.reviewThreads.filter((thread) => thread.status === "open").length} open
           </span>
         </div>
         {props.strategy.sections.map((section) => (
-          <SectionComments
+          <AnchoredReviewThreads
             key={section.id}
-            section={section}
-            comments={threads.filter((thread) => thread.comment.sectionId === section.id)}
-            readOnly={props.readOnly}
+            anchor={{
+              type: "strategy_section",
+              sectionId: section.id,
+              label: section.title,
+              quote: section.content.slice(0, 10_000) || null,
+            }}
+            threads={props.reviewThreads.filter(
+              (thread) =>
+                thread.anchor.type === "strategy_section" && thread.anchor.sectionId === section.id,
+            )}
+            permissions={props.reviewPermissions}
             busy={props.busy}
-            onAdd={props.onAddComment}
-            onReply={props.onReplyComment}
-            onResolve={props.onResolveComment}
+            actions={props.reviewActions}
+            onJumpToAnchor={(anchor) => {
+              if (anchor.type === "strategy_section") props.onJumpToSection(anchor.sectionId);
+            }}
           />
         ))}
       </section>
@@ -239,14 +259,23 @@ function StrategyReview(props: StrategyStageProps & { readonly strategy: Strateg
           </div>
           <StatusPill value={props.strategy.reviewStatus} />
         </div>
-        {!props.readOnly && props.strategy.reviewStatus === "draft" ? (
+        {props.strategy.rejectionNote ? (
+          <p className="mt-3 border-l-2 border-amber-500/40 bg-amber-500/5 py-2 pl-2.5 pr-2 text-[10px] text-amber-700 dark:text-amber-300">
+            {props.strategy.rejectionNote}
+          </p>
+        ) : null}
+        {props.canSubmit &&
+        (props.strategy.reviewStatus === "draft" || props.strategy.reviewStatus === "rejected") ? (
           <div className="mt-4 flex justify-end">
             <Button size="sm" disabled={props.busy} onClick={() => void props.onSubmit()}>
-              <Send /> Submit for review
+              <Send />
+              {props.strategy.reviewStatus === "rejected"
+                ? "Re-submit for review"
+                : "Submit for review"}
             </Button>
           </div>
         ) : null}
-        {!props.readOnly && props.strategy.reviewStatus === "pending_review" ? (
+        {props.canReview && props.strategy.reviewStatus === "pending_review" ? (
           <div className="mt-4 border-t pt-4">
             {confirmingApproval ? (
               <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3">
@@ -260,7 +289,7 @@ function StrategyReview(props: StrategyStageProps & { readonly strategy: Strateg
                   </Button>
                   <Button
                     size="xs"
-                    disabled={props.busy}
+                    disabled={props.busy || openBlockingIds.length > 0}
                     onClick={() => void props.onReview("approved")}
                   >
                     <Check /> Confirm approval
@@ -270,25 +299,31 @@ function StrategyReview(props: StrategyStageProps & { readonly strategy: Strateg
             ) : (
               <div className="grid gap-2">
                 <textarea
-                  value={rejectionNote}
-                  aria-label="Strategy rejection note"
-                  placeholder="Reason required when requesting changes"
+                  value={changesSummary}
+                  aria-label="Strategy changes summary"
+                  placeholder="Optional summary"
                   rows={2}
                   className="w-full resize-y rounded-md border bg-background px-3 py-2 text-xs outline-none focus:border-ring"
-                  onChange={(event) => setRejectionNote(event.currentTarget.value)}
+                  onChange={(event) => setChangesSummary(event.currentTarget.value)}
                 />
                 <div className="flex justify-end gap-2">
                   <Button
                     size="xs"
                     variant="outline"
-                    disabled={props.busy || !rejectionNote.trim()}
-                    onClick={() => void props.onReview("rejected", rejectionNote.trim())}
+                    disabled={props.busy || openBlockingIds.length === 0}
+                    onClick={() =>
+                      void props.onReview(
+                        "changes_requested",
+                        changesSummary.trim() || undefined,
+                        openBlockingIds,
+                      )
+                    }
                   >
                     <X /> Request changes
                   </Button>
                   <Button
                     size="xs"
-                    disabled={props.busy}
+                    disabled={props.busy || openBlockingIds.length > 0}
                     onClick={() => setConfirmingApproval(true)}
                   >
                     <Check /> Approve strategy
@@ -303,136 +338,11 @@ function StrategyReview(props: StrategyStageProps & { readonly strategy: Strateg
   );
 }
 
-function SectionComments(props: {
-  readonly section: StrategySectionView;
-  readonly comments: ReturnType<typeof strategyCommentThreads>;
-  readonly readOnly: boolean;
-  readonly busy: boolean;
-  readonly onAdd: (sectionId: string, body: string) => Promise<boolean>;
-  readonly onReply: (commentId: string, body: string) => Promise<boolean>;
-  readonly onResolve: (commentId: string) => Promise<boolean>;
-}) {
-  return (
-    <div className="border-b px-4 py-3 last:border-b-0">
-      <h4 className="text-xs font-medium">{props.section.title}</h4>
-      <div className="mt-2 grid gap-2">
-        {props.comments.map(({ comment, replies }) => (
-          <CommentThread
-            key={comment.id}
-            comment={comment}
-            replies={replies}
-            readOnly={props.readOnly}
-            busy={props.busy}
-            onReply={props.onReply}
-            onResolve={props.onResolve}
-          />
-        ))}
-        {!props.readOnly ? (
-          <CommentComposer
-            placeholder="Add a section comment"
-            disabled={props.busy}
-            onSend={(body) => props.onAdd(props.section.id, body)}
-          />
-        ) : null}
-      </div>
-    </div>
-  );
-}
-
-function CommentThread(props: {
-  readonly comment: StrategyCommentView;
-  readonly replies: readonly StrategyCommentView[];
-  readonly readOnly: boolean;
-  readonly busy: boolean;
-  readonly onReply: (commentId: string, body: string) => Promise<boolean>;
-  readonly onResolve: (commentId: string) => Promise<boolean>;
-}) {
-  return (
-    <div className={cn("rounded-lg border p-3", props.comment.resolved && "opacity-60")}>
-      <CommentBody comment={props.comment} />
-      {props.replies.map((reply) => (
-        <div key={reply.id} className="ml-4 mt-2 border-l pl-3">
-          <CommentBody comment={reply} />
-        </div>
-      ))}
-      {!props.readOnly && !props.comment.resolved ? (
-        <div className="mt-2 grid gap-2 border-t pt-2">
-          <CommentComposer
-            compact
-            placeholder="Reply"
-            disabled={props.busy}
-            onSend={(body) => props.onReply(props.comment.id, body)}
-          />
-          <Button
-            className="justify-self-end"
-            size="xs"
-            variant="ghost"
-            disabled={props.busy}
-            onClick={() => void props.onResolve(props.comment.id)}
-          >
-            <CheckCircle2 /> Resolve
-          </Button>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function CommentBody({ comment }: { readonly comment: StrategyCommentView }) {
-  return (
-    <div>
-      <div className="flex items-center gap-2 text-[9px] text-muted-foreground">
-        <span className="font-medium text-foreground">{comment.author}</span>
-        {comment.resolved ? <span>Resolved</span> : null}
-      </div>
-      {comment.quote ? (
-        <blockquote className="mt-1 border-l-2 pl-2 text-[10px] italic text-muted-foreground">
-          {comment.quote}
-        </blockquote>
-      ) : null}
-      <p className="mt-1 text-[11px] leading-4">{comment.body}</p>
-    </div>
-  );
-}
-
-function CommentComposer(props: {
-  readonly placeholder: string;
-  readonly compact?: boolean;
-  readonly disabled: boolean;
-  readonly onSend: (body: string) => Promise<boolean>;
-}) {
-  const [body, setBody] = useState("");
-  return (
-    <div className="flex items-end gap-2">
-      <textarea
-        value={body}
-        rows={props.compact ? 1 : 2}
-        placeholder={props.placeholder}
-        aria-label={props.placeholder}
-        className="min-h-8 flex-1 resize-y rounded-md border bg-background px-2 py-1.5 text-[11px] outline-none focus:border-ring"
-        onChange={(event) => setBody(event.currentTarget.value)}
-      />
-      <Button
-        size="icon-xs"
-        variant="outline"
-        disabled={props.disabled || !body.trim()}
-        aria-label={`Send ${props.placeholder.toLowerCase()}`}
-        onClick={() => {
-          void props.onSend(body.trim()).then((saved) => {
-            if (saved) setBody("");
-          });
-        }}
-      >
-        {props.compact ? <Reply /> : <Send />}
-      </Button>
-    </div>
-  );
-}
-
 function StatusPill({ value }: { readonly value: string }) {
+  const label = value === "rejected" ? "Changes requested" : value.replaceAll("_", " ");
   return (
     <span className="rounded-full border bg-muted/30 px-2 py-0.5 text-[9px] font-medium capitalize text-muted-foreground">
-      {value.replaceAll("_", " ")}
+      {label}
     </span>
   );
 }

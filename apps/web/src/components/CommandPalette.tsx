@@ -126,6 +126,8 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 import { ComposerHandleContext, useComposerHandleContext } from "../composerHandleContext";
 import type { ChatComposerHandle } from "./chat/ChatComposer";
 import { useEnterpriseModeStore } from "../enterpriseModeStore";
+import { DESKTOP_DEVELOPMENT_PROFILE } from "../branding";
+import { isQaApproverDesktopProfile } from "../qa/qaRole";
 import { QaProjectCreationDialog } from "./QaProjectCreationDialog";
 const EMPTY_BROWSE_ENTRIES: FilesystemBrowseResult["entries"] = [];
 function getLocalFileManagerName(platform: string): string {
@@ -381,8 +383,10 @@ export function CommandPalette({ children }: { children: ReactNode }) {
   });
   const setOpen = (open: boolean) => dispatch({ _tag: "SetOpen", open });
   const isQaMode = useEnterpriseModeStore((store) => store.mode === "qa");
+  const isQaApproverUi = isQaMode && isQaApproverDesktopProfile(DESKTOP_DEVELOPMENT_PROFILE);
   const [qaProjectCreationOpen, setQaProjectCreationOpen] = useState(false);
   const openAddProject = () => {
+    if (isQaApproverUi) return;
     if (isQaMode) {
       setQaProjectCreationOpen(true);
       return;
@@ -425,7 +429,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
   return (
     <OpenAddProjectCommandPaletteProvider openAddProject={openAddProject}>
       <ComposerHandleContext value={composerHandleRef}>
-        {isQaMode ? (
+        {isQaMode && !isQaApproverUi ? (
           <QaProjectCreationDialog
             open={qaProjectCreationOpen}
             onOpenChange={setQaProjectCreationOpen}
@@ -473,6 +477,7 @@ function useOpenCommandPaletteDialogContent(props: {
   const navigate = useNavigate();
   const { clearOpenIntent, openIntent, setOpen } = props;
   const isQaMode = useEnterpriseModeStore((store) => store.mode === "qa");
+  const isQaApproverUi = isQaMode && isQaApproverDesktopProfile(DESKTOP_DEVELOPMENT_PROFILE);
   const composerHandleRef = useComposerHandleContext();
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
@@ -905,7 +910,7 @@ function useOpenCommandPaletteDialogContent(props: {
     return () => window.clearTimeout(task);
   }, [openIntent]);
   const actionItems: Array<CommandPaletteActionItem | CommandPaletteSubmenuItem> = [];
-  if (projects.length > 0) {
+  if (projects.length > 0 && !isQaApproverUi) {
     const activeProjectTitle = currentProjectId
       ? (projectTitleById.get(currentProjectId) ?? null)
       : null;
@@ -941,41 +946,42 @@ function useOpenCommandPaletteDialogContent(props: {
       groups: [{ value: "projects", label: "Projects", items: projectThreadItems }],
     });
   }
-  actionItems.push({
-    kind: "action",
-    value: "action:add-project",
-    searchTerms: isQaMode
-      ? ["create QA project", "new QA project", "release", "quality assurance"]
-      : [
-          "add project",
-          "folder",
-          "directory",
-          "browse",
-          "clone",
-          "remote",
-          "repository",
-          "repo",
-          "git",
-          "github",
-          "gitlab",
-          "bitbucket",
-          "azure",
-          "devops",
-          "url",
-          "environment",
-        ],
-    title: isQaMode ? "Create QA project" : "Add project",
-    icon: <FolderPlusIcon className={ITEM_ICON_CLASS} />,
-    keepOpen: true,
-    run: async () => {
-      if (isQaMode) {
-        setOpen(false);
-        props.openQaProjectCreation();
-        return;
-      }
-      openAddProjectFlow();
-    },
-  });
+  if (!isQaApproverUi)
+    actionItems.push({
+      kind: "action",
+      value: "action:add-project",
+      searchTerms: isQaMode
+        ? ["create QA project", "new QA project", "release", "quality assurance"]
+        : [
+            "add project",
+            "folder",
+            "directory",
+            "browse",
+            "clone",
+            "remote",
+            "repository",
+            "repo",
+            "git",
+            "github",
+            "gitlab",
+            "bitbucket",
+            "azure",
+            "devops",
+            "url",
+            "environment",
+          ],
+      title: isQaMode ? "Create QA project" : "Add project",
+      icon: <FolderPlusIcon className={ITEM_ICON_CLASS} />,
+      keepOpen: true,
+      run: async () => {
+        if (isQaMode) {
+          setOpen(false);
+          props.openQaProjectCreation();
+          return;
+        }
+        openAddProjectFlow();
+      },
+    });
   if (!isQaMode && wslAddProjectEnvironmentOption) {
     actionItems.push({
       kind: "action",

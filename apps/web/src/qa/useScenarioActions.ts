@@ -27,7 +27,7 @@ export function useScenarioActions(options: UseScenarioActionsOptions) {
     options.setError(null);
     const saved = await saveScenarioRowsSequentially(
       scenarios,
-      plan.revision,
+      options.snapshot!.revision,
       async (scenario, expectedRevision) => {
         const result = await updateScenario({
           environmentId: options.threadRef.environmentId,
@@ -69,13 +69,17 @@ export function useScenarioActions(options: UseScenarioActionsOptions) {
         input: {
           threadId: options.threadRef.threadId,
           planId: plan.id,
-          expectedRevision: plan.revision,
+          expectedRevision: options.snapshot!.revision,
         },
       }),
     );
     return next !== null;
   };
-  const review = async (decision: "approved" | "rejected", note?: string) => {
+  const review = async (
+    decision: "approved" | "changes_requested",
+    summary?: string,
+    blockingCommentIds?: readonly string[],
+  ) => {
     const plan = options.snapshot?.scenarioPlan;
     if (!plan) return false;
     const next = await runScenarioMutation(options, () =>
@@ -84,13 +88,12 @@ export function useScenarioActions(options: UseScenarioActionsOptions) {
         input: {
           threadId: options.threadRef.threadId,
           planId: plan.id,
-          expectedRevision: plan.revision,
+          expectedRevision: options.snapshot!.revision,
           decision,
-          ...(note
-            ? {
-                note,
-              }
+          ...(decision === "changes_requested" && blockingCommentIds
+            ? { blockingCommentIds: [...blockingCommentIds] }
             : {}),
+          ...(summary ? { summary } : {}),
         },
       }),
     );
@@ -141,7 +144,7 @@ async function saveScenarioRowsSequentially(
   for (const scenario of scenarios) {
     const next = await save(scenario, expectedRevision);
     if (!next) return false;
-    expectedRevision = next.scenarioPlan.revision;
+    expectedRevision = next.snapshot.revision;
     onSaved(next.snapshot);
   }
   return true;
