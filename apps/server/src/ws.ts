@@ -38,6 +38,8 @@ import {
   type OrchestrationShellStreamItem,
   type OrchestrationThreadStreamItem,
   QaOperationError,
+  ProjectId,
+  type QaReviewActor,
   type QaReleaseSnapshot,
   OrchestrationGetFullThreadDiffError,
   OrchestrationGetSnapshotError,
@@ -122,9 +124,11 @@ import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
 import * as QaWorkflow from "./qa/QaWorkflow.ts";
+import * as QaDashboardQuery from "./qa/QaDashboardQuery.ts";
 import * as QaIam from "./qa/QaIam.ts";
 import * as QaDatabase from "./qa/QaDatabase.ts";
 import * as QaReleaseEventBus from "./qa/QaReleaseEventBus.ts";
+import * as QaReviewService from "./qa/QaReviewService.ts";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 const isEnvironmentAuthorizationError = Schema.is(EnvironmentAuthorizationError);
 const isQaOperationError = Schema.is(QaOperationError);
@@ -133,6 +137,23 @@ const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
 function unexpectedCompatibilityError(error: never): never {
   throw new Error(`Unhandled compatibility error: ${String(error)}`);
+}
+
+function mapQaReviewError(error: QaReviewService.QaReviewError): QaOperationError {
+  switch (error.code) {
+    case "not_found":
+      return new QaOperationError({ code: "review_thread_not_found", message: error.message });
+    case "revision_conflict":
+      return new QaOperationError({ code: "release_conflict", message: error.message });
+    case "invalid_anchor":
+      return new QaOperationError({ code: "review_anchor_not_found", message: error.message });
+    case "persistence_failed":
+      return new QaOperationError({ code: "persistence_failed", message: error.message });
+    case "access_denied":
+    case "invalid_input":
+    case "invalid_state":
+      return new QaOperationError({ code: "invalid_workflow_state", message: error.message });
+  }
 }
 
 /** Preserve the setup runner's broader pre-refactor message normalization. */
@@ -316,6 +337,8 @@ const RPC_REQUIRED_SCOPE = new Map<string, RpcRequiredScope>([
   [WS_METHODS.sourceControlLookupRepository, AuthOrchestrationReadScope],
   [WS_METHODS.sourceControlCloneRepository, AuthOrchestrationOperateScope],
   [WS_METHODS.sourceControlPublishRepository, AuthOrchestrationOperateScope],
+  [WS_METHODS.qaListAssignedReleases, AuthQaReadScope],
+  [WS_METHODS.qaGetReleaseAccess, AuthQaReadScope],
   [WS_METHODS.qaGetSnapshot, AuthQaReadScope],
   [WS_METHODS.qaInitializeRelease, AuthQaMakeScope],
   [WS_METHODS.qaUploadDocument, AuthQaMakeScope],
@@ -326,9 +349,9 @@ const RPC_REQUIRED_SCOPE = new Map<string, RpcRequiredScope>([
   [WS_METHODS.qaGetStrategy, AuthQaReadScope],
   [WS_METHODS.qaGenerateStrategy, AuthQaMakeScope],
   [WS_METHODS.qaUpdateStrategySection, AuthQaMakeScope],
-  [WS_METHODS.qaAddStrategyComment, AuthQaMakeScope],
+  [WS_METHODS.qaAddStrategyComment, AuthQaApproveScope],
   [WS_METHODS.qaReplyStrategyComment, AuthQaMakeScope],
-  [WS_METHODS.qaResolveStrategyComment, AuthQaMakeScope],
+  [WS_METHODS.qaResolveStrategyComment, AuthQaApproveScope],
   [WS_METHODS.qaSubmitStrategy, AuthQaMakeScope],
   [WS_METHODS.qaReviewStrategy, AuthQaApproveScope],
   [WS_METHODS.qaGetScenarioPlan, AuthQaReadScope],
@@ -345,6 +368,12 @@ const RPC_REQUIRED_SCOPE = new Map<string, RpcRequiredScope>([
   [WS_METHODS.qaReviewScriptPlan, AuthQaApproveScope],
   [WS_METHODS.qaGetReadiness, AuthQaReadScope],
   [WS_METHODS.qaReviewReadiness, AuthQaApproveScope],
+  [WS_METHODS.qaListReviewThreads, AuthQaReadScope],
+  [WS_METHODS.qaAddReviewComment, AuthQaApproveScope],
+  [WS_METHODS.qaReplyReviewComment, AuthQaMakeScope],
+  [WS_METHODS.qaRunReviewCommentAiCheck, AuthQaApproveScope],
+  [WS_METHODS.qaResolveReviewComment, AuthQaApproveScope],
+  [WS_METHODS.qaMarkReviewRead, AuthQaReadScope],
   [WS_METHODS.projectsListEntries, AuthOrchestrationReadScope],
   [WS_METHODS.projectsReadFile, AuthOrchestrationReadScope],
   [WS_METHODS.projectsSearchEntries, AuthOrchestrationReadScope],
@@ -493,6 +522,8 @@ const makeWsRpcLayer = (
       const processResourceMonitor = yield* ProcessResourceMonitor.ProcessResourceMonitor;
       const relayClient = yield* RelayClient.RelayClient;
       const qaWorkflow = yield* QaWorkflow.QaWorkflow;
+      const qaDashboardQuery = yield* QaDashboardQuery.QaDashboardQuery;
+      const qaReviewService = yield* QaReviewService.QaReviewService;
       const qaIam = yield* QaIam.QaIam;
       const qaDatabase = yield* QaDatabase.QaDatabase;
       const publishQaSnapshot = (
@@ -517,6 +548,32 @@ const makeWsRpcLayer = (
             }),
           ),
           Effect.as(snapshot),
+        );
+      const loadCurrentQaSnapshot = (threadId: ThreadId) =>
+        qaWorkflow.getSnapshot({ threadId }).pipe(
+          Effect.flatMap((snapshot) =>
+            snapshot
+              ? Effect.succeed(snapshot)
+              : Effect.fail(
+                  new QaOperationError({
+                    code: "release_not_found",
+                    message: "The QA release was not found.",
+                  }),
+                ),
+          ),
+        );
+      const publishReviewMutation = <A, R>(
+        threadId: ThreadId,
+        effect: Effect.Effect<A, QaReviewService.QaReviewError, R>,
+      ) =>
+        effect.pipe(
+          Effect.mapError(mapQaReviewError),
+          Effect.flatMap((reviewThread) =>
+            loadCurrentQaSnapshot(threadId).pipe(
+              Effect.flatMap((snapshot) => publishQaSnapshot("review_recorded", snapshot)),
+              Effect.map((snapshot) => ({ reviewThread, snapshot })),
+            ),
+          ),
         );
       const authorizationError = (requiredScope: AuthEnvironmentScope) =>
         new EnvironmentAuthorizationError({
@@ -564,6 +621,69 @@ const makeWsRpcLayer = (
               code: "persistence_failed",
               message: "The QA project could not be registered.",
             });
+      const qaCapabilityScope = (capability: QaIam.QaIamCapability): AuthEnvironmentScope => {
+        switch (capability) {
+          case "qa:make":
+            return AuthQaMakeScope;
+          case "qa:approve":
+            return AuthQaApproveScope;
+          case "qa:chat":
+            return AuthQaChatScope;
+          case "qa:read":
+          case "qa:test-application":
+          default:
+            return AuthQaReadScope;
+        }
+      };
+      const authorizeQaReleaseEffect = <A, E, R>(
+        threadId: ThreadId,
+        capability: QaIam.QaIamCapability,
+        effect: Effect.Effect<A, E, R>,
+      ): Effect.Effect<A, E | QaOperationError | EnvironmentAuthorizationError, R> =>
+        qaIam
+          .authorizeRelease({
+            subject: currentSession.subject,
+            releaseThreadId: threadId,
+            capability,
+          })
+          .pipe(
+            Effect.mapError((cause) =>
+              cause.code === "release_not_found"
+                ? new QaOperationError({
+                    code: "release_not_found",
+                    message: "The QA release was not found.",
+                  })
+                : authorizationError(qaCapabilityScope(capability)),
+            ),
+            Effect.andThen(effect),
+          );
+      const withQaReleaseAccess = <A, E, R>(
+        threadId: ThreadId,
+        capability: QaIam.QaIamCapability,
+        use: (access: QaIam.QaReleaseAccess) => Effect.Effect<A, E, R>,
+      ): Effect.Effect<A, E | QaOperationError | EnvironmentAuthorizationError, R> =>
+        qaIam
+          .authorizeRelease({
+            subject: currentSession.subject,
+            releaseThreadId: threadId,
+            capability,
+          })
+          .pipe(
+            Effect.mapError((cause) =>
+              cause.code === "release_not_found"
+                ? new QaOperationError({
+                    code: "release_not_found",
+                    message: "The QA release was not found.",
+                  })
+                : authorizationError(qaCapabilityScope(capability)),
+            ),
+            Effect.flatMap(use),
+          );
+      const reviewActor = (access: QaIam.QaReleaseAccess): QaReviewActor => ({
+        principalId: access.principal.id,
+        displayName: access.principal.displayName,
+        role: access.role,
+      });
       const authorizeEffect = <A, E, R>(
         requiredScope: RpcRequiredScope,
         effect: Effect.Effect<A, E, R>,
@@ -592,6 +712,15 @@ const makeWsRpcLayer = (
           authorizeEffect(requiredScopeForMethod(method), effect),
           traceAttributes,
         );
+      const observeQaReleaseRpcEffect = <A, E, R>(
+        method: string,
+        threadId: ThreadId,
+        capability: QaIam.QaIamCapability,
+        effect: Effect.Effect<A, E, R>,
+      ) =>
+        observeRpcEffect(method, authorizeQaReleaseEffect(threadId, capability, effect), {
+          "rpc.aggregate": "qa",
+        });
       const observeRpcStream = <A, E, R>(
         method: string,
         stream: Stream.Stream<A, E, R>,
@@ -601,6 +730,17 @@ const makeWsRpcLayer = (
           method,
           authorizeStream(requiredScopeForMethod(method), stream),
           traceAttributes,
+        );
+      const observeQaReleaseRpcStream = <A, E, R>(
+        method: string,
+        threadId: ThreadId,
+        capability: QaIam.QaIamCapability,
+        stream: Stream.Stream<A, E, R>,
+      ) =>
+        observeRpcStream(
+          method,
+          Stream.unwrap(authorizeQaReleaseEffect(threadId, capability, Effect.succeed(stream))),
+          { "rpc.aggregate": "qa" },
         );
       const observeRpcStreamEffect = <A, StreamError, StreamContext, EffectError, EffectContext>(
         method: string,
@@ -1064,15 +1204,129 @@ const makeWsRpcLayer = (
           .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
 
       return WsRpcGroup.of({
+        [WS_METHODS.qaListAssignedReleases]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.qaListAssignedReleases,
+            qaDashboardQuery
+              .listAssignedReleases({
+                subject: currentSession.subject,
+                ...(input.completedSince ? { completedSince: input.completedSince } : {}),
+              })
+              .pipe(Effect.mapError(mapQaReviewError)),
+            { "rpc.aggregate": "qa" },
+          ),
+        [WS_METHODS.qaGetReleaseAccess]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.qaGetReleaseAccess,
+            withQaReleaseAccess(input.threadId, "qa:read", (access) =>
+              Effect.succeed({
+                threadId: input.threadId,
+                projectId: ProjectId.make(access.projectId),
+                principalId: access.principal.id,
+                role: access.role,
+                uiRole: access.role === "qa:maker" ? ("maker" as const) : ("approver" as const),
+                capabilities: access.capabilities.filter(
+                  (capability) => capability !== "qa:test-application",
+                ),
+              }),
+            ),
+            { "rpc.aggregate": "qa" },
+          ),
+        [WS_METHODS.qaListReviewThreads]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.qaListReviewThreads,
+            withQaReleaseAccess(input.threadId, "qa:read", (access) =>
+              qaReviewService
+                .listThreads({
+                  threadId: input.threadId,
+                  principalId: access.principal.id,
+                  ...(input.artifactKind ? { artifactKind: input.artifactKind } : {}),
+                  ...(input.artifactId ? { artifactId: input.artifactId } : {}),
+                })
+                .pipe(Effect.mapError(mapQaReviewError)),
+            ),
+            { "rpc.aggregate": "qa" },
+          ),
+        [WS_METHODS.qaAddReviewComment]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.qaAddReviewComment,
+            withQaReleaseAccess(input.threadId, "qa:approve", (access) =>
+              publishReviewMutation(
+                input.threadId,
+                qaReviewService.addComment(input, reviewActor(access)),
+              ),
+            ),
+            { "rpc.aggregate": "qa" },
+          ),
+        [WS_METHODS.qaReplyReviewComment]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.qaReplyReviewComment,
+            withQaReleaseAccess(input.threadId, "qa:make", (access) =>
+              publishReviewMutation(
+                input.threadId,
+                qaReviewService.reply(input, reviewActor(access)),
+              ),
+            ),
+            { "rpc.aggregate": "qa" },
+          ),
+        [WS_METHODS.qaRunReviewCommentAiCheck]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.qaRunReviewCommentAiCheck,
+            withQaReleaseAccess(input.threadId, "qa:approve", (access) =>
+              qaReviewService.enqueueAiRun(input, reviewActor(access)).pipe(
+                Effect.mapError(mapQaReviewError),
+                Effect.flatMap((run) =>
+                  loadCurrentQaSnapshot(input.threadId).pipe(
+                    Effect.flatMap((snapshot) => publishQaSnapshot("review_recorded", snapshot)),
+                    Effect.as(run),
+                  ),
+                ),
+              ),
+            ),
+            { "rpc.aggregate": "qa" },
+          ),
+        [WS_METHODS.qaResolveReviewComment]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.qaResolveReviewComment,
+            withQaReleaseAccess(input.threadId, "qa:approve", (access) =>
+              publishReviewMutation(
+                input.threadId,
+                qaReviewService.resolve(input, reviewActor(access)),
+              ),
+            ),
+            { "rpc.aggregate": "qa" },
+          ),
+        [WS_METHODS.qaMarkReviewRead]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.qaMarkReviewRead,
+            withQaReleaseAccess(input.threadId, "qa:read", (access) =>
+              qaReviewService
+                .markRead(input, reviewActor(access))
+                .pipe(Effect.mapError(mapQaReviewError)),
+            ),
+            { "rpc.aggregate": "qa" },
+          ),
         [WS_METHODS.qaGetSnapshot]: (input) =>
-          observeRpcEffect(WS_METHODS.qaGetSnapshot, qaWorkflow.getSnapshot(input), {
-            "rpc.aggregate": "qa",
-          }),
+          observeQaReleaseRpcEffect(
+            WS_METHODS.qaGetSnapshot,
+            input.threadId,
+            "qa:read",
+            qaWorkflow.getSnapshot(input),
+          ),
         [WS_METHODS.qaInitializeRelease]: (input) =>
           observeRpcEffect(
             WS_METHODS.qaInitializeRelease,
             (input.projectTitle === undefined
-              ? qaWorkflow.initializeRelease(input)
+              ? qaIam
+                  .authorizeProject({
+                    subject: currentSession.subject,
+                    projectId: input.projectId,
+                    capability: "qa:make",
+                  })
+                  .pipe(
+                    Effect.mapError(mapQaProjectRegistrationError),
+                    Effect.andThen(qaWorkflow.initializeRelease(input)),
+                  )
               : qaDatabase
                   .withTransaction(
                     qaIam
@@ -1100,24 +1354,28 @@ const makeWsRpcLayer = (
             { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaUploadDocument]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaUploadDocument,
+            input.threadId,
+            "qa:make",
             qaWorkflow
               .uploadDocument(input)
               .pipe(Effect.flatMap((snapshot) => publishQaSnapshot("progress", snapshot))),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaStartIngestion]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaStartIngestion,
+            input.threadId,
+            "qa:make",
             qaWorkflow
               .startIngestion(input)
               .pipe(Effect.flatMap((snapshot) => publishQaSnapshot("stage_advanced", snapshot))),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaReview]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaReview,
+            input.threadId,
+            "qa:approve",
             qaWorkflow
               .review(input)
               .pipe(
@@ -1128,11 +1386,12 @@ const makeWsRpcLayer = (
                   ),
                 ),
               ),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaSubscribeRelease]: (input) =>
-          observeRpcStream(
+          observeQaReleaseRpcStream(
             WS_METHODS.qaSubscribeRelease,
+            input.threadId,
+            "qa:read",
             Stream.concat(
               Stream.fromEffect(
                 qaWorkflow.getSnapshot(input).pipe(
@@ -1160,23 +1419,28 @@ const makeWsRpcLayer = (
                 Stream.filter((event) => event.threadId === input.threadId),
               ),
             ),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaUpdateRequirement]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaUpdateRequirement,
+            input.threadId,
+            "qa:make",
             qaWorkflow
               .updateRequirement(input)
               .pipe(Effect.flatMap((snapshot) => publishQaSnapshot("proposal_received", snapshot))),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaGetStrategy]: (input) =>
-          observeRpcEffect(WS_METHODS.qaGetStrategy, qaWorkflow.getStrategy(input), {
-            "rpc.aggregate": "qa",
-          }),
+          observeQaReleaseRpcEffect(
+            WS_METHODS.qaGetStrategy,
+            input.threadId,
+            "qa:read",
+            qaWorkflow.getStrategy(input),
+          ),
         [WS_METHODS.qaGenerateStrategy]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaGenerateStrategy,
+            input.threadId,
+            "qa:make",
             qaWorkflow
               .generateStrategy(input)
               .pipe(
@@ -1184,11 +1448,12 @@ const makeWsRpcLayer = (
                   publishQaSnapshot("stage_started", result.snapshot).pipe(Effect.as(result)),
                 ),
               ),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaUpdateStrategySection]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaUpdateStrategySection,
+            input.threadId,
+            "qa:make",
             qaWorkflow
               .updateStrategySection(input)
               .pipe(
@@ -1196,11 +1461,12 @@ const makeWsRpcLayer = (
                   publishQaSnapshot("proposal_received", result.snapshot).pipe(Effect.as(result)),
                 ),
               ),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaAddStrategyComment]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaAddStrategyComment,
+            input.threadId,
+            "qa:approve",
             qaWorkflow
               .addStrategyComment(input)
               .pipe(
@@ -1208,11 +1474,12 @@ const makeWsRpcLayer = (
                   publishQaSnapshot("review_recorded", result.snapshot).pipe(Effect.as(result)),
                 ),
               ),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaReplyStrategyComment]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaReplyStrategyComment,
+            input.threadId,
+            "qa:make",
             qaWorkflow
               .replyStrategyComment(input)
               .pipe(
@@ -1220,11 +1487,12 @@ const makeWsRpcLayer = (
                   publishQaSnapshot("review_recorded", result.snapshot).pipe(Effect.as(result)),
                 ),
               ),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaResolveStrategyComment]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaResolveStrategyComment,
+            input.threadId,
+            "qa:approve",
             qaWorkflow
               .resolveStrategyComment(input)
               .pipe(
@@ -1232,11 +1500,12 @@ const makeWsRpcLayer = (
                   publishQaSnapshot("review_recorded", result.snapshot).pipe(Effect.as(result)),
                 ),
               ),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaSubmitStrategy]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaSubmitStrategy,
+            input.threadId,
+            "qa:make",
             qaWorkflow
               .submitStrategy(input)
               .pipe(
@@ -1244,30 +1513,36 @@ const makeWsRpcLayer = (
                   publishQaSnapshot("review_recorded", result.snapshot).pipe(Effect.as(result)),
                 ),
               ),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaReviewStrategy]: (input) =>
           observeRpcEffect(
             WS_METHODS.qaReviewStrategy,
-            qaWorkflow
-              .reviewStrategy(input)
-              .pipe(
-                Effect.flatMap((result) =>
-                  publishQaSnapshot(
-                    result.decision === "approved" ? "stage_advanced" : "review_recorded",
-                    result.snapshot,
-                  ).pipe(Effect.as(result)),
+            withQaReleaseAccess(input.threadId, "qa:approve", (access) =>
+              qaWorkflow
+                .reviewStrategy(input, reviewActor(access))
+                .pipe(
+                  Effect.flatMap((result) =>
+                    publishQaSnapshot(
+                      result.decision === "approved" ? "stage_advanced" : "review_recorded",
+                      result.snapshot,
+                    ).pipe(Effect.as(result)),
+                  ),
                 ),
-              ),
+            ),
             { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaGetScenarioPlan]: (input) =>
-          observeRpcEffect(WS_METHODS.qaGetScenarioPlan, qaWorkflow.getScenarioPlan(input), {
-            "rpc.aggregate": "qa",
-          }),
+          observeQaReleaseRpcEffect(
+            WS_METHODS.qaGetScenarioPlan,
+            input.threadId,
+            "qa:read",
+            qaWorkflow.getScenarioPlan(input),
+          ),
         [WS_METHODS.qaUpdateScenario]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaUpdateScenario,
+            input.threadId,
+            "qa:make",
             qaWorkflow
               .updateScenario(input)
               .pipe(
@@ -1275,11 +1550,12 @@ const makeWsRpcLayer = (
                   publishQaSnapshot("proposal_received", result.snapshot).pipe(Effect.as(result)),
                 ),
               ),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaSubmitScenarioPlan]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaSubmitScenarioPlan,
+            input.threadId,
+            "qa:make",
             qaWorkflow
               .submitScenarioPlan(input)
               .pipe(
@@ -1287,30 +1563,36 @@ const makeWsRpcLayer = (
                   publishQaSnapshot("review_recorded", result.snapshot).pipe(Effect.as(result)),
                 ),
               ),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaReviewScenarioPlan]: (input) =>
           observeRpcEffect(
             WS_METHODS.qaReviewScenarioPlan,
-            qaWorkflow
-              .reviewScenarioPlan(input)
-              .pipe(
-                Effect.flatMap((result) =>
-                  publishQaSnapshot(
-                    result.decision === "approved" ? "stage_advanced" : "review_recorded",
-                    result.snapshot,
-                  ).pipe(Effect.as(result)),
+            withQaReleaseAccess(input.threadId, "qa:approve", (access) =>
+              qaWorkflow
+                .reviewScenarioPlan(input, reviewActor(access))
+                .pipe(
+                  Effect.flatMap((result) =>
+                    publishQaSnapshot(
+                      result.decision === "approved" ? "stage_advanced" : "review_recorded",
+                      result.snapshot,
+                    ).pipe(Effect.as(result)),
+                  ),
                 ),
-              ),
+            ),
             { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaGetTestCasePlan]: (input) =>
-          observeRpcEffect(WS_METHODS.qaGetTestCasePlan, qaWorkflow.getTestCasePlan(input), {
-            "rpc.aggregate": "qa",
-          }),
+          observeQaReleaseRpcEffect(
+            WS_METHODS.qaGetTestCasePlan,
+            input.threadId,
+            "qa:read",
+            qaWorkflow.getTestCasePlan(input),
+          ),
         [WS_METHODS.qaUpdateTestCase]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaUpdateTestCase,
+            input.threadId,
+            "qa:make",
             qaWorkflow
               .updateTestCase(input)
               .pipe(
@@ -1318,11 +1600,12 @@ const makeWsRpcLayer = (
                   publishQaSnapshot("proposal_received", result.snapshot).pipe(Effect.as(result)),
                 ),
               ),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaSubmitTestCasePlan]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaSubmitTestCasePlan,
+            input.threadId,
+            "qa:make",
             qaWorkflow
               .submitTestCasePlan(input)
               .pipe(
@@ -1330,11 +1613,12 @@ const makeWsRpcLayer = (
                   publishQaSnapshot("review_recorded", result.snapshot).pipe(Effect.as(result)),
                 ),
               ),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaReviewTestCasePlan]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaReviewTestCasePlan,
+            input.threadId,
+            "qa:approve",
             qaWorkflow
               .reviewTestCasePlan(input)
               .pipe(
@@ -1345,15 +1629,19 @@ const makeWsRpcLayer = (
                   ).pipe(Effect.as(result)),
                 ),
               ),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaGetScriptPlan]: (input) =>
-          observeRpcEffect(WS_METHODS.qaGetScriptPlan, qaWorkflow.getScriptPlan(input), {
-            "rpc.aggregate": "qa",
-          }),
+          observeQaReleaseRpcEffect(
+            WS_METHODS.qaGetScriptPlan,
+            input.threadId,
+            "qa:read",
+            qaWorkflow.getScriptPlan(input),
+          ),
         [WS_METHODS.qaUpdateScript]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaUpdateScript,
+            input.threadId,
+            "qa:make",
             qaWorkflow
               .updateScript(input)
               .pipe(
@@ -1361,11 +1649,12 @@ const makeWsRpcLayer = (
                   publishQaSnapshot("proposal_received", result.snapshot).pipe(Effect.as(result)),
                 ),
               ),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaSubmitScriptPlan]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaSubmitScriptPlan,
+            input.threadId,
+            "qa:make",
             qaWorkflow
               .submitScriptPlan(input)
               .pipe(
@@ -1373,11 +1662,12 @@ const makeWsRpcLayer = (
                   publishQaSnapshot("review_recorded", result.snapshot).pipe(Effect.as(result)),
                 ),
               ),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaReviewScriptPlan]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaReviewScriptPlan,
+            input.threadId,
+            "qa:approve",
             qaWorkflow
               .reviewScriptPlan(input)
               .pipe(
@@ -1388,15 +1678,19 @@ const makeWsRpcLayer = (
                   ).pipe(Effect.as(result)),
                 ),
               ),
-            { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaGetReadiness]: (input) =>
-          observeRpcEffect(WS_METHODS.qaGetReadiness, qaWorkflow.getReadiness(input), {
-            "rpc.aggregate": "qa",
-          }),
+          observeQaReleaseRpcEffect(
+            WS_METHODS.qaGetReadiness,
+            input.threadId,
+            "qa:read",
+            qaWorkflow.getReadiness(input),
+          ),
         [WS_METHODS.qaReviewReadiness]: (input) =>
-          observeRpcEffect(
+          observeQaReleaseRpcEffect(
             WS_METHODS.qaReviewReadiness,
+            input.threadId,
+            "qa:approve",
             qaWorkflow
               .reviewReadiness(input)
               .pipe(
@@ -1407,7 +1701,6 @@ const makeWsRpcLayer = (
                   ).pipe(Effect.as(result)),
                 ),
               ),
-            { "rpc.aggregate": "qa" },
           ),
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
           observeRpcEffect(
@@ -2369,7 +2662,6 @@ export const websocketRpcRouteLayer = Layer.unwrap(
         }).pipe(
           Effect.provide(
             makeWsRpcLayer(session, previewAutomationBroker, qaReleaseEventBus).pipe(
-              Layer.provide(QaWorkflow.layer),
               Layer.provide(QaIam.layer),
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(ProviderMaintenanceRunner.layer),

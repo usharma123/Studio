@@ -21,6 +21,10 @@ import * as QaReleaseEventBus from "./qa/QaReleaseEventBus.ts";
 import * as QaDatabase from "./qa/QaDatabase.ts";
 import * as QaIam from "./qa/QaIam.ts";
 import * as QaIngestionGateway from "./qa/QaIngestionGateway.ts";
+import * as QaWorkflow from "./qa/QaWorkflow.ts";
+import * as QaDashboardQuery from "./qa/QaDashboardQuery.ts";
+import * as QaReviewService from "./qa/QaReviewService.ts";
+import * as QaReviewAiWorker from "./qa/QaReviewAiWorker.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import { ProviderSessionDirectoryLive } from "./provider/Layers/ProviderSessionDirectory.ts";
 import * as ProviderSessionRuntime from "./persistence/ProviderSessionRuntime.ts";
@@ -37,6 +41,7 @@ import * as GitHubCli from "./sourceControl/GitHubCli.ts";
 import * as GitLabCli from "./sourceControl/GitLabCli.ts";
 import * as TextGeneration from "./textGeneration/TextGeneration.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./provider/Layers/ProviderInstanceRegistryHydration.ts";
+import * as ProviderDetachedReview from "./provider/Services/ProviderDetachedReview.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as McpHttpServer from "./mcp/McpHttpServer.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
@@ -161,6 +166,7 @@ const PlatformServicesLive = Layer.unwrap(
 );
 
 const ReactorLayerLive = Layer.empty.pipe(
+  Layer.provideMerge(QaReviewAiWorker.layer),
   Layer.provideMerge(OrchestrationReactorLive),
   Layer.provideMerge(ProviderRuntimeIngestionLive),
   Layer.provideMerge(ProviderCommandReactorLive),
@@ -272,6 +278,9 @@ const ProjectFaviconResolverLayerLive = ProjectFaviconResolver.layer.pipe(
 
 const AuthLayerLive = EnvironmentAuth.layer.pipe(
   Layer.provideMerge(PersistenceLayerLive),
+  Layer.provideMerge(QaWorkflow.layer.pipe(Layer.provide(PersistenceLayerLive))),
+  Layer.provideMerge(QaDashboardQuery.layer),
+  Layer.provideMerge(QaReviewService.layer),
   Layer.provideMerge(QaDatabase.layer),
   Layer.provideMerge(QaIngestionGateway.layer),
   Layer.provide(ServerSecretStore.layer),
@@ -290,7 +299,7 @@ const ProviderRuntimeLayerLive = ProviderSessionReaperLive.pipe(
   Layer.provideMerge(OrchestrationLayerLive),
 );
 
-const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
+const RuntimeCoreInfrastructureLive = ReactorLayerLive.pipe(
   // Core Services
   Layer.provideMerge(CheckpointingLayerLive),
   Layer.provideMerge(SourceControlProviderRegistryLayerLive),
@@ -299,6 +308,7 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   Layer.provideMerge(ProviderRuntimeLayerLive),
   Layer.provideMerge(Layer.mergeAll(TerminalLayerLive, PreviewLayerLive)),
   Layer.provideMerge(PersistenceLayerLive),
+  Layer.provideMerge(QaReleaseEventBus.layer),
   Layer.provideMerge(Keybindings.layer),
   Layer.provideMerge(ProviderRegistryLive),
   // The instance registry is the new routing keystone — text generation,
@@ -306,7 +316,11 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   // through this layer. Built-in drivers come from `BUILT_IN_DRIVERS`;
   // `providerInstances` hydration merges `settings.providers.<kind>`
   // with explicit `providerInstances` entries on boot.
+  Layer.provideMerge(ProviderDetachedReview.layer),
   Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
+);
+
+const RuntimeCoreDependenciesLive = RuntimeCoreInfrastructureLive.pipe(
   // Shared native/canonical NDJSON writers used by both the per-instance
   // drivers (native stream, written from inside each `<X>Adapter`) and
   // `ProviderService` (canonical stream, written after event normalization).
@@ -366,11 +380,7 @@ export const makeRoutesLayer = Layer.mergeAll(
   McpHttpServer.layer.pipe(
     Layer.provide(McpSessionRegistry.layer.pipe(Layer.provide(QaIam.layer))),
   ),
-).pipe(
-  Layer.provide(QaReleaseEventBus.layer),
-  Layer.provide(PreviewAutomationBroker.layer),
-  Layer.provide(browserApiCorsLayer),
-);
+).pipe(Layer.provide(PreviewAutomationBroker.layer), Layer.provide(browserApiCorsLayer));
 
 export const makeServerLayer = Layer.unwrap(
   Effect.gen(function* () {

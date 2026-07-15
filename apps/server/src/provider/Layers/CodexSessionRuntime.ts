@@ -55,6 +55,8 @@ const BENIGN_ERROR_LOG_SNIPPETS = [
   "state db record_discrepancy: find_thread_path_by_id_str_in_subdir, falling_back",
 ];
 const CODEX_APP_SERVER_FORCE_KILL_AFTER = "2 seconds" as const;
+const CODEX_DETACHED_REVIEW_TIMEOUT_MS = 180_000;
+const CODEX_DETACHED_REVIEW_POLL_INTERVAL = "250 millis" as const;
 const RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS = [
   "not found",
   "missing thread",
@@ -134,6 +136,13 @@ export interface CodexThreadSnapshot {
   readonly turns: ReadonlyArray<CodexThreadTurnSnapshot>;
 }
 
+export interface CodexDetachedReviewResult {
+  readonly reviewThreadId: string;
+  readonly turnId: string;
+  readonly output: string;
+  readonly completedAt: number | null;
+}
+
 export interface CodexSessionRuntimeShape {
   readonly start: () => Effect.Effect<ProviderSession, CodexSessionRuntimeError>;
   readonly getSession: Effect.Effect<ProviderSession>;
@@ -145,6 +154,14 @@ export interface CodexSessionRuntimeShape {
   readonly rollbackThread: (
     numTurns: number,
   ) => Effect.Effect<CodexThreadSnapshot, CodexSessionRuntimeError>;
+  /**
+   * Run an app-server review on a detached provider thread. Detached review
+   * notifications remain inside this runtime and are never projected into the
+   * canonical release conversation by ProviderService.
+   */
+  readonly runDetachedReview: (
+    instructions: string,
+  ) => Effect.Effect<CodexDetachedReviewResult, CodexSessionRuntimeError>;
   readonly respondToRequest: (
     requestId: ApprovalRequestId,
     decision: ProviderApprovalDecision,
@@ -162,7 +179,16 @@ export type CodexSessionRuntimeError =
   | CodexSessionRuntimePendingApprovalNotFoundError
   | CodexSessionRuntimePendingUserInputNotFoundError
   | CodexSessionRuntimeInvalidUserInputAnswersError
-  | CodexSessionRuntimeThreadIdMissingError;
+  | CodexSessionRuntimeThreadIdMissingError
+  | CodexSessionRuntimeDetachedReviewError;
+
+export class CodexSessionRuntimeDetachedReviewError extends Schema.TaggedErrorClass<CodexSessionRuntimeDetachedReviewError>()(
+  "CodexSessionRuntimeDetachedReviewError",
+  {
+    detail: Schema.String,
+    reviewThreadId: Schema.optional(Schema.String),
+  },
+) {}
 
 export class CodexSessionRuntimePendingApprovalNotFoundError extends Schema.TaggedErrorClass<CodexSessionRuntimePendingApprovalNotFoundError>()(
   "CodexSessionRuntimePendingApprovalNotFoundError",
@@ -699,6 +725,27 @@ function parseThreadSnapshot(
       items: turn.items,
     })),
   };
+}
+
+type CodexDetachedReviewTurn = {
+  readonly id: string;
+  readonly status: "completed" | "interrupted" | "failed" | "inProgress";
+  readonly completedAt?: number | null;
+  readonly error?: { readonly message: string } | null;
+  readonly items: ReadonlyArray<{
+    readonly type: string;
+    readonly text?: string;
+    readonly phase?: string | null;
+  }>;
+};
+
+function detachedReviewOutput(turn: CodexDetachedReviewTurn): string | null {
+  const messages = turn.items.filter(
+    (item): item is typeof item & { readonly text: string } =>
+      item.type === "agentMessage" && typeof item.text === "string" && item.text.trim().length > 0,
+  );
+  const finalMessage = messages.findLast((item) => item.phase === "final_answer");
+  return (finalMessage ?? messages.at(-1))?.text.trim() ?? null;
 }
 
 export const makeCodexSessionRuntime = (
@@ -1318,6 +1365,72 @@ export const makeCodexSessionRuntime = (
       yield* Queue.shutdown(events);
     });
 
+    const runDetachedReview = Effect.fn("CodexSessionRuntime.runDetachedReview")(function* (
+      instructions: string,
+    ) {
+      const providerThreadId = yield* readProviderThreadId;
+      const started = yield* client.request("review/start", {
+        threadId: providerThreadId,
+        delivery: "detached",
+        target: {
+          type: "custom",
+          instructions,
+        },
+      });
+      const reviewThreadId = started.reviewThreadId;
+      const turnId = started.turn.id;
+      const deadline = (yield* Clock.currentTimeMillis) + CODEX_DETACHED_REVIEW_TIMEOUT_MS;
+
+      const awaitTerminalTurn = Effect.gen(function* () {
+        let current: CodexDetachedReviewTurn = started.turn;
+        while (current.status === "inProgress") {
+          if ((yield* Clock.currentTimeMillis) >= deadline) {
+            return yield* new CodexSessionRuntimeDetachedReviewError({
+              detail: "The detached Codex review timed out.",
+              reviewThreadId,
+            });
+          }
+          yield* Effect.sleep(CODEX_DETACHED_REVIEW_POLL_INTERVAL);
+          const response = yield* client.request("thread/read", {
+            threadId: reviewThreadId,
+            includeTurns: true,
+          });
+          const refreshed = response.thread.turns.find((turn) => turn.id === turnId);
+          if (refreshed) {
+            current = refreshed;
+          }
+        }
+        return current;
+      });
+
+      const terminal = yield* awaitTerminalTurn.pipe(
+        Effect.ensuring(
+          client
+            .request("thread/archive", { threadId: reviewThreadId })
+            .pipe(Effect.ignoreCause({ log: true })),
+        ),
+      );
+      if (terminal.status !== "completed") {
+        return yield* new CodexSessionRuntimeDetachedReviewError({
+          detail: terminal.error?.message ?? `The detached Codex review ${terminal.status}.`,
+          reviewThreadId,
+        });
+      }
+      const output = detachedReviewOutput(terminal);
+      if (!output) {
+        return yield* new CodexSessionRuntimeDetachedReviewError({
+          detail: "The detached Codex review completed without a final response.",
+          reviewThreadId,
+        });
+      }
+      return {
+        reviewThreadId,
+        turnId,
+        output,
+        completedAt: terminal.completedAt ?? null,
+      } satisfies CodexDetachedReviewResult;
+    });
+
     return {
       start,
       getSession: Ref.get(sessionRef),
@@ -1408,6 +1521,7 @@ export const makeCodexSessionRuntime = (
           });
           return parseThreadSnapshot(response);
         }),
+      runDetachedReview,
       respondToRequest: (requestId, decision) =>
         Effect.gen(function* () {
           const pending = (yield* Ref.get(pendingApprovalsRef)).get(requestId);

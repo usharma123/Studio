@@ -144,8 +144,11 @@ import {
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
 import {
+  QaAddReviewCommentInput,
   QaAddStrategyCommentInput,
+  QaAssignedReleaseDashboard,
   QaGenerateStrategyInput,
+  QaGetReleaseAccessInput,
   QaGetScenarioPlanInput,
   QaGetReadinessInput,
   QaGetScriptPlanInput,
@@ -153,17 +156,28 @@ import {
   QaGetStrategyInput,
   QaGetTestCasePlanInput,
   QaInitializeReleaseInput,
+  QaListAssignedReleasesInput,
+  QaListReviewThreadsInput,
+  QaMarkReviewReadInput,
   QaOperationError,
   QaReleaseSnapshot,
+  QaReleaseAccess,
   QaReleaseStreamEvent,
+  QaReplyReviewCommentInput,
   QaReplyStrategyCommentInput,
+  QaResolveReviewCommentInput,
   QaResolveStrategyCommentInput,
   QaReviewInput,
+  QaReviewAiRun,
+  QaReviewMutationResult,
+  QaReviewReadReceipt,
   QaReviewScenarioPlanInput,
   QaReviewReadinessInput,
   QaReviewScriptPlanInput,
   QaReviewStrategyInput,
   QaReviewTestCasePlanInput,
+  QaReviewThreadList,
+  QaRunReviewCommentAiCheckInput,
   QaScenarioPlan,
   QaScenarioPlanApprovalResult,
   QaScenarioPlanMutationResult,
@@ -271,6 +285,8 @@ export const WS_METHODS = {
   sourceControlPublishRepository: "sourceControl.publishRepository",
 
   // Enterprise QA workflow methods
+  qaListAssignedReleases: "qa.listAssignedReleases",
+  qaGetReleaseAccess: "qa.getReleaseAccess",
   qaGetSnapshot: "qa.getSnapshot",
   qaInitializeRelease: "qa.initializeRelease",
   qaUploadDocument: "qa.uploadDocument",
@@ -300,6 +316,12 @@ export const WS_METHODS = {
   qaReviewScriptPlan: "qa.reviewScriptPlan",
   qaGetReadiness: "qa.getReadiness",
   qaReviewReadiness: "qa.reviewReadiness",
+  qaListReviewThreads: "qa.listReviewThreads",
+  qaAddReviewComment: "qa.addReviewComment",
+  qaReplyReviewComment: "qa.replyReviewComment",
+  qaRunReviewCommentAiCheck: "qa.runReviewCommentAiCheck",
+  qaResolveReviewComment: "qa.resolveReviewComment",
+  qaMarkReviewRead: "qa.markReviewRead",
 
   // Streaming subscriptions
   subscribeVcsStatus: "subscribeVcsStatus",
@@ -311,6 +333,18 @@ export const WS_METHODS = {
   subscribeServerLifecycle: "subscribeServerLifecycle",
   subscribeAuthAccess: "subscribeAuthAccess",
 } as const;
+
+export const WsQaListAssignedReleasesRpc = Rpc.make(WS_METHODS.qaListAssignedReleases, {
+  payload: QaListAssignedReleasesInput,
+  success: QaAssignedReleaseDashboard,
+  error: Schema.Union([QaOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsQaGetReleaseAccessRpc = Rpc.make(WS_METHODS.qaGetReleaseAccess, {
+  payload: QaGetReleaseAccessInput,
+  success: QaReleaseAccess,
+  error: Schema.Union([QaOperationError, EnvironmentAuthorizationError]),
+});
 
 export const WsQaGetSnapshotRpc = Rpc.make(WS_METHODS.qaGetSnapshot, {
   payload: QaGetSnapshotInput,
@@ -484,6 +518,42 @@ export const WsQaGetReadinessRpc = Rpc.make(WS_METHODS.qaGetReadiness, {
 export const WsQaReviewReadinessRpc = Rpc.make(WS_METHODS.qaReviewReadiness, {
   payload: QaReviewReadinessInput,
   success: QaReadinessReviewResult,
+  error: Schema.Union([QaOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsQaListReviewThreadsRpc = Rpc.make(WS_METHODS.qaListReviewThreads, {
+  payload: QaListReviewThreadsInput,
+  success: QaReviewThreadList,
+  error: Schema.Union([QaOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsQaAddReviewCommentRpc = Rpc.make(WS_METHODS.qaAddReviewComment, {
+  payload: QaAddReviewCommentInput,
+  success: QaReviewMutationResult,
+  error: Schema.Union([QaOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsQaReplyReviewCommentRpc = Rpc.make(WS_METHODS.qaReplyReviewComment, {
+  payload: QaReplyReviewCommentInput,
+  success: QaReviewMutationResult,
+  error: Schema.Union([QaOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsQaRunReviewCommentAiCheckRpc = Rpc.make(WS_METHODS.qaRunReviewCommentAiCheck, {
+  payload: QaRunReviewCommentAiCheckInput,
+  success: QaReviewAiRun,
+  error: Schema.Union([QaOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsQaResolveReviewCommentRpc = Rpc.make(WS_METHODS.qaResolveReviewComment, {
+  payload: QaResolveReviewCommentInput,
+  success: QaReviewMutationResult,
+  error: Schema.Union([QaOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsQaMarkReviewReadRpc = Rpc.make(WS_METHODS.qaMarkReviewRead, {
+  payload: QaMarkReviewReadInput,
+  success: QaReviewReadReceipt,
   error: Schema.Union([QaOperationError, EnvironmentAuthorizationError]),
 });
 
@@ -935,6 +1005,8 @@ export const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess,
 });
 
 export const WsRpcGroup = RpcGroup.make(
+  WsQaListAssignedReleasesRpc,
+  WsQaGetReleaseAccessRpc,
   WsQaGetSnapshotRpc,
   WsQaInitializeReleaseRpc,
   WsQaUploadDocumentRpc,
@@ -964,6 +1036,12 @@ export const WsRpcGroup = RpcGroup.make(
   WsQaReviewScriptPlanRpc,
   WsQaGetReadinessRpc,
   WsQaReviewReadinessRpc,
+  WsQaListReviewThreadsRpc,
+  WsQaAddReviewCommentRpc,
+  WsQaReplyReviewCommentRpc,
+  WsQaRunReviewCommentAiCheckRpc,
+  WsQaResolveReviewCommentRpc,
+  WsQaMarkReviewReadRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,

@@ -141,6 +141,10 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
     return Effect.promise(() => this.rollbackThreadImpl(numTurns));
   }
 
+  runDetachedReview(_instructions: string) {
+    return Effect.die(new Error("FakeCodexRuntime.runDetachedReview is not used in this test"));
+  }
+
   respondToRequest(requestId: ApprovalRequestId, decision: ProviderApprovalDecision) {
     return Effect.promise(() => this.respondToRequestImpl(requestId, decision));
   }

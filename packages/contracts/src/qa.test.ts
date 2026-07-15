@@ -4,23 +4,36 @@ import { describe, expect, it } from "vite-plus/test";
 import { ProjectId, ThreadId } from "./baseSchemas.ts";
 import {
   EnterpriseMode,
+  QaAddReviewCommentInput,
   QaAgentRequirementProposal,
   QaAgentSubmitScenariosInput,
   QaAgentSubmitScriptsInput,
   QaAgentSubmitStrategyInput,
   QaAgentSubmitTestCasesInput,
   QaDocumentKind,
+  QaAssignedReleaseDashboard,
+  QaGetReleaseAccessInput,
   QaInitializeReleaseInput,
+  QaListAssignedReleasesInput,
+  QaListReviewThreadsInput,
+  QaMarkReviewReadInput,
+  QaReleaseAccess,
   QaReleaseSnapshot,
   QaReleaseStreamEvent,
   QaStageId,
   QaStageState,
   QaStrategyDocument,
   QaReviewStrategyInput,
+  QaReviewAiRun,
+  QaReviewScenarioPlanInput,
+  QaReviewThread,
+  QaReplyReviewCommentInput,
+  QaResolveReviewCommentInput,
   QaReadinessDashboard,
   QaReviewReadinessInput,
   QaScenarioPlan,
   QaScriptPlan,
+  QaRunReviewCommentAiCheckInput,
   QaTestCasePlan,
   QaUpdateStrategySectionInput,
   QaUpdateScenarioInput,
@@ -33,6 +46,21 @@ import {
 import { WS_METHODS } from "./rpc.ts";
 
 const decodeEnterpriseMode = Schema.decodeUnknownSync(EnterpriseMode);
+const decodeQaAddReviewCommentInput = Schema.decodeUnknownSync(QaAddReviewCommentInput);
+const decodeQaAssignedReleaseDashboard = Schema.decodeUnknownSync(QaAssignedReleaseDashboard);
+const decodeQaGetReleaseAccessInput = Schema.decodeUnknownSync(QaGetReleaseAccessInput);
+const decodeQaListAssignedReleasesInput = Schema.decodeUnknownSync(QaListAssignedReleasesInput);
+const decodeQaListReviewThreadsInput = Schema.decodeUnknownSync(QaListReviewThreadsInput);
+const decodeQaMarkReviewReadInput = Schema.decodeUnknownSync(QaMarkReviewReadInput);
+const decodeQaReleaseAccess = Schema.decodeUnknownSync(QaReleaseAccess);
+const decodeQaReplyReviewCommentInput = Schema.decodeUnknownSync(QaReplyReviewCommentInput);
+const decodeQaResolveReviewCommentInput = Schema.decodeUnknownSync(QaResolveReviewCommentInput);
+const decodeQaReviewAiRun = Schema.decodeUnknownSync(QaReviewAiRun);
+const decodeQaReviewScenarioPlanInput = Schema.decodeUnknownSync(QaReviewScenarioPlanInput);
+const decodeQaReviewThread = Schema.decodeUnknownSync(QaReviewThread);
+const decodeQaRunReviewCommentAiCheckInput = Schema.decodeUnknownSync(
+  QaRunReviewCommentAiCheckInput,
+);
 const decodeQaUploadDocumentInput = Schema.decodeUnknownSync(QaUploadDocumentInput);
 const decodeQaInitializeReleaseInput = Schema.decodeUnknownSync(QaInitializeReleaseInput);
 const decodeQaReleaseSnapshot = Schema.decodeUnknownSync(QaReleaseSnapshot);
@@ -98,6 +126,8 @@ describe("QA contracts", () => {
     expect(decodeEnterpriseMode("developer")).toBe("developer");
     expect(decodeQaDocumentKind("HLD")).toBe("HLD");
     expect(decodeQaStageId("test_cases")).toBe("test_cases");
+    expect(WS_METHODS.qaListAssignedReleases).toBe("qa.listAssignedReleases");
+    expect(WS_METHODS.qaGetReleaseAccess).toBe("qa.getReleaseAccess");
     expect(WS_METHODS.qaGetSnapshot).toBe("qa.getSnapshot");
     expect(WS_METHODS.qaInitializeRelease).toBe("qa.initializeRelease");
     expect(WS_METHODS.qaUploadDocument).toBe("qa.uploadDocument");
@@ -127,6 +157,224 @@ describe("QA contracts", () => {
     expect(WS_METHODS.qaReviewScriptPlan).toBe("qa.reviewScriptPlan");
     expect(WS_METHODS.qaGetReadiness).toBe("qa.getReadiness");
     expect(WS_METHODS.qaReviewReadiness).toBe("qa.reviewReadiness");
+    expect(WS_METHODS.qaListReviewThreads).toBe("qa.listReviewThreads");
+    expect(WS_METHODS.qaAddReviewComment).toBe("qa.addReviewComment");
+    expect(WS_METHODS.qaReplyReviewComment).toBe("qa.replyReviewComment");
+    expect(WS_METHODS.qaRunReviewCommentAiCheck).toBe("qa.runReviewCommentAiCheck");
+    expect(WS_METHODS.qaResolveReviewComment).toBe("qa.resolveReviewComment");
+    expect(WS_METHODS.qaMarkReviewRead).toBe("qa.markReviewRead");
+  });
+
+  it("decodes principal-specific release access and the minimal assigned-release dashboard", () => {
+    const threadId = ThreadId.make("thread-qa-review-contract");
+    const projectId = ProjectId.make("project-qa-review-contract");
+    expect(decodeQaListAssignedReleasesInput({})).toEqual({});
+    expect(decodeQaGetReleaseAccessInput({ threadId }).threadId).toBe(threadId);
+
+    const access = decodeQaReleaseAccess({
+      threadId,
+      projectId,
+      principalId: "principal-root",
+      role: "root",
+      uiRole: "approver",
+      capabilities: ["qa:read", "qa:make", "qa:approve", "qa:chat"],
+    });
+    expect(access.role).toBe("root");
+    expect(access.uiRole).toBe("approver");
+    expect(access.capabilities).toContain("qa:approve");
+
+    const dashboard = decodeQaAssignedReleaseDashboard({
+      releases: [
+        {
+          threadId,
+          projectId,
+          projectTitle: "Customer portal",
+          releaseNumber: 4,
+          title: "Release 4",
+          activeStage: "strategy",
+          bucket: "awaiting_review",
+          status: "ready_for_review",
+          role: "root",
+          uiRole: "approver",
+          unresolvedBlockingCommentCount: 1,
+          unreadReviewActivityCount: 2,
+          updatedAt: "2026-07-15T10:00:00.000Z",
+          completedAt: null,
+        },
+      ],
+      awaitingReviewCount: 1,
+      completedSince: "2026-06-15T10:00:00.000Z",
+      generatedAt: "2026-07-15T10:00:00.000Z",
+    });
+    expect(dashboard.releases[0]?.bucket).toBe("awaiting_review");
+    expect(dashboard.releases[0]?.unresolvedBlockingCommentCount).toBe(1);
+  });
+
+  it("decodes anchored review threads, evidence, and revisioned review mutations", () => {
+    const threadId = ThreadId.make("thread-qa-review-contract");
+    const reviewThreadId = "review-thread-1";
+    const approver = {
+      principalId: "principal-approver",
+      displayName: "QA Approver",
+      role: "qa:approver",
+    } as const;
+    const maker = {
+      principalId: "principal-maker",
+      displayName: "QA Maker",
+      role: "qa:maker",
+    } as const;
+    const aiRun = decodeQaReviewAiRun({
+      id: "ai-run-1",
+      reviewThreadId,
+      status: "completed",
+      requestedBy: approver,
+      providerInstanceId: null,
+      model: "gpt-5",
+      artifactRevision: 7,
+      sourceChainHash: "sha256:source-chain-7",
+      result: {
+        verdict: "agrees",
+        rationale: "The maker response brings the strategy back into alignment.",
+        citations: [
+          {
+            citation: {
+              documentId: "doc-hld-1",
+              documentName: "Payments HLD",
+              section: "3.2 Approval boundary",
+              location: "page 14",
+              excerpt: "A checker must approve every high-value transfer.",
+            },
+            relationship: "supports",
+            explanation: "The revised strategy now covers the checker boundary.",
+          },
+        ],
+      },
+      failureMessage: null,
+      stale: false,
+      createdAt: "2026-07-15T10:00:00.000Z",
+      startedAt: "2026-07-15T10:00:01.000Z",
+      completedAt: "2026-07-15T10:00:10.000Z",
+    });
+    expect(aiRun.result?.citations[0]?.citation.documentId).toBe("doc-hld-1");
+
+    const reviewThread = decodeQaReviewThread({
+      id: reviewThreadId,
+      threadId,
+      artifactKind: "strategy",
+      artifactId: "strategy-release-4",
+      anchor: {
+        type: "strategy_section",
+        sectionId: "approval-controls",
+        label: "Approval controls",
+        quote: "High-value transfer validation",
+      },
+      severity: "blocking",
+      status: "open",
+      createdArtifactRevision: 6,
+      currentArtifactRevision: 7,
+      currentSourceChainHash: "sha256:source-chain-7",
+      createdBy: approver,
+      entries: [
+        {
+          id: "review-entry-1",
+          reviewThreadId,
+          kind: "comment",
+          body: "Cover the checker boundary for high-value transfers.",
+          author: approver,
+          correctsEntryId: null,
+          createdAt: "2026-07-15T09:00:00.000Z",
+        },
+        {
+          id: "review-entry-2",
+          reviewThreadId,
+          kind: "reply",
+          body: "Addressed in the approval-controls section.",
+          author: maker,
+          correctsEntryId: null,
+          createdAt: "2026-07-15T09:30:00.000Z",
+        },
+      ],
+      latestMakerReplyAt: "2026-07-15T09:30:00.000Z",
+      latestAiRun: aiRun,
+      canRunAiReview: true,
+      canResolve: true,
+      unreadCount: 1,
+      createdAt: "2026-07-15T09:00:00.000Z",
+      updatedAt: "2026-07-15T10:00:10.000Z",
+      resolvedAt: null,
+      resolvedBy: null,
+      resolutionAiRunId: null,
+      resolutionOverrideReason: null,
+    });
+    expect(reviewThread.anchor.type).toBe("strategy_section");
+    expect(reviewThread.latestAiRun?.result?.verdict).toBe("agrees");
+
+    const add = decodeQaAddReviewCommentInput({
+      threadId,
+      artifactKind: "scenario_plan",
+      artifactId: "scenario-plan-4",
+      expectedRevision: 7,
+      anchor: {
+        type: "scenario",
+        scenarioId: "scenario-12",
+        label: "SCN-012 — High-value transfer",
+        quote: null,
+      },
+      severity: "advisory",
+      body: "Add a boundary-value example.",
+    });
+    expect(add.anchor.type).toBe("scenario");
+    expect(
+      decodeQaListReviewThreadsInput({
+        threadId,
+        artifactKind: "scenario_plan",
+        artifactId: "scenario-plan-4",
+      }).artifactKind,
+    ).toBe("scenario_plan");
+    expect(
+      decodeQaReplyReviewCommentInput({
+        threadId,
+        reviewThreadId,
+        expectedRevision: 8,
+        body: "Added the boundary example.",
+      }).body,
+    ).toBe("Added the boundary example.");
+    expect(
+      decodeQaRunReviewCommentAiCheckInput({
+        threadId,
+        reviewThreadId,
+        expectedRevision: 9,
+      }).reviewThreadId,
+    ).toBe(reviewThreadId);
+    expect(
+      decodeQaResolveReviewCommentInput({
+        threadId,
+        reviewThreadId,
+        aiRunId: aiRun.id,
+        expectedRevision: 10,
+      }).aiRunId,
+    ).toBe(aiRun.id);
+    expect(
+      decodeQaMarkReviewReadInput({
+        threadId,
+        reviewThreadId,
+        throughEntryId: "review-entry-2",
+      }).throughEntryId,
+    ).toBe("review-entry-2");
+
+    expect(() =>
+      decodeQaAddReviewCommentInput({
+        ...add,
+        artifactKind: "strategy",
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeQaReviewAiRun({
+        ...aiRun,
+        status: "completed",
+        result: null,
+      }),
+    ).toThrow();
   });
 
   it("round-trips upload bytes and a release snapshot", () => {
@@ -360,6 +608,33 @@ describe("QA contracts", () => {
       note: "Approved after comment resolution.",
     });
     expect(approval.decision).toBe("approved");
+
+    const changesRequested = decodeQaReviewStrategyInput({
+      threadId: ThreadId.make("thread-qa-contract"),
+      strategyId: "strategy-release-1",
+      expectedRevision: 5,
+      decision: "changes_requested",
+      blockingCommentIds: ["review-thread-1"],
+      summary: "Address the unresolved approval-boundary comment.",
+    });
+    expect(changesRequested.blockingCommentIds).toEqual(["review-thread-1"]);
+    expect(() =>
+      decodeQaReviewStrategyInput({
+        threadId: ThreadId.make("thread-qa-contract"),
+        strategyId: "strategy-release-1",
+        expectedRevision: 5,
+        decision: "changes_requested",
+      }),
+    ).toThrow();
+
+    const scenarioChangesRequested = decodeQaReviewScenarioPlanInput({
+      threadId: ThreadId.make("thread-qa-contract"),
+      planId: "scenario-plan-release-1",
+      expectedRevision: 5,
+      decision: "changes_requested",
+      blockingCommentIds: ["review-thread-2"],
+    });
+    expect(scenarioChangesRequested.decision).toBe("changes_requested");
   });
 
   it("accepts only bounded, draft-only agent strategy proposals", () => {

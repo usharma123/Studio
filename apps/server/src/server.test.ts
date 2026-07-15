@@ -84,7 +84,11 @@ import { PersistenceSqlError } from "./persistence/Errors.ts";
 import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "./provider/providerMaintenance.ts";
 import * as QaDatabase from "./qa/QaDatabase.ts";
+import * as QaDashboardQuery from "./qa/QaDashboardQuery.ts";
 import * as QaIngestionGateway from "./qa/QaIngestionGateway.ts";
+import * as QaReleaseEventBus from "./qa/QaReleaseEventBus.ts";
+import * as QaReviewService from "./qa/QaReviewService.ts";
+import * as QaWorkflow from "./qa/QaWorkflow.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSettings from "./serverSettings.ts";
@@ -522,6 +526,12 @@ const buildAppUnderTest = (options?: {
           ...options.layers.vcsStatusBroadcaster,
         })
       : VcsStatusBroadcaster.layer.pipe(Layer.provide(gitWorkflowLayer));
+    const qaReviewRoutesLayer = Layer.mergeAll(
+      QaDashboardQuery.layer,
+      QaReleaseEventBus.layer,
+      QaReviewService.layer,
+      QaWorkflow.layer,
+    );
 
     const servedRoutesLayer = HttpRouter.serve(makeRoutesLayer, {
       disableListenLog: true,
@@ -735,6 +745,7 @@ const buildAppUnderTest = (options?: {
     );
 
     const appLayer = servedRoutesLayer.pipe(
+      Layer.provide(qaReviewRoutesLayer),
       Layer.provide(
         Layer.mock(BrowserTraceCollector.BrowserTraceCollector)({
           record: () => Effect.void,

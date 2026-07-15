@@ -23,6 +23,7 @@ import {
   type QaReadinessReviewResult,
   type QaReviewReadinessInput,
   type QaReviewScenarioPlanInput,
+  type QaReviewActor,
   type QaReviewScriptPlanInput,
   type QaReplyStrategyCommentInput,
   type QaResolveStrategyCommentInput,
@@ -67,6 +68,11 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { QaDatabase } from "./QaDatabase.ts";
 import { QaIngestionGateway } from "./QaIngestionGateway.ts";
+import {
+  assertQaReviewDecisionAllowed,
+  recordQaReviewDecision,
+  type QaReviewError,
+} from "./QaReviewService.ts";
 
 const MAX_DOCUMENT_BYTES = 20 * 1024 * 1024;
 const REQUIREMENTS_GATE_KIND = "requirements_review" as const;
@@ -123,6 +129,7 @@ type QaWorkflowShape = {
   ) => Effect.Effect<QaStrategyMutationResult, QaOperationError>;
   readonly reviewStrategy: (
     input: QaReviewStrategyInput,
+    actor?: QaReviewActor,
   ) => Effect.Effect<QaStrategyApprovalResult, QaOperationError>;
   readonly getScenarioPlan: (
     input: QaGetScenarioPlanInput,
@@ -135,6 +142,7 @@ type QaWorkflowShape = {
   ) => Effect.Effect<QaScenarioPlanMutationResult, QaOperationError>;
   readonly reviewScenarioPlan: (
     input: QaReviewScenarioPlanInput,
+    actor?: QaReviewActor,
   ) => Effect.Effect<QaScenarioPlanApprovalResult, QaOperationError>;
   readonly submitAgentScenarios: (
     threadId: QaGetSnapshotInput["threadId"],
@@ -478,6 +486,28 @@ function persistenceError(operation: string): QaOperationError {
     "persistence_failed",
     `QA workflow persistence failed during ${operation}.`,
   );
+}
+
+const DEFAULT_APPROVER_ACTOR: QaReviewActor = {
+  principalId: "qa-approver",
+  displayName: "QA Approver",
+  role: "qa:approver",
+};
+
+function mapReviewDecisionError(error: QaReviewError): QaOperationError {
+  switch (error.code) {
+    case "revision_conflict":
+      return operationError("release_conflict", error.message);
+    case "not_found":
+      return operationError("review_target_not_found", error.message);
+    case "persistence_failed":
+      return operationError("persistence_failed", error.message);
+    case "access_denied":
+    case "invalid_anchor":
+    case "invalid_input":
+    case "invalid_state":
+      return operationError("invalid_workflow_state", error.message);
+  }
 }
 
 function mapQaFailure<A, E, R>(
@@ -2927,7 +2957,10 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const reviewStrategy = (input: QaReviewStrategyInput) =>
+  const reviewStrategy = (
+    input: QaReviewStrategyInput,
+    approverActor: QaReviewActor = DEFAULT_APPROVER_ACTOR,
+  ) =>
     mapQaFailure(
       "reviewStrategy",
       sql.withTransaction(
@@ -2941,6 +2974,21 @@ const make = Effect.gen(function* () {
               "Submit the strategy before recording an approval decision.",
             );
           }
+          const durableDecision =
+            input.decision === "approved" || input.decision === "changes_requested"
+              ? input.decision
+              : null;
+          const decisionCheck = durableDecision
+            ? yield* assertQaReviewDecisionAllowed(sql, {
+                threadId: input.threadId,
+                artifactKind: "strategy",
+                artifactId: strategy.id,
+                decision: durableDecision,
+                ...(input.blockingCommentIds
+                  ? { blockingThreadIds: input.blockingCommentIds }
+                  : {}),
+              }).pipe(Effect.mapError(mapReviewDecisionError))
+            : null;
           if (
             input.decision === "approved" &&
             strategy.comments.some((comment) => comment.status === "open")
@@ -2965,7 +3013,7 @@ const make = Effect.gen(function* () {
             yield* sql`
               UPDATE qa_strategies
               SET revision = ${nextRevision}, review_status = 'approved', rejection_note = NULL,
-                  approved_at = ${reviewedAt}, approved_by = 'QA Approver',
+                  approved_at = ${reviewedAt}, approved_by = ${approverActor.displayName},
                   rejected_at = NULL, rejected_by = NULL, updated_at = ${reviewedAt}
               WHERE thread_id = ${input.threadId}
             `;
@@ -2985,12 +3033,13 @@ const make = Effect.gen(function* () {
               WHERE thread_id = ${input.threadId}
             `;
           } else {
-            const note = input.note?.trim() || "Strategy rejected by QA approver.";
+            const note =
+              input.summary?.trim() || input.note?.trim() || "Changes requested by QA approver.";
             yield* sql`
               UPDATE qa_strategies
               SET revision = ${nextRevision}, review_status = 'rejected',
                   rejection_note = ${note}, rejected_at = ${reviewedAt},
-                  rejected_by = 'QA Approver', approved_at = NULL, approved_by = NULL,
+                  rejected_by = ${approverActor.displayName}, approved_at = NULL, approved_by = NULL,
                   updated_at = ${reviewedAt}
               WHERE thread_id = ${input.threadId}
             `;
@@ -3004,6 +3053,18 @@ const make = Effect.gen(function* () {
               SET active_stage = 'strategy', revision = ${nextRevision}, updated_at = ${reviewedAt}
               WHERE thread_id = ${input.threadId}
             `;
+          }
+          if (durableDecision && decisionCheck) {
+            yield* recordQaReviewDecision(sql, {
+              threadId: input.threadId,
+              artifactKind: "strategy",
+              artifactId: strategy.id,
+              decision: durableDecision,
+              blockingThreadIds: decisionCheck.blockingThreadIds,
+              ...(input.summary ? { summary: input.summary } : {}),
+              actor: approverActor,
+              timestamp: reviewedAt,
+            }).pipe(Effect.mapError(mapReviewDecisionError));
           }
           const result = yield* strategyMutationResult(input.threadId);
           return {
@@ -3177,7 +3238,10 @@ const make = Effect.gen(function* () {
         }),
       ),
     );
-  const reviewScenarioPlan = (input: QaReviewScenarioPlanInput) =>
+  const reviewScenarioPlan = (
+    input: QaReviewScenarioPlanInput,
+    approverActor: QaReviewActor = DEFAULT_APPROVER_ACTOR,
+  ) =>
     mapQaFailure(
       "reviewScenarioPlan",
       sql.withTransaction(
@@ -3195,18 +3259,47 @@ const make = Effect.gen(function* () {
               "invalid_workflow_state",
               "Submit the scenario plan before review.",
             );
+          const durableDecision =
+            input.decision === "approved" || input.decision === "changes_requested"
+              ? input.decision
+              : null;
+          const decisionCheck = durableDecision
+            ? yield* assertQaReviewDecisionAllowed(sql, {
+                threadId: input.threadId,
+                artifactKind: "scenario_plan",
+                artifactId: plan.id,
+                decision: durableDecision,
+                ...(input.blockingCommentIds
+                  ? { blockingThreadIds: input.blockingCommentIds }
+                  : {}),
+              }).pipe(Effect.mapError(mapReviewDecisionError))
+            : null;
           const t = yield* nowIso;
           const next = snapshot.revision + 1;
           if (input.decision === "approved") {
-            yield* sql`UPDATE qa_scenario_plans SET revision=${next},review_status='approved',approved_at=${t},approved_by='QA Approver',updated_at=${t} WHERE thread_id=${input.threadId}`;
-            yield* sql`UPDATE qa_scenarios SET status='approved',approved_at=${t},approved_by='QA Approver',updated_at=${t} WHERE thread_id=${input.threadId}`;
+            yield* sql`UPDATE qa_scenario_plans SET revision=${next},review_status='approved',approved_at=${t},approved_by=${approverActor.displayName},updated_at=${t} WHERE thread_id=${input.threadId}`;
+            yield* sql`UPDATE qa_scenarios SET status='approved',approved_at=${t},approved_by=${approverActor.displayName},updated_at=${t} WHERE thread_id=${input.threadId}`;
             yield* sql`UPDATE qa_stage_states SET status='complete',progress=100,updated_at=${t} WHERE thread_id=${input.threadId} AND stage='scenarios'`;
             yield* sql`UPDATE qa_stage_states SET status='ready',progress=0,updated_at=${t} WHERE thread_id=${input.threadId} AND stage='test_cases'`;
             yield* sql`UPDATE qa_releases SET active_stage='test_cases',revision=${next},updated_at=${t} WHERE thread_id=${input.threadId}`;
           } else {
-            yield* sql`UPDATE qa_scenario_plans SET revision=${next},review_status='rejected',rejection_note=${input.note?.trim() || "Scenario plan rejected."},rejected_at=${t},rejected_by='QA Approver',updated_at=${t} WHERE thread_id=${input.threadId}`;
-            yield* sql`UPDATE qa_scenarios SET status='rejected',decision_note=${input.note?.trim() || "Scenario plan rejected."},rejected_at=${t},rejected_by='QA Approver',updated_at=${t} WHERE thread_id=${input.threadId}`;
+            const note =
+              input.summary?.trim() || input.note?.trim() || "Changes requested by QA approver.";
+            yield* sql`UPDATE qa_scenario_plans SET revision=${next},review_status='rejected',rejection_note=${note},rejected_at=${t},rejected_by=${approverActor.displayName},updated_at=${t} WHERE thread_id=${input.threadId}`;
+            yield* sql`UPDATE qa_scenarios SET status='rejected',decision_note=${note},rejected_at=${t},rejected_by=${approverActor.displayName},updated_at=${t} WHERE thread_id=${input.threadId}`;
             yield* sql`UPDATE qa_releases SET revision=${next},updated_at=${t} WHERE thread_id=${input.threadId}`;
+          }
+          if (durableDecision && decisionCheck) {
+            yield* recordQaReviewDecision(sql, {
+              threadId: input.threadId,
+              artifactKind: "scenario_plan",
+              artifactId: plan.id,
+              decision: durableDecision,
+              blockingThreadIds: decisionCheck.blockingThreadIds,
+              ...(input.summary ? { summary: input.summary } : {}),
+              actor: approverActor,
+              timestamp: t,
+            }).pipe(Effect.mapError(mapReviewDecisionError));
           }
           const result = yield* scenarioMutationResult(input.threadId);
           return {

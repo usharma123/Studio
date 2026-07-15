@@ -8,6 +8,8 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
+import { AuthQaApproveScope, AuthQaChatScope, AuthQaMakeScope, AuthQaReadScope } from "./auth.ts";
+import { ProviderInstanceId } from "./providerInstance.ts";
 
 export const EnterpriseMode = Schema.Literals(["qa", "developer", "business_analyst"]);
 export type EnterpriseMode = typeof EnterpriseMode.Type;
@@ -20,6 +22,14 @@ export type QaDocumentKind = typeof QaDocumentKind.Type;
 
 export const QaReviewStatus = Schema.Literals(["pending", "approved", "rejected"]);
 export type QaReviewStatus = typeof QaReviewStatus.Type;
+
+/** `rejected` is retained for compatibility while new artifact loops use changes requested. */
+export const QaArtifactReviewDecision = Schema.Literals([
+  "approved",
+  "changes_requested",
+  "rejected",
+]);
+export type QaArtifactReviewDecision = typeof QaArtifactReviewDecision.Type;
 
 export const QaIngestionStatus = Schema.Literals([
   "idle",
@@ -104,6 +114,274 @@ export const QaSourceCitation = Schema.Struct({
   excerpt: TrimmedNonEmptyString,
 });
 export type QaSourceCitation = typeof QaSourceCitation.Type;
+
+export const QaProjectRole = Schema.Literals(["root", "qa:maker", "qa:approver"]);
+export type QaProjectRole = typeof QaProjectRole.Type;
+
+export const QaUiRole = Schema.Literals(["maker", "approver"]);
+export type QaUiRole = typeof QaUiRole.Type;
+
+export const QaReleaseCapability = Schema.Literals([
+  AuthQaReadScope,
+  AuthQaMakeScope,
+  AuthQaApproveScope,
+  AuthQaChatScope,
+]);
+export type QaReleaseCapability = typeof QaReleaseCapability.Type;
+
+/** Principal-specific access is queried separately from the shared release snapshot. */
+export const QaReleaseAccess = Schema.Struct({
+  threadId: ThreadId,
+  projectId: ProjectId,
+  principalId: TrimmedNonEmptyString,
+  role: QaProjectRole,
+  uiRole: QaUiRole,
+  capabilities: Schema.Array(QaReleaseCapability),
+});
+export type QaReleaseAccess = typeof QaReleaseAccess.Type;
+
+export const QaAssignedReleaseBucket = Schema.Literals([
+  "awaiting_review",
+  "in_progress",
+  "completed",
+]);
+export type QaAssignedReleaseBucket = typeof QaAssignedReleaseBucket.Type;
+
+export const QaAssignedReleaseStatus = Schema.Literals([
+  "active",
+  "ready_for_review",
+  "changes_requested",
+  "blocked",
+  "completed",
+]);
+export type QaAssignedReleaseStatus = typeof QaAssignedReleaseStatus.Type;
+
+export const QaAssignedReleaseSummary = Schema.Struct({
+  threadId: ThreadId,
+  projectId: ProjectId,
+  projectTitle: TrimmedNonEmptyString,
+  releaseNumber: PositiveInt,
+  title: TrimmedNonEmptyString,
+  activeStage: QaStageId,
+  bucket: QaAssignedReleaseBucket,
+  status: QaAssignedReleaseStatus,
+  role: QaProjectRole,
+  uiRole: QaUiRole,
+  unresolvedBlockingCommentCount: NonNegativeInt,
+  unreadReviewActivityCount: NonNegativeInt,
+  updatedAt: IsoDateTime,
+  completedAt: Schema.NullOr(IsoDateTime),
+});
+export type QaAssignedReleaseSummary = typeof QaAssignedReleaseSummary.Type;
+
+export const QaAssignedReleaseDashboard = Schema.Struct({
+  releases: Schema.Array(QaAssignedReleaseSummary),
+  awaitingReviewCount: NonNegativeInt,
+  completedSince: IsoDateTime,
+  generatedAt: IsoDateTime,
+});
+export type QaAssignedReleaseDashboard = typeof QaAssignedReleaseDashboard.Type;
+
+export const QaReviewArtifactKind = Schema.Literals(["strategy", "scenario_plan"]);
+export type QaReviewArtifactKind = typeof QaReviewArtifactKind.Type;
+
+export const QaStrategySectionReviewAnchor = Schema.Struct({
+  type: Schema.Literal("strategy_section"),
+  sectionId: TrimmedNonEmptyString,
+  label: TrimmedNonEmptyString,
+  quote: Schema.NullOr(Schema.String.check(Schema.isMaxLength(10_000))),
+});
+export type QaStrategySectionReviewAnchor = typeof QaStrategySectionReviewAnchor.Type;
+
+export const QaScenarioReviewAnchor = Schema.Struct({
+  type: Schema.Literal("scenario"),
+  scenarioId: TrimmedNonEmptyString,
+  label: TrimmedNonEmptyString,
+  quote: Schema.NullOr(Schema.String.check(Schema.isMaxLength(10_000))),
+});
+export type QaScenarioReviewAnchor = typeof QaScenarioReviewAnchor.Type;
+
+export const QaReviewAnchor = Schema.Union([QaStrategySectionReviewAnchor, QaScenarioReviewAnchor]);
+export type QaReviewAnchor = typeof QaReviewAnchor.Type;
+
+export const QaReviewSeverity = Schema.Literals(["blocking", "advisory"]);
+export type QaReviewSeverity = typeof QaReviewSeverity.Type;
+
+export const QaReviewThreadStatus = Schema.Literals(["open", "resolved"]);
+export type QaReviewThreadStatus = typeof QaReviewThreadStatus.Type;
+
+export const QaReviewActor = Schema.Struct({
+  principalId: TrimmedNonEmptyString,
+  displayName: TrimmedNonEmptyString,
+  role: QaProjectRole,
+});
+export type QaReviewActor = typeof QaReviewActor.Type;
+
+export const QaReviewEntryKind = Schema.Literals(["comment", "reply", "correction"]);
+export type QaReviewEntryKind = typeof QaReviewEntryKind.Type;
+
+/** Review entries are append-only; corrections point at the entry they supersede. */
+export const QaReviewEntry = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  reviewThreadId: TrimmedNonEmptyString,
+  kind: QaReviewEntryKind,
+  body: TrimmedNonEmptyString.check(Schema.isMaxLength(20_000)),
+  author: QaReviewActor,
+  correctsEntryId: Schema.NullOr(TrimmedNonEmptyString),
+  createdAt: IsoDateTime,
+}).check(
+  Schema.makeFilter(
+    (entry) =>
+      (entry.kind === "correction") === (entry.correctsEntryId !== null) ||
+      "Only correction entries may reference a corrected entry.",
+  ),
+);
+export type QaReviewEntry = typeof QaReviewEntry.Type;
+
+export const QaReviewAiVerdict = Schema.Literals(["agrees", "disagrees", "inconclusive"]);
+export type QaReviewAiVerdict = typeof QaReviewAiVerdict.Type;
+
+export const QaReviewAiCitationRelationship = Schema.Literals([
+  "supports",
+  "contradicts",
+  "context",
+]);
+export type QaReviewAiCitationRelationship = typeof QaReviewAiCitationRelationship.Type;
+
+export const QaReviewAiCitation = Schema.Struct({
+  citation: QaSourceCitation,
+  relationship: QaReviewAiCitationRelationship,
+  explanation: TrimmedNonEmptyString.check(Schema.isMaxLength(4_000)),
+});
+export type QaReviewAiCitation = typeof QaReviewAiCitation.Type;
+
+export const QaReviewAiResult = Schema.Struct({
+  verdict: QaReviewAiVerdict,
+  rationale: TrimmedNonEmptyString.check(Schema.isMaxLength(20_000)),
+  citations: Schema.Array(QaReviewAiCitation),
+});
+export type QaReviewAiResult = typeof QaReviewAiResult.Type;
+
+export const QaReviewAiRunStatus = Schema.Literals(["queued", "running", "completed", "failed"]);
+export type QaReviewAiRunStatus = typeof QaReviewAiRunStatus.Type;
+
+export const QaReviewAiRun = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  reviewThreadId: TrimmedNonEmptyString,
+  status: QaReviewAiRunStatus,
+  requestedBy: QaReviewActor,
+  providerInstanceId: Schema.NullOr(ProviderInstanceId),
+  model: Schema.NullOr(TrimmedNonEmptyString),
+  artifactRevision: PositiveInt,
+  sourceChainHash: TrimmedNonEmptyString,
+  result: Schema.NullOr(QaReviewAiResult),
+  failureMessage: Schema.NullOr(Schema.String.check(Schema.isMaxLength(20_000))),
+  stale: Schema.Boolean,
+  createdAt: IsoDateTime,
+  startedAt: Schema.NullOr(IsoDateTime),
+  completedAt: Schema.NullOr(IsoDateTime),
+}).check(
+  Schema.makeFilter((run) => {
+    switch (run.status) {
+      case "queued":
+        return (
+          (run.startedAt === null &&
+            run.completedAt === null &&
+            run.result === null &&
+            run.failureMessage === null) ||
+          "Queued AI reviews cannot contain execution or terminal result fields."
+        );
+      case "running":
+        return (
+          (run.startedAt !== null &&
+            run.completedAt === null &&
+            run.result === null &&
+            run.failureMessage === null) ||
+          "Running AI reviews require a start time and cannot contain terminal result fields."
+        );
+      case "completed":
+        return (
+          (run.startedAt !== null &&
+            run.completedAt !== null &&
+            run.result !== null &&
+            run.failureMessage === null) ||
+          "Completed AI reviews require a result and terminal timestamps."
+        );
+      case "failed":
+        return (
+          (run.startedAt !== null &&
+            run.completedAt !== null &&
+            run.result === null &&
+            run.failureMessage !== null) ||
+          "Failed AI reviews require a failure message and terminal timestamps."
+        );
+    }
+  }),
+);
+export type QaReviewAiRun = typeof QaReviewAiRun.Type;
+
+export const QaReviewThread = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  threadId: ThreadId,
+  artifactKind: QaReviewArtifactKind,
+  artifactId: TrimmedNonEmptyString,
+  anchor: QaReviewAnchor,
+  severity: QaReviewSeverity,
+  status: QaReviewThreadStatus,
+  createdArtifactRevision: PositiveInt,
+  currentArtifactRevision: PositiveInt,
+  currentSourceChainHash: TrimmedNonEmptyString,
+  createdBy: QaReviewActor,
+  entries: Schema.Array(QaReviewEntry).check(Schema.isMinLength(1)),
+  latestMakerReplyAt: Schema.NullOr(IsoDateTime),
+  latestAiRun: Schema.NullOr(QaReviewAiRun),
+  canRunAiReview: Schema.Boolean,
+  canResolve: Schema.Boolean,
+  unreadCount: NonNegativeInt,
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+  resolvedAt: Schema.NullOr(IsoDateTime),
+  resolvedBy: Schema.NullOr(QaReviewActor),
+  resolutionAiRunId: Schema.NullOr(TrimmedNonEmptyString),
+  resolutionOverrideReason: Schema.NullOr(TrimmedNonEmptyString.check(Schema.isMaxLength(4_000))),
+}).check(
+  Schema.makeFilter(
+    (thread) =>
+      (thread.artifactKind === "strategy" && thread.anchor.type === "strategy_section") ||
+      (thread.artifactKind === "scenario_plan" && thread.anchor.type === "scenario") ||
+      "Review thread anchor must match its artifact kind.",
+  ),
+  Schema.makeFilter(
+    (thread) =>
+      (thread.status === "open"
+        ? thread.resolvedAt === null &&
+          thread.resolvedBy === null &&
+          thread.resolutionAiRunId === null &&
+          thread.resolutionOverrideReason === null
+        : thread.resolvedAt !== null &&
+          thread.resolvedBy !== null &&
+          thread.resolutionAiRunId !== null) ||
+      "Review thread resolution fields must match its status.",
+  ),
+);
+export type QaReviewThread = typeof QaReviewThread.Type;
+
+export const QaReviewReadReceipt = Schema.Struct({
+  threadId: ThreadId,
+  reviewThreadId: TrimmedNonEmptyString,
+  principalId: TrimmedNonEmptyString,
+  lastReadEntryId: Schema.NullOr(TrimmedNonEmptyString),
+  readAt: IsoDateTime,
+});
+export type QaReviewReadReceipt = typeof QaReviewReadReceipt.Type;
+
+export const QaReviewThreadList = Schema.Struct({
+  threadId: ThreadId,
+  reviewThreads: Schema.Array(QaReviewThread),
+  readReceipts: Schema.Array(QaReviewReadReceipt),
+  generatedAt: IsoDateTime,
+});
+export type QaReviewThreadList = typeof QaReviewThreadList.Type;
 
 export const QaRequirement = Schema.Struct({
   id: TrimmedNonEmptyString,
@@ -604,6 +882,77 @@ export type QaReleaseStreamEvent = typeof QaReleaseStreamEvent.Type;
 export const QaGetSnapshotInput = Schema.Struct({ threadId: ThreadId });
 export type QaGetSnapshotInput = typeof QaGetSnapshotInput.Type;
 
+export const QaListAssignedReleasesInput = Schema.Struct({
+  completedSince: Schema.optional(IsoDateTime),
+});
+export type QaListAssignedReleasesInput = typeof QaListAssignedReleasesInput.Type;
+
+export const QaGetReleaseAccessInput = Schema.Struct({ threadId: ThreadId });
+export type QaGetReleaseAccessInput = typeof QaGetReleaseAccessInput.Type;
+
+export const QaListReviewThreadsInput = Schema.Struct({
+  threadId: ThreadId,
+  artifactKind: Schema.optional(QaReviewArtifactKind),
+  artifactId: Schema.optional(TrimmedNonEmptyString),
+});
+export type QaListReviewThreadsInput = typeof QaListReviewThreadsInput.Type;
+
+export const QaAddReviewCommentInput = Schema.Struct({
+  threadId: ThreadId,
+  artifactKind: QaReviewArtifactKind,
+  artifactId: TrimmedNonEmptyString,
+  expectedRevision: PositiveInt,
+  anchor: QaReviewAnchor,
+  severity: QaReviewSeverity,
+  body: TrimmedNonEmptyString.check(Schema.isMaxLength(20_000)),
+}).check(
+  Schema.makeFilter(
+    (input) =>
+      (input.artifactKind === "strategy" && input.anchor.type === "strategy_section") ||
+      (input.artifactKind === "scenario_plan" && input.anchor.type === "scenario") ||
+      "Review comment anchor must match its artifact kind.",
+  ),
+);
+export type QaAddReviewCommentInput = typeof QaAddReviewCommentInput.Type;
+
+export const QaReplyReviewCommentInput = Schema.Struct({
+  threadId: ThreadId,
+  reviewThreadId: TrimmedNonEmptyString,
+  expectedRevision: PositiveInt,
+  body: TrimmedNonEmptyString.check(Schema.isMaxLength(20_000)),
+  correctsEntryId: Schema.optional(TrimmedNonEmptyString),
+});
+export type QaReplyReviewCommentInput = typeof QaReplyReviewCommentInput.Type;
+
+export const QaRunReviewCommentAiCheckInput = Schema.Struct({
+  threadId: ThreadId,
+  reviewThreadId: TrimmedNonEmptyString,
+  expectedRevision: PositiveInt,
+});
+export type QaRunReviewCommentAiCheckInput = typeof QaRunReviewCommentAiCheckInput.Type;
+
+export const QaResolveReviewCommentInput = Schema.Struct({
+  threadId: ThreadId,
+  reviewThreadId: TrimmedNonEmptyString,
+  aiRunId: TrimmedNonEmptyString,
+  expectedRevision: PositiveInt,
+  overrideReason: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(4_000))),
+});
+export type QaResolveReviewCommentInput = typeof QaResolveReviewCommentInput.Type;
+
+export const QaMarkReviewReadInput = Schema.Struct({
+  threadId: ThreadId,
+  reviewThreadId: TrimmedNonEmptyString,
+  throughEntryId: TrimmedNonEmptyString,
+});
+export type QaMarkReviewReadInput = typeof QaMarkReviewReadInput.Type;
+
+export const QaReviewMutationResult = Schema.Struct({
+  reviewThread: QaReviewThread,
+  snapshot: QaReleaseSnapshot,
+});
+export type QaReviewMutationResult = typeof QaReviewMutationResult.Type;
+
 export const QaInitializeReleaseInput = Schema.Struct({
   projectId: ProjectId,
   threadId: ThreadId,
@@ -726,9 +1075,20 @@ export const QaReviewStrategyInput = Schema.Struct({
   threadId: ThreadId,
   strategyId: TrimmedNonEmptyString,
   expectedRevision: PositiveInt,
-  decision: Schema.Literals(["approved", "rejected"]),
+  decision: QaArtifactReviewDecision,
   note: Schema.optional(Schema.String.check(Schema.isMaxLength(4_000))),
-});
+  blockingCommentIds: Schema.optional(
+    Schema.Array(TrimmedNonEmptyString).check(Schema.isMinLength(1)),
+  ),
+  summary: Schema.optional(Schema.String.check(Schema.isMaxLength(4_000))),
+}).check(
+  Schema.makeFilter(
+    (input) =>
+      input.decision !== "changes_requested" ||
+      input.blockingCommentIds !== undefined ||
+      "Changes requested decisions must reference at least one blocking comment.",
+  ),
+);
 export type QaReviewStrategyInput = typeof QaReviewStrategyInput.Type;
 
 export const QaStrategyMutationResult = Schema.Struct({
@@ -738,7 +1098,7 @@ export const QaStrategyMutationResult = Schema.Struct({
 export type QaStrategyMutationResult = typeof QaStrategyMutationResult.Type;
 
 export const QaStrategyApprovalResult = Schema.Struct({
-  decision: Schema.Literals(["approved", "rejected"]),
+  decision: QaArtifactReviewDecision,
   reviewedAt: IsoDateTime,
   strategy: QaStrategyDocument,
   snapshot: QaReleaseSnapshot,
@@ -792,9 +1152,20 @@ export const QaReviewScenarioPlanInput = Schema.Struct({
   threadId: ThreadId,
   planId: TrimmedNonEmptyString,
   expectedRevision: PositiveInt,
-  decision: Schema.Literals(["approved", "rejected"]),
+  decision: QaArtifactReviewDecision,
   note: Schema.optional(Schema.String.check(Schema.isMaxLength(4_000))),
-});
+  blockingCommentIds: Schema.optional(
+    Schema.Array(TrimmedNonEmptyString).check(Schema.isMinLength(1)),
+  ),
+  summary: Schema.optional(Schema.String.check(Schema.isMaxLength(4_000))),
+}).check(
+  Schema.makeFilter(
+    (input) =>
+      input.decision !== "changes_requested" ||
+      input.blockingCommentIds !== undefined ||
+      "Changes requested decisions must reference at least one blocking comment.",
+  ),
+);
 export type QaReviewScenarioPlanInput = typeof QaReviewScenarioPlanInput.Type;
 
 export const QaScenarioPlanMutationResult = Schema.Struct({
@@ -804,7 +1175,7 @@ export const QaScenarioPlanMutationResult = Schema.Struct({
 export type QaScenarioPlanMutationResult = typeof QaScenarioPlanMutationResult.Type;
 
 export const QaScenarioPlanApprovalResult = Schema.Struct({
-  decision: Schema.Literals(["approved", "rejected"]),
+  decision: QaArtifactReviewDecision,
   reviewedAt: IsoDateTime,
   scenarioPlan: QaScenarioPlan,
   snapshot: QaReleaseSnapshot,
@@ -1079,6 +1450,10 @@ export class QaOperationError extends Schema.TaggedErrorClass<QaOperationError>(
       "document_type_unsupported",
       "document_name_invalid",
       "review_target_not_found",
+      "review_thread_not_found",
+      "review_anchor_not_found",
+      "review_ai_run_not_found",
+      "review_ai_check_unavailable",
       "invalid_workflow_state",
       "ingestion_failed",
       "persistence_failed",
