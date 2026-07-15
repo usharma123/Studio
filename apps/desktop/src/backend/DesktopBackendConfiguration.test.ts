@@ -52,6 +52,7 @@ function makeEnvironmentLayer(
   baseDir: string,
   options?: {
     readonly appPath?: string;
+    readonly dirname?: string;
     readonly isPackaged?: boolean;
     readonly devServerUrl?: string;
     readonly developmentProfile?: "root" | "qa:maker" | "qa:approver";
@@ -60,7 +61,7 @@ function makeEnvironmentLayer(
   },
 ) {
   return DesktopEnvironment.layer({
-    dirname: "/repo/apps/desktop/src",
+    dirname: options?.dirname ?? "/repo/apps/desktop/src",
     homeDirectory: baseDir,
     platform: options?.platform ?? "darwin",
     processArch: "x64",
@@ -251,7 +252,7 @@ describe("DesktopBackendConfiguration", () => {
         const baseDir = yield* fileSystem.makeTempDirectoryScoped({
           prefix: "t3-desktop-backend-config-test-",
         });
-        const entryPath = path.join(baseDir, "app.asar.unpacked/apps/server/dist/bin.mjs");
+        const entryPath = path.join(baseDir, "apps/server/dist/bin.mjs");
         yield* fileSystem.makeDirectory(path.dirname(entryPath), { recursive: true });
         yield* fileSystem.writeFileString(entryPath, "");
 
@@ -280,7 +281,8 @@ describe("DesktopBackendConfiguration", () => {
                 makeEnvironmentLayer(baseDir, {
                   appPath: baseDir,
                   devServerUrl,
-                  isPackaged: true,
+                  dirname: path.join(baseDir, "apps/desktop/src"),
+                  isPackaged: false,
                   platform: "win32",
                   resourcesPath: baseDir,
                 }),

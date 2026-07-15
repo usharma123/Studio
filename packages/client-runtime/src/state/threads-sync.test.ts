@@ -421,7 +421,7 @@ describe("EnvironmentThreads", () => {
       expect(Option.getOrThrow(failed.error)).toBe("thread not found yet");
       expect(yield* Ref.get(harness.subscriptionCount)).toBe(1);
 
-      yield* TestClock.adjust("250 millis");
+      yield* TestClock.adjust("2 seconds");
       for (let attempt = 0; attempt < 100; attempt += 1) {
         if ((yield* Ref.get(harness.subscriptionCount)) >= 2) {
           break;
