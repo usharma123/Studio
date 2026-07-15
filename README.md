@@ -1,17 +1,17 @@
-# Super
+# Studio
 
-Super is a Codex-focused desktop client for working with coding agents. It provides an Electron
+Studio is a Codex-focused desktop client for working with coding agents. It provides an Electron
 application backed by a Node.js server and a React/Vite interface, with support for local and remote
 agent sessions.
 
 ## Upstream credit
 
-Super is built on the excellent open-source [T3 Code](https://github.com/pingdotgg/t3code)
+Studio is built on the excellent open-source [T3 Code](https://github.com/pingdotgg/t3code)
 project. T3 Code established the core agent runtime, provider integrations, and much of the
 application architecture used here. The upstream source is MIT-licensed; see [LICENSE](./LICENSE)
 for the applicable license and copyright notice.
 
-Super is an independent project and is not affiliated with T3 Code, Ping Labs, or OpenAI.
+Studio is an independent project and is not affiliated with T3 Code, Ping Labs, or OpenAI.
 
 ## Supported agents
 
