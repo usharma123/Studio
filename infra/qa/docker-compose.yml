@@ -1,0 +1,64 @@
+services:
+  qa-postgres:
+    image: postgres:16-alpine
+    container_name: t3code-qa-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: t3code_qa
+      POSTGRES_USER: t3code_qa
+      POSTGRES_PASSWORD: t3code_qa
+    ports:
+      - "55433:5432"
+    volumes:
+      - t3code_qa_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U t3code_qa -d t3code_qa"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  qa-helix-minio:
+    image: minio/minio:latest
+    container_name: t3code-qa-helix-minio
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - t3code_qa_helix_minio:/data
+
+  qa-helix-minio-init:
+    image: minio/mc:latest
+    container_name: t3code-qa-helix-minio-init
+    restart: "no"
+    depends_on:
+      - qa-helix-minio
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until mc alias set local http://qa-helix-minio:9000 minioadmin minioadmin; do sleep 1; done
+        mc mb --ignore-existing local/helix-db
+
+  qa-helix:
+    image: ghcr.io/helixdb/enterprise-dev:latest
+    container_name: t3code-qa-helix
+    restart: unless-stopped
+    depends_on:
+      qa-helix-minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "18080:8080"
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT: http://qa-helix-minio:9000
+      AWS_ALLOW_HTTP: "true"
+      AWS_REGION: us-east-1
+      S3_BUCKET: helix-db
+      DB_PATH: t3code-qa/
+
+volumes:
+  t3code_qa_postgres:
+  t3code_qa_helix_minio:

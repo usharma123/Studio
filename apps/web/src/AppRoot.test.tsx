@@ -1,0 +1,20 @@
+import { Children, isValidElement, type ReactElement, type ReactNode } from "react";
+import { RouterProvider } from "@tanstack/react-router";
+import { describe, expect, it } from "vite-plus/test";
+
+import { AppAtomRegistryProvider } from "./rpc/atomRegistry";
+import type { AppRouter } from "./router";
+import { AppRoot } from "./AppRoot";
+
+describe("AppRoot", () => {
+  it("keeps the browser entry focused on routed UI", () => {
+    const root = AppRoot({ router: {} as AppRouter });
+
+    expect(root.type).toBe(AppAtomRegistryProvider);
+    const children = Children.toArray(
+      (root as ReactElement<{ readonly children: ReactNode }>).props.children,
+    );
+    expect(children).toHaveLength(1);
+    expect(isValidElement(children[0]) && children[0].type).toBe(RouterProvider);
+  });
+});
