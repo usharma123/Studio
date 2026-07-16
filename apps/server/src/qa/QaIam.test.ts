@@ -197,7 +197,7 @@ layer("QaIam", (it) => {
     }),
   );
 
-  it.effect("registers a named QA project for the creating principal", () =>
+  it.effect("registers a named QA project for the existing project team", () =>
     Effect.gen(function* () {
       const iam = yield* QaIam;
       const sql = yield* SqlClient.SqlClient;
@@ -212,15 +212,69 @@ layer("QaIam", (it) => {
       assert.equal(access.role, "qa:maker");
       const rows = yield* sql<{
         readonly name: string;
+        readonly subject: string;
         readonly role: string;
       }>`
-        SELECT projects.name, assignments.role
+        SELECT projects.name, principals.subject, assignments.role
         FROM qa_projects projects
         JOIN qa_project_assignments assignments ON assignments.project_id = projects.id
+        JOIN application_principals principals ON principals.id = assignments.principal_id
         WHERE projects.id = 'customer-portal'
-          AND assignments.principal_id = 'principal-maker'
+        ORDER BY principals.subject
       `;
-      assert.deepEqual(rows, [{ name: "Customer portal", role: "qa:maker" }]);
+      assert.deepEqual(rows, [
+        { name: "Customer portal", subject: "test:approver", role: "qa:approver" },
+        { name: "Customer portal", subject: "test:maker", role: "qa:maker" },
+        { name: "Customer portal", subject: "test:root", role: "root" },
+      ]);
+
+      const maker = yield* iam.authorizeProject({
+        subject: "test:maker",
+        projectId: "customer-portal",
+        capability: "qa:make",
+      });
+      assert.equal(maker.role, "qa:maker");
+
+      const approver = yield* iam.authorizeProject({
+        subject: "test:approver",
+        projectId: "customer-portal",
+        capability: "qa:approve",
+      });
+      assert.equal(approver.role, "qa:approver");
+
+      const makerApprovalError = yield* iam
+        .authorizeProject({
+          subject: "test:maker",
+          projectId: "customer-portal",
+          capability: "qa:approve",
+        })
+        .pipe(Effect.flip);
+      assert.equal(makerApprovalError.code, "capability_denied");
+
+      const approverMakeError = yield* iam
+        .authorizeProject({
+          subject: "test:approver",
+          projectId: "customer-portal",
+          capability: "qa:make",
+        })
+        .pipe(Effect.flip);
+      assert.equal(approverMakeError.code, "capability_denied");
+
+      yield* sql`
+        INSERT INTO qa_releases (
+          thread_id, project_id, mode, release_number, title, status, phase,
+          ingestion_status, ingestion_progress, created_at, updated_at
+        ) VALUES (
+          'customer-portal-release', 'customer-portal', 'qa', 1, 'Release 1', 'active',
+          'documents', 'idle', 0, ${NOW}, ${NOW}
+        )
+      `;
+      const releaseApprover = yield* iam.authorizeRelease({
+        subject: "test:approver",
+        releaseThreadId: "customer-portal-release",
+        capability: "qa:approve",
+      });
+      assert.equal(releaseApprover.role, "qa:approver");
     }),
   );
 

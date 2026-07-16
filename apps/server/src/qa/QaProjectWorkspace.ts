@@ -1,8 +1,6 @@
 import type { ProjectId } from "@t3tools/contracts";
 
-import { appendBrowsePathSegment, ensureBrowseDirectoryPath } from "../lib/projectPaths";
-
-const QA_PROJECT_DIRECTORY = ".t3-qa-projects";
+const QA_PROJECTS_DIRECTORY = ".t3-qa-projects";
 
 export function qaProjectDirectoryName(projectTitle: string, projectId: ProjectId): string {
   const slug = projectTitle
@@ -22,11 +20,12 @@ export function buildQaProjectWorkspaceRoot(input: {
   readonly baseDirectory: string | null | undefined;
   readonly projectTitle: string;
   readonly projectId: ProjectId;
+  readonly joinPath: (...segments: ReadonlyArray<string>) => string;
 }): string {
-  const baseDirectory = ensureBrowseDirectoryPath(input.baseDirectory?.trim() || "~/");
-  const qaProjectsDirectory = appendBrowsePathSegment(baseDirectory, QA_PROJECT_DIRECTORY);
-  return appendBrowsePathSegment(
-    qaProjectsDirectory,
+  const baseDirectory = input.baseDirectory?.trim() || "~/";
+  return input.joinPath(
+    baseDirectory,
+    QA_PROJECTS_DIRECTORY,
     qaProjectDirectoryName(input.projectTitle, input.projectId),
   );
 }

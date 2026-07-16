@@ -37,6 +37,12 @@ export const qaEnvironment = {
     tag: WS_METHODS.qaSubscribeRelease,
     idleTtlMs: 30_000,
   }),
+  createProject: createEnvironmentRpcCommand(connectionAtomRuntime, {
+    label: "environment-data:qa:create-project",
+    tag: WS_METHODS.qaCreateProject,
+    scheduler: qaMutationScheduler,
+    concurrency: releaseSerialConcurrency,
+  }),
   initialize: createEnvironmentRpcCommand(connectionAtomRuntime, {
     label: "environment-data:qa:initialize",
     tag: WS_METHODS.qaInitializeRelease,

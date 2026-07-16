@@ -1,16 +1,12 @@
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import { DEFAULT_MODEL, DEFAULT_RUNTIME_MODE, ProviderInstanceId } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
 import { LoaderCircleIcon, ShieldCheckIcon } from "lucide-react";
 import { useState, type FormEvent } from "react";
 
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
-import { projectEnvironment } from "../state/projects";
-import { threadEnvironment } from "../state/threads";
 import { useAtomCommand } from "../state/use-atom-command";
 import { qaEnvironment } from "../qa/client";
-import { buildQaProjectWorkspaceRoot } from "../qa/projectCreation";
 import { useRightPanelStore } from "../rightPanelStore";
 import { newProjectId, newThreadId } from "../lib/utils";
 import { buildThreadRouteParams } from "../threadRoutes";
@@ -45,11 +41,7 @@ export function QaProjectCreationDialog(props: {
   const { environments } = useEnvironments();
   const primaryEnvironment = usePrimaryEnvironment();
   const environment = primaryEnvironment ?? environments[0] ?? null;
-  const createProject = useAtomCommand(projectEnvironment.create, { reportFailure: false });
-  const deleteProject = useAtomCommand(projectEnvironment.delete, { reportFailure: false });
-  const createThread = useAtomCommand(threadEnvironment.create, { reportFailure: false });
-  const deleteThread = useAtomCommand(threadEnvironment.delete, { reportFailure: false });
-  const initializeRelease = useAtomCommand(qaEnvironment.initialize, { reportFailure: false });
+  const createProject = useAtomCommand(qaEnvironment.createProject, { reportFailure: false });
   const [step, setStep] = useState<"project" | "release">("project");
   const [projectTitle, setProjectTitle] = useState("");
   const [releaseTitle, setReleaseTitle] = useState("");
@@ -83,57 +75,8 @@ export function QaProjectCreationDialog(props: {
     const projectId = newProjectId();
     const threadId = newThreadId();
     const environmentId = environment.environmentId;
-    const workspaceRoot = buildQaProjectWorkspaceRoot({
-      baseDirectory: environment.serverConfig?.settings.addProjectBaseDirectory,
-      projectTitle: trimmedProjectTitle,
-      projectId,
-    });
-    const createdAt = new Date().toISOString();
 
     const projectResult = await createProject({
-      environmentId,
-      input: {
-        projectId,
-        title: trimmedProjectTitle,
-        workspaceRoot,
-        createWorkspaceRootIfMissing: true,
-        defaultModelSelection: {
-          instanceId: ProviderInstanceId.make("codex"),
-          model: DEFAULT_MODEL,
-        },
-      },
-    });
-    if (projectResult._tag === "Failure") {
-      setError(failureMessage(projectResult, "The QA project could not be created."));
-      setIsCreating(false);
-      return;
-    }
-
-    const threadResult = await createThread({
-      environmentId,
-      input: {
-        threadId,
-        projectId,
-        title: trimmedReleaseTitle,
-        modelSelection: {
-          instanceId: ProviderInstanceId.make("codex"),
-          model: DEFAULT_MODEL,
-        },
-        runtimeMode: DEFAULT_RUNTIME_MODE,
-        interactionMode: "default",
-        branch: null,
-        worktreePath: null,
-        createdAt,
-      },
-    });
-    if (threadResult._tag === "Failure") {
-      await deleteProject({ environmentId, input: { projectId, force: true } });
-      setError(failureMessage(threadResult, "The initial QA release could not be created."));
-      setIsCreating(false);
-      return;
-    }
-
-    const releaseResult = await initializeRelease({
       environmentId,
       input: {
         projectId,
@@ -142,10 +85,8 @@ export function QaProjectCreationDialog(props: {
         releaseTitle: trimmedReleaseTitle,
       },
     });
-    if (releaseResult._tag === "Failure") {
-      await deleteThread({ environmentId, input: { threadId } });
-      await deleteProject({ environmentId, input: { projectId, force: true } });
-      setError(failureMessage(releaseResult, "The QA release workspace could not be initialized."));
+    if (projectResult._tag === "Failure") {
+      setError(failureMessage(projectResult, "The QA project and release could not be created."));
       setIsCreating(false);
       return;
     }

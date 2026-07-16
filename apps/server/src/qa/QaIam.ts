@@ -186,6 +186,7 @@ type ProjectAccessRow = PrincipalRow & {
 
 type ProjectRegistrationContextRow = {
   readonly organizationId: string;
+  readonly sourceProjectId: string;
   readonly role: string;
 };
 
@@ -343,22 +344,28 @@ export const make = Effect.gen(function* () {
     const contexts = yield* sql<ProjectRegistrationContextRow>`
       SELECT
         memberships.organization_id AS "organizationId",
+        assignments.project_id AS "sourceProjectId",
         assignments.role
       FROM organization_memberships memberships
       JOIN organizations ON organizations.id = memberships.organization_id
       JOIN qa_project_assignments assignments
         ON assignments.organization_id = memberships.organization_id
         AND assignments.principal_id = memberships.principal_id
+      JOIN qa_projects source_projects
+        ON source_projects.id = assignments.project_id
+        AND source_projects.organization_id = assignments.organization_id
       WHERE memberships.principal_id = ${principal.id}
         AND memberships.status = 'active'
         AND organizations.status = 'active'
+        AND source_projects.status = 'active'
       ORDER BY
         CASE assignments.role
           WHEN 'root' THEN 1
           WHEN 'qa:maker' THEN 2
           ELSE 3
         END,
-        memberships.organization_id
+        memberships.organization_id,
+        assignments.project_id
       LIMIT 1
     `.pipe(Effect.mapError((cause) => persistenceError("registerProject:resolveContext", cause)));
     const context = contexts[0];
@@ -387,13 +394,25 @@ export const make = Effect.gen(function* () {
           yield* sql`
           INSERT INTO qa_project_assignments (
             organization_id, project_id, principal_id, role, created_at, updated_at
-          ) VALUES (
-            ${context.organizationId}, ${input.projectId}, ${principal.id}, ${context.role},
-            ${timestamp}, ${timestamp}
           )
-        `.pipe(
-            Effect.mapError((cause) => persistenceError("registerProject:assignPrincipal", cause)),
-          );
+          SELECT
+            ${context.organizationId},
+            ${input.projectId},
+            source_assignments.principal_id,
+            source_assignments.role,
+            ${timestamp},
+            ${timestamp}
+          FROM qa_project_assignments source_assignments
+          JOIN application_principals source_principals
+            ON source_principals.id = source_assignments.principal_id
+          JOIN organization_memberships source_memberships
+            ON source_memberships.organization_id = source_assignments.organization_id
+            AND source_memberships.principal_id = source_assignments.principal_id
+          WHERE source_assignments.organization_id = ${context.organizationId}
+            AND source_assignments.project_id = ${context.sourceProjectId}
+            AND source_principals.status = 'active'
+            AND source_memberships.status = 'active'
+        `.pipe(Effect.mapError((cause) => persistenceError("registerProject:assignTeam", cause)));
           return yield* resolveProjectAccess(input);
         }),
       )

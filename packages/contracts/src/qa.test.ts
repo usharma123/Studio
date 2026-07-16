@@ -12,6 +12,7 @@ import {
   QaAgentSubmitTestCasesInput,
   QaDocumentKind,
   QaAssignedReleaseDashboard,
+  QaCreateProjectInput,
   QaGetReleaseAccessInput,
   QaInitializeReleaseInput,
   QaListAssignedReleasesInput,
@@ -49,6 +50,7 @@ const decodeEnterpriseMode = Schema.decodeUnknownSync(EnterpriseMode);
 const decodeQaAddReviewCommentInput = Schema.decodeUnknownSync(QaAddReviewCommentInput);
 const decodeQaAssignedReleaseDashboard = Schema.decodeUnknownSync(QaAssignedReleaseDashboard);
 const decodeQaGetReleaseAccessInput = Schema.decodeUnknownSync(QaGetReleaseAccessInput);
+const decodeQaCreateProjectInput = Schema.decodeUnknownSync(QaCreateProjectInput);
 const decodeQaListAssignedReleasesInput = Schema.decodeUnknownSync(QaListAssignedReleasesInput);
 const decodeQaListReviewThreadsInput = Schema.decodeUnknownSync(QaListReviewThreadsInput);
 const decodeQaMarkReviewReadInput = Schema.decodeUnknownSync(QaMarkReviewReadInput);
@@ -109,15 +111,26 @@ const stages = [
 ];
 
 describe("QA contracts", () => {
-  it("accepts user-facing names when initializing a QA project release", () => {
-    const input = decodeQaInitializeReleaseInput({
-      projectId: ProjectId.make("project-qa-contract"),
-      threadId: ThreadId.make("thread-qa-contract"),
+  it("decodes server-owned QA project creation without a client workspace root", () => {
+    const input = decodeQaCreateProjectInput({
+      projectId: ProjectId.make("project-qa-create"),
+      threadId: ThreadId.make("thread-qa-create"),
       projectTitle: "Customer portal",
       releaseTitle: "2.4.0 regression",
     });
 
     expect(input.projectTitle).toBe("Customer portal");
+    expect(input.releaseTitle).toBe("2.4.0 regression");
+    expect("workspaceRoot" in input).toBe(false);
+  });
+
+  it("accepts a release name when initializing an existing QA project", () => {
+    const input = decodeQaInitializeReleaseInput({
+      projectId: ProjectId.make("project-qa-contract"),
+      threadId: ThreadId.make("thread-qa-contract"),
+      releaseTitle: "2.4.0 regression",
+    });
+
     expect(input.releaseTitle).toBe("2.4.0 regression");
   });
 
@@ -129,6 +142,7 @@ describe("QA contracts", () => {
     expect(WS_METHODS.qaListAssignedReleases).toBe("qa.listAssignedReleases");
     expect(WS_METHODS.qaGetReleaseAccess).toBe("qa.getReleaseAccess");
     expect(WS_METHODS.qaGetSnapshot).toBe("qa.getSnapshot");
+    expect(WS_METHODS.qaCreateProject).toBe("qa.createProject");
     expect(WS_METHODS.qaInitializeRelease).toBe("qa.initializeRelease");
     expect(WS_METHODS.qaUploadDocument).toBe("qa.uploadDocument");
     expect(WS_METHODS.qaStartIngestion).toBe("qa.startIngestion");

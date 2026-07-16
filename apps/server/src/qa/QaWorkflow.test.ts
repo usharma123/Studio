@@ -48,7 +48,6 @@ layer("QaWorkflow", (it) => {
       const initialized = yield* qa.initializeRelease({
         projectId,
         threadId,
-        projectTitle: "QA Project",
         releaseTitle: "2.4.0 regression",
       });
       assert.equal(initialized.title, "2.4.0 regression");

@@ -147,6 +147,7 @@ import {
   QaAddReviewCommentInput,
   QaAddStrategyCommentInput,
   QaAssignedReleaseDashboard,
+  QaCreateProjectInput,
   QaGenerateStrategyInput,
   QaGetReleaseAccessInput,
   QaGetScenarioPlanInput,
@@ -288,6 +289,7 @@ export const WS_METHODS = {
   qaListAssignedReleases: "qa.listAssignedReleases",
   qaGetReleaseAccess: "qa.getReleaseAccess",
   qaGetSnapshot: "qa.getSnapshot",
+  qaCreateProject: "qa.createProject",
   qaInitializeRelease: "qa.initializeRelease",
   qaUploadDocument: "qa.uploadDocument",
   qaStartIngestion: "qa.startIngestion",
@@ -349,6 +351,12 @@ export const WsQaGetReleaseAccessRpc = Rpc.make(WS_METHODS.qaGetReleaseAccess, {
 export const WsQaGetSnapshotRpc = Rpc.make(WS_METHODS.qaGetSnapshot, {
   payload: QaGetSnapshotInput,
   success: Schema.NullOr(QaReleaseSnapshot),
+  error: Schema.Union([QaOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsQaCreateProjectRpc = Rpc.make(WS_METHODS.qaCreateProject, {
+  payload: QaCreateProjectInput,
+  success: QaReleaseSnapshot,
   error: Schema.Union([QaOperationError, EnvironmentAuthorizationError]),
 });
 
@@ -1008,6 +1016,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsQaListAssignedReleasesRpc,
   WsQaGetReleaseAccessRpc,
   WsQaGetSnapshotRpc,
+  WsQaCreateProjectRpc,
   WsQaInitializeReleaseRpc,
   WsQaUploadDocumentRpc,
   WsQaStartIngestionRpc,

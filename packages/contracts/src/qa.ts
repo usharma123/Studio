@@ -953,10 +953,22 @@ export const QaReviewMutationResult = Schema.Struct({
 });
 export type QaReviewMutationResult = typeof QaReviewMutationResult.Type;
 
+/**
+ * Creates the orchestration project, its first release thread, and the QA
+ * records through one server-owned operation. The workspace root and runtime
+ * defaults are intentionally not client-controlled for QA-scoped principals.
+ */
+export const QaCreateProjectInput = Schema.Struct({
+  projectId: ProjectId,
+  threadId: ThreadId,
+  projectTitle: TrimmedNonEmptyString.check(Schema.isMaxLength(160)),
+  releaseTitle: TrimmedNonEmptyString.check(Schema.isMaxLength(160)),
+});
+export type QaCreateProjectInput = typeof QaCreateProjectInput.Type;
+
 export const QaInitializeReleaseInput = Schema.Struct({
   projectId: ProjectId,
   threadId: ThreadId,
-  projectTitle: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(160))),
   releaseTitle: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(160))),
 });
 export type QaInitializeReleaseInput = typeof QaInitializeReleaseInput.Type;

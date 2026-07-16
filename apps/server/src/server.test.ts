@@ -77,7 +77,10 @@ import * as GitManager from "./git/GitManager.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
-import { OrchestrationListenerCallbackError } from "./orchestration/Errors.ts";
+import {
+  OrchestrationCommandInvariantError,
+  OrchestrationListenerCallbackError,
+} from "./orchestration/Errors.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite.ts";
 import { PersistenceSqlError } from "./persistence/Errors.ts";
@@ -4718,6 +4721,144 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       assert.isAtLeast(response.sequence, 0);
       assert.equal(stat.type, "Directory");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("denies QA project creation to an approver before orchestration dispatch", () =>
+    Effect.gen(function* () {
+      const commands: Array<OrchestrationCommand> = [];
+      yield* buildAppUnderTest({
+        config: { desktopDevelopmentProfile: "qa:approver" },
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command) => {
+              commands.push(command);
+              return Effect.succeed({ sequence: commands.length });
+            },
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.qaCreateProject]({
+            projectId: ProjectId.make("project-qa-approver-denied"),
+            threadId: ThreadId.make("thread-qa-approver-denied"),
+            projectTitle: "Denied project",
+            releaseTitle: "Denied release",
+          }),
+        ),
+      ).pipe(Effect.result);
+
+      if (result._tag !== "Failure" || result.failure._tag !== "EnvironmentAuthorizationError") {
+        assert.fail("Expected an EnvironmentAuthorizationError");
+      }
+      assert.equal(result.failure.requiredScope, "qa:make");
+      assert.deepEqual(commands, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("keeps generic orchestration project creation blocked for a QA maker", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const workspaceRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3-qa-guard-" });
+      const commands: Array<OrchestrationCommand> = [];
+      yield* buildAppUnderTest({
+        config: { desktopDevelopmentProfile: "qa:maker" },
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command) => {
+              commands.push(command);
+              return Effect.succeed({ sequence: commands.length });
+            },
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "project.create",
+            commandId: CommandId.make("maker-generic-project-create"),
+            projectId: ProjectId.make("maker-generic-project"),
+            title: "Generic project",
+            workspaceRoot,
+            createdAt: "2026-07-16T00:00:00.000Z",
+          }),
+        ),
+      ).pipe(Effect.result);
+
+      if (
+        result._tag !== "Failure" ||
+        result.failure._tag !== "OrchestrationDispatchCommandError"
+      ) {
+        assert.fail("Expected an OrchestrationDispatchCommandError");
+      }
+      assert.include(result.failure.message, "QA chat sessions may only");
+      assert.deepEqual(commands, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("rolls back the project and empty derived workspace when thread creation fails", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const workspaceBase = yield* fs.makeTempDirectoryScoped({ prefix: "t3-qa-rollback-" });
+      const commands: Array<OrchestrationCommand> = [];
+      const projectId = ProjectId.make("rollback-project-1234");
+      const expectedWorkspaceRoot = path.join(
+        workspaceBase,
+        ".t3-qa-projects",
+        "rollback-project-rollback",
+      );
+
+      yield* buildAppUnderTest({
+        config: { desktopDevelopmentProfile: "qa:maker" },
+        layers: {
+          serverSettings: {
+            getSettings: Effect.succeed({
+              ...DEFAULT_SERVER_SETTINGS,
+              addProjectBaseDirectory: workspaceBase,
+            }),
+          },
+          orchestrationEngine: {
+            dispatch: (command) => {
+              commands.push(command);
+              return command.type === "thread.create"
+                ? Effect.fail(
+                    new OrchestrationCommandInvariantError({
+                      commandType: command.type,
+                      detail: "Injected thread creation failure.",
+                    }),
+                  )
+                : Effect.succeed({ sequence: commands.length });
+            },
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.qaCreateProject]({
+            projectId,
+            threadId: ThreadId.make("rollback-thread-1234"),
+            projectTitle: "Rollback project",
+            releaseTitle: "v1",
+          }),
+        ),
+      ).pipe(Effect.result);
+
+      if (result._tag !== "Failure" || result.failure._tag !== "QaOperationError") {
+        assert.fail("Expected a QaOperationError");
+      }
+      assert.deepEqual(
+        commands.map((command) => command.type),
+        ["project.create", "thread.create", "project.delete"],
+      );
+      assert.isFalse(yield* fs.exists(expectedWorkspaceRoot));
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

@@ -3,8 +3,11 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -23,6 +26,8 @@ import {
   AuthTerminalOperateScope,
   AuthAccessReadScope,
   AuthAccessStreamError,
+  DEFAULT_MODEL,
+  DEFAULT_RUNTIME_MODE,
   type AuthAccessStreamEvent,
   type AuthEnvironmentScope,
   AuthSessionId,
@@ -39,6 +44,7 @@ import {
   type OrchestrationThreadStreamItem,
   QaOperationError,
   ProjectId,
+  ProviderInstanceId,
   type QaReviewActor,
   type QaReleaseSnapshot,
   OrchestrationGetFullThreadDiffError,
@@ -129,11 +135,22 @@ import * as QaIam from "./qa/QaIam.ts";
 import * as QaDatabase from "./qa/QaDatabase.ts";
 import * as QaReleaseEventBus from "./qa/QaReleaseEventBus.ts";
 import * as QaReviewService from "./qa/QaReviewService.ts";
+import { buildQaProjectWorkspaceRoot } from "./qa/QaProjectWorkspace.ts";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 const isEnvironmentAuthorizationError = Schema.is(EnvironmentAuthorizationError);
 const isQaOperationError = Schema.is(QaOperationError);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+
+function isPathWithin(path: Path.Path, parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return (
+    relative.length > 0 &&
+    relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+  );
+}
 
 function unexpectedCompatibilityError(error: never): never {
   throw new Error(`Unhandled compatibility error: ${String(error)}`);
@@ -340,6 +357,7 @@ const RPC_REQUIRED_SCOPE = new Map<string, RpcRequiredScope>([
   [WS_METHODS.qaListAssignedReleases, AuthQaReadScope],
   [WS_METHODS.qaGetReleaseAccess, AuthQaReadScope],
   [WS_METHODS.qaGetSnapshot, AuthQaReadScope],
+  [WS_METHODS.qaCreateProject, AuthQaMakeScope],
   [WS_METHODS.qaInitializeRelease, AuthQaMakeScope],
   [WS_METHODS.qaUploadDocument, AuthQaMakeScope],
   [WS_METHODS.qaStartIngestion, AuthQaMakeScope],
@@ -480,6 +498,9 @@ const makeWsRpcLayer = (
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
       const crypto = yield* Crypto.Crypto;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
       const checkpointDiffQuery = yield* CheckpointDiffQuery.CheckpointDiffQuery;
@@ -1166,6 +1187,173 @@ const makeWsRpcLayer = (
           );
       };
 
+      const compensateQaProjectCreation = (input: {
+        readonly projectId: ProjectId;
+        readonly projectCreated: boolean;
+        readonly workspaceCreated: boolean;
+        readonly workspaceRoot: string | null;
+        readonly workspaceBoundary: string | null;
+      }) =>
+        Effect.gen(function* () {
+          let projectRemoved = !input.projectCreated;
+          if (input.projectCreated) {
+            const rollbackExit = yield* serverCommandId("qa-create-project-rollback").pipe(
+              Effect.flatMap((commandId) =>
+                dispatchNormalizedCommand({
+                  type: "project.delete",
+                  commandId,
+                  projectId: input.projectId,
+                  force: true,
+                }),
+              ),
+              Effect.tapCause(Effect.logError),
+              Effect.exit,
+            );
+            projectRemoved = Exit.isSuccess(rollbackExit);
+          }
+          if (
+            input.projectCreated &&
+            projectRemoved &&
+            input.workspaceCreated &&
+            input.workspaceRoot !== null &&
+            input.workspaceBoundary !== null &&
+            path.basename(input.workspaceBoundary) === ".t3-qa-projects" &&
+            isPathWithin(path, input.workspaceBoundary, input.workspaceRoot)
+          ) {
+            yield* fileSystem.readDirectory(input.workspaceRoot, { recursive: false }).pipe(
+              Effect.flatMap((entries) =>
+                entries.length === 0
+                  ? fileSystem.remove(input.workspaceRoot!, { recursive: true })
+                  : Effect.void,
+              ),
+              Effect.ignoreCause({ log: true }),
+            );
+          }
+        });
+
+      const createQaProject = (input: {
+        readonly projectId: ProjectId;
+        readonly threadId: ThreadId;
+        readonly projectTitle: string;
+        readonly releaseTitle: string;
+      }) => {
+        let projectCreated = false;
+        let workspaceCreated = false;
+        let workspaceRoot: string | null = null;
+        let workspaceBoundary: string | null = null;
+
+        return Effect.gen(function* () {
+          const [createdAt, settings] = yield* Effect.all([
+            nowIso,
+            serverSettings.getSettings.pipe(
+              Effect.mapError(
+                () =>
+                  new QaOperationError({
+                    code: "persistence_failed",
+                    message: "The QA project workspace could not be prepared.",
+                  }),
+              ),
+            ),
+          ]);
+          const requestedWorkspaceRoot = buildQaProjectWorkspaceRoot({
+            baseDirectory: settings.addProjectBaseDirectory,
+            projectTitle: input.projectTitle,
+            projectId: input.projectId,
+            joinPath: path.join,
+          });
+          const workspaceState = yield* workspacePaths
+            .normalizeWorkspaceRoot(requestedWorkspaceRoot)
+            .pipe(
+              Effect.matchEffect({
+                onFailure: (cause) =>
+                  cause._tag === "WorkspaceRootNotExistsError"
+                    ? Effect.succeed({ exists: false, root: cause.normalizedWorkspaceRoot })
+                    : Effect.fail(
+                        new QaOperationError({
+                          code: "persistence_failed",
+                          message: "The QA project workspace could not be prepared.",
+                        }),
+                      ),
+                onSuccess: (root) => Effect.succeed({ exists: true, root }),
+              }),
+            );
+          workspaceCreated = !workspaceState.exists;
+          workspaceRoot = workspaceState.root;
+          workspaceBoundary = path.dirname(workspaceState.root);
+          const modelSelection = {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: DEFAULT_MODEL,
+          } as const;
+          const projectCommand = yield* normalizeDispatchCommand({
+            type: "project.create",
+            commandId: yield* serverCommandId("qa-create-project"),
+            projectId: input.projectId,
+            title: input.projectTitle,
+            workspaceRoot: requestedWorkspaceRoot,
+            createWorkspaceRootIfMissing: true,
+            defaultModelSelection: modelSelection,
+            createdAt,
+          });
+
+          yield* dispatchNormalizedCommand(projectCommand);
+          projectCreated = true;
+          yield* dispatchNormalizedCommand({
+            type: "thread.create",
+            commandId: yield* serverCommandId("qa-create-release-thread"),
+            threadId: input.threadId,
+            projectId: input.projectId,
+            title: input.releaseTitle,
+            modelSelection,
+            runtimeMode: DEFAULT_RUNTIME_MODE,
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            createdAt,
+          });
+
+          return yield* qaDatabase.withTransaction(
+            qaIam
+              .registerProject({
+                subject: currentSession.subject,
+                projectId: input.projectId,
+                projectName: input.projectTitle,
+              })
+              .pipe(
+                Effect.mapError(mapQaProjectRegistrationError),
+                Effect.flatMap(() =>
+                  qaWorkflow.initializeRelease({
+                    projectId: input.projectId,
+                    threadId: input.threadId,
+                    releaseTitle: input.releaseTitle,
+                  }),
+                ),
+              ),
+          );
+        }).pipe(
+          Effect.onExit((exit) =>
+            Exit.isFailure(exit)
+              ? Effect.uninterruptible(
+                  compensateQaProjectCreation({
+                    projectId: input.projectId,
+                    projectCreated,
+                    workspaceCreated,
+                    workspaceRoot,
+                    workspaceBoundary,
+                  }),
+                )
+              : Effect.void,
+          ),
+          Effect.mapError((cause) =>
+            isEnvironmentAuthorizationError(cause) || isQaOperationError(cause)
+              ? cause
+              : new QaOperationError({
+                  code: "persistence_failed",
+                  message: "The QA project and first release could not be created.",
+                }),
+          ),
+        );
+      };
+
       const loadServerConfig = Effect.gen(function* () {
         const keybindingsConfig = yield* keybindings.loadConfigState;
         const providers = yield* providerRegistry.getProviders;
@@ -1313,44 +1501,28 @@ const makeWsRpcLayer = (
             "qa:read",
             qaWorkflow.getSnapshot(input),
           ),
+        [WS_METHODS.qaCreateProject]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.qaCreateProject,
+            createQaProject(input).pipe(
+              Effect.flatMap((snapshot) => publishQaSnapshot("stage_started", snapshot)),
+            ),
+            { "rpc.aggregate": "qa" },
+          ),
         [WS_METHODS.qaInitializeRelease]: (input) =>
           observeRpcEffect(
             WS_METHODS.qaInitializeRelease,
-            (input.projectTitle === undefined
-              ? qaIam
-                  .authorizeProject({
-                    subject: currentSession.subject,
-                    projectId: input.projectId,
-                    capability: "qa:make",
-                  })
-                  .pipe(
-                    Effect.mapError(mapQaProjectRegistrationError),
-                    Effect.andThen(qaWorkflow.initializeRelease(input)),
-                  )
-              : qaDatabase
-                  .withTransaction(
-                    qaIam
-                      .registerProject({
-                        subject: currentSession.subject,
-                        projectId: input.projectId,
-                        projectName: input.projectTitle,
-                      })
-                      .pipe(
-                        Effect.mapError(mapQaProjectRegistrationError),
-                        Effect.flatMap(() => qaWorkflow.initializeRelease(input)),
-                      ),
-                  )
-                  .pipe(
-                    Effect.mapError((cause) =>
-                      isEnvironmentAuthorizationError(cause) || isQaOperationError(cause)
-                        ? cause
-                        : new QaOperationError({
-                            code: "persistence_failed",
-                            message: "The QA project and release could not be created.",
-                          }),
-                    ),
-                  )
-            ).pipe(Effect.flatMap((snapshot) => publishQaSnapshot("stage_started", snapshot))),
+            qaIam
+              .authorizeProject({
+                subject: currentSession.subject,
+                projectId: input.projectId,
+                capability: "qa:make",
+              })
+              .pipe(
+                Effect.mapError(mapQaProjectRegistrationError),
+                Effect.andThen(qaWorkflow.initializeRelease(input)),
+                Effect.flatMap((snapshot) => publishQaSnapshot("stage_started", snapshot)),
+              ),
             { "rpc.aggregate": "qa" },
           ),
         [WS_METHODS.qaUploadDocument]: (input) =>
