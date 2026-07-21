@@ -28,6 +28,7 @@ import {
   gitRefExists,
   gitShowFileAtRef,
   makeOrchestrationIntegrationHarness,
+  ORCHESTRATION_INTEGRATION_AUTH_SESSION_ID,
   type OrchestrationIntegrationHarness,
 } from "./OrchestrationEngineHarness.integration.ts";
 import { checkpointRefForThreadTurn } from "../src/checkpointing/Utils.ts";
@@ -179,6 +180,7 @@ const startTurn = (input: {
       : {}),
     interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
     runtimeMode: "approval-required",
+    initiatingSessionId: ORCHESTRATION_INTEGRATION_AUTH_SESSION_ID,
     createdAt: input.createdAt ?? nowIso(),
   });
 
@@ -315,6 +317,7 @@ it.live.skipIf(!process.env.CODEX_BINARY_PATH)(
           },
           interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
           runtimeMode: "full-access",
+          initiatingSessionId: ORCHESTRATION_INTEGRATION_AUTH_SESSION_ID,
           createdAt: nowIso(),
         });
 
@@ -342,6 +345,7 @@ it.live.skipIf(!process.env.CODEX_BINARY_PATH)(
           },
           interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
           runtimeMode: "approval-required",
+          initiatingSessionId: ORCHESTRATION_INTEGRATION_AUTH_SESSION_ID,
           createdAt: nowIso(),
         });
 

@@ -5,6 +5,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   ApprovalRequestId,
   AuthOrchestrationOperateScope,
+  AuthSessionId,
   CodexSettings,
   EnvironmentId,
   ProviderDriverKind,
@@ -83,9 +84,51 @@ import * as VcsProcess from "../src/vcs/VcsProcess.ts";
 import * as AgentAwarenessRelay from "../src/relay/AgentAwarenessRelay.ts";
 import * as SessionStore from "../src/auth/SessionStore.ts";
 import * as ServerEnvironment from "../src/environment/ServerEnvironment.ts";
+import * as McpProviderSession from "../src/mcp/McpProviderSession.ts";
+import * as McpSessionRegistry from "../src/mcp/McpSessionRegistry.ts";
 import * as QaIam from "../src/qa/QaIam.ts";
 
 const decodeCodexSettings = Schema.decodeEffect(CodexSettings);
+
+export const ORCHESTRATION_INTEGRATION_AUTH_SESSION_ID = AuthSessionId.make(
+  "orchestration-engine-harness-session",
+);
+
+const issueHarnessMcpCredential = (request: McpSessionRegistry.McpCredentialRequest) =>
+  Effect.sync(() => {
+    const providerSessionId = `orchestration-engine-harness:${request.threadId}`;
+    const credential: McpSessionRegistry.McpIssuedCredential = {
+      config: {
+        initiatingSessionId: request.initiatingSessionId,
+        environmentId: EnvironmentId.make("orchestration-engine-harness"),
+        threadId: request.threadId,
+        providerSessionId,
+        providerInstanceId: request.providerInstanceId,
+        endpoint: "http://127.0.0.1/mcp",
+        authorizationHeader: `Bearer ${providerSessionId}`,
+        authorizationContext: {
+          kind: "standard",
+          principalSubject: "orchestration-engine-harness:test",
+          workspaceAdministrator: true,
+        },
+      },
+      expiresAt: Number.MAX_SAFE_INTEGER,
+    };
+    McpProviderSession.setMcpProviderSession(credential.config);
+    return credential;
+  });
+
+const validateHarnessMcpCredential = (
+  request: McpSessionRegistry.McpCurrentThreadAuthorizationRequest,
+) =>
+  Effect.sync(() => {
+    const current = McpProviderSession.readMcpProviderSession(request.threadId);
+    const isValid = current?.initiatingSessionId === request.initiatingSessionId;
+    if (!isValid) {
+      McpProviderSession.clearMcpProviderSession(request.threadId);
+    }
+    return isValid;
+  });
 
 function runGit(cwd: string, args: ReadonlyArray<string>) {
   return NodeChildProcess.execFileSync("git", args, {
@@ -287,13 +330,19 @@ export const makeOrchestrationIntegrationHarness = (
     );
     const providerEventLoggersLayer = Layer.succeed(ProviderEventLoggers, NoOpProviderEventLoggers);
     const providerLayer = useRealCodex
-      ? makeProviderServiceLive().pipe(
+      ? makeProviderServiceLive({
+          issueMcpCredential: issueHarnessMcpCredential,
+          validateMcpCredential: validateHarnessMcpCredential,
+        }).pipe(
           Layer.provide(providerSessionDirectoryLayer),
           Layer.provide(realCodexRegistry),
           Layer.provide(AnalyticsService.layerTest),
           Layer.provide(providerEventLoggersLayer),
         )
-      : makeProviderServiceLive().pipe(
+      : makeProviderServiceLive({
+          issueMcpCredential: issueHarnessMcpCredential,
+          validateMcpCredential: validateHarnessMcpCredential,
+        }).pipe(
           Layer.provide(providerSessionDirectoryLayer),
           Layer.provide(fakeRegistry!),
           Layer.provide(AnalyticsService.layerTest),
@@ -331,12 +380,14 @@ export const makeOrchestrationIntegrationHarness = (
     const sessionStoreLayer = Layer.mock(SessionStore.SessionStore, {
       cookieName: "t3-orchestration-engine-harness-session",
       resolveActiveAuthorization: (sessionId) =>
-        Effect.succeed({
-          sessionId,
-          subject: "orchestration-engine-harness:test",
-          scopes: [AuthOrchestrationOperateScope],
-          expiresAt: DateTime.makeUnsafe("2099-01-01T00:00:00.000Z"),
-        }),
+        sessionId === ORCHESTRATION_INTEGRATION_AUTH_SESSION_ID
+          ? Effect.succeed({
+              sessionId,
+              subject: "orchestration-engine-harness:test",
+              scopes: [AuthOrchestrationOperateScope],
+              expiresAt: DateTime.makeUnsafe("2099-01-01T00:00:00.000Z"),
+            })
+          : Effect.fail(new SessionStore.UnknownSessionTokenError({ sessionId })),
     });
     const serverEnvironmentLayer = Layer.succeed(
       ServerEnvironment.ServerEnvironment,

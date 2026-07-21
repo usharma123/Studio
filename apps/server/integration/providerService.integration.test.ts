@@ -1,5 +1,11 @@
 import type { ProviderRuntimeEvent } from "@t3tools/contracts";
-import { ProviderDriverKind, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  AuthSessionId,
+  EnvironmentId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ThreadId,
+} from "@t3tools/contracts";
 import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts/settings";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it, assert } from "@effect/vitest";
@@ -26,6 +32,8 @@ import { ServerSettingsService } from "../src/serverSettings.ts";
 import { AnalyticsService } from "../src/telemetry/Services/AnalyticsService.ts";
 import { SqlitePersistenceMemory } from "../src/persistence/Layers/Sqlite.ts";
 import * as ProviderSessionRuntime from "../src/persistence/ProviderSessionRuntime.ts";
+import * as McpProviderSession from "../src/mcp/McpProviderSession.ts";
+import * as McpSessionRegistry from "../src/mcp/McpSessionRegistry.ts";
 
 import {
   makeTestProviderAdapterHarness,
@@ -39,6 +47,45 @@ import {
 } from "./fixtures/providerRuntime.ts";
 
 const codexInstanceId = ProviderInstanceId.make("codex");
+const providerServiceIntegrationAuthorization = {
+  initiatingSessionId: AuthSessionId.make("provider-service-integration-session"),
+};
+
+const issueIntegrationMcpCredential = (request: McpSessionRegistry.McpCredentialRequest) =>
+  Effect.sync(() => {
+    const providerSessionId = `provider-service-integration:${request.threadId}`;
+    const credential: McpSessionRegistry.McpIssuedCredential = {
+      config: {
+        initiatingSessionId: request.initiatingSessionId,
+        environmentId: EnvironmentId.make("provider-service-integration"),
+        threadId: request.threadId,
+        providerSessionId,
+        providerInstanceId: request.providerInstanceId,
+        endpoint: "http://127.0.0.1/mcp",
+        authorizationHeader: `Bearer ${providerSessionId}`,
+        authorizationContext: {
+          kind: "standard",
+          principalSubject: "provider-service-integration:test",
+          workspaceAdministrator: true,
+        },
+      },
+      expiresAt: Number.MAX_SAFE_INTEGER,
+    };
+    McpProviderSession.setMcpProviderSession(credential.config);
+    return credential;
+  });
+
+const validateIntegrationMcpCredential = (
+  request: McpSessionRegistry.McpCurrentThreadAuthorizationRequest,
+) =>
+  Effect.sync(() => {
+    const current = McpProviderSession.readMcpProviderSession(request.threadId);
+    const isValid = current?.initiatingSessionId === request.initiatingSessionId;
+    if (!isValid) {
+      McpProviderSession.clearMcpProviderSession(request.threadId);
+    }
+    return isValid;
+  });
 
 const makeWorkspaceDirectory = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -74,7 +121,10 @@ const makeIntegrationFixture = Effect.gen(function* () {
     Layer.succeed(ProviderEventLoggers, NoOpProviderEventLoggers),
   ).pipe(Layer.provide(SqlitePersistenceMemory));
 
-  const layer = makeProviderServiceLive().pipe(Layer.provide(shared));
+  const layer = makeProviderServiceLive({
+    issueMcpCredential: issueIntegrationMcpCredential,
+    validateMcpCredential: validateIntegrationMcpCredential,
+  }).pipe(Layer.provide(shared));
 
   return {
     cwd,
@@ -116,11 +166,14 @@ const runTurn = (input: {
     return yield* collectEventsDuring(
       input.provider.streamEvents,
       input.response.events.length,
-      input.provider.sendTurn({
-        threadId: input.threadId,
-        input: input.userText,
-        attachments: [],
-      }),
+      input.provider.sendTurn(
+        {
+          threadId: input.threadId,
+          input: input.userText,
+          attachments: [],
+        },
+        providerServiceIntegrationAuthorization,
+      ),
     );
   });
 
@@ -130,13 +183,17 @@ it.live("replays typed runtime fixture events", () =>
 
     yield* Effect.gen(function* () {
       const provider = yield* ProviderService;
-      const session = yield* provider.startSession(ThreadId.make("thread-integration-typed"), {
-        threadId: ThreadId.make("thread-integration-typed"),
-        provider: ProviderDriverKind.make("codex"),
-        providerInstanceId: codexInstanceId,
-        cwd: fixture.cwd,
-        runtimeMode: "full-access",
-      });
+      const session = yield* provider.startSession(
+        ThreadId.make("thread-integration-typed"),
+        {
+          threadId: ThreadId.make("thread-integration-typed"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: codexInstanceId,
+          cwd: fixture.cwd,
+          runtimeMode: "full-access",
+        },
+        providerServiceIntegrationAuthorization,
+      );
       assert.equal((session.threadId ?? "").length > 0, true);
 
       const observedEvents = yield* runTurn({
@@ -167,13 +224,17 @@ it.live("replays file-changing fixture turn events", () =>
 
     yield* Effect.gen(function* () {
       const provider = yield* ProviderService;
-      const session = yield* provider.startSession(ThreadId.make("thread-integration-tools"), {
-        threadId: ThreadId.make("thread-integration-tools"),
-        provider: ProviderDriverKind.make("codex"),
-        providerInstanceId: codexInstanceId,
-        cwd: fixture.cwd,
-        runtimeMode: "full-access",
-      });
+      const session = yield* provider.startSession(
+        ThreadId.make("thread-integration-tools"),
+        {
+          threadId: ThreadId.make("thread-integration-tools"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: codexInstanceId,
+          cwd: fixture.cwd,
+          runtimeMode: "full-access",
+        },
+        providerServiceIntegrationAuthorization,
+      );
       assert.equal((session.threadId ?? "").length > 0, true);
 
       const observedEvents = yield* runTurn({
@@ -204,13 +265,17 @@ it.live("runs multi-turn tool/approval flow", () =>
 
     yield* Effect.gen(function* () {
       const provider = yield* ProviderService;
-      const session = yield* provider.startSession(ThreadId.make("thread-integration-multi"), {
-        threadId: ThreadId.make("thread-integration-multi"),
-        provider: ProviderDriverKind.make("codex"),
-        providerInstanceId: codexInstanceId,
-        cwd: fixture.cwd,
-        runtimeMode: "full-access",
-      });
+      const session = yield* provider.startSession(
+        ThreadId.make("thread-integration-multi"),
+        {
+          threadId: ThreadId.make("thread-integration-multi"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: codexInstanceId,
+          cwd: fixture.cwd,
+          runtimeMode: "full-access",
+        },
+        providerServiceIntegrationAuthorization,
+      );
       assert.equal((session.threadId ?? "").length > 0, true);
 
       const firstTurnEvents = yield* runTurn({
@@ -256,13 +321,17 @@ it.live("rolls back provider conversation state only", () =>
 
     yield* Effect.gen(function* () {
       const provider = yield* ProviderService;
-      const session = yield* provider.startSession(ThreadId.make("thread-integration-rollback"), {
-        threadId: ThreadId.make("thread-integration-rollback"),
-        provider: ProviderDriverKind.make("codex"),
-        providerInstanceId: codexInstanceId,
-        cwd: fixture.cwd,
-        runtimeMode: "full-access",
-      });
+      const session = yield* provider.startSession(
+        ThreadId.make("thread-integration-rollback"),
+        {
+          threadId: ThreadId.make("thread-integration-rollback"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: codexInstanceId,
+          cwd: fixture.cwd,
+          runtimeMode: "full-access",
+        },
+        providerServiceIntegrationAuthorization,
+      );
       assert.equal((session.threadId ?? "").length > 0, true);
 
       yield* runTurn({
