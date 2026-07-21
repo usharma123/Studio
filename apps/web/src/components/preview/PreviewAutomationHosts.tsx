@@ -53,7 +53,6 @@ import { previewAutomationOpenNeedsOverlay } from "./previewAutomationOpenReadin
 import { createPreviewAutomationRequestConsumerAtom } from "./previewAutomationRequestConsumer";
 import { createPreviewAutomationClientId } from "./previewAutomationClientId";
 import {
-  needsPreviewAutomationSessionSync,
   resolvePreviewAutomationOpenTab,
   resolvePreviewAutomationTarget,
 } from "./previewAutomationTarget";
@@ -307,23 +306,20 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
     let tabId = request.tabId ?? null;
     try {
       let state = readThreadPreviewState(threadRef);
-      const needsSessionSync = needsPreviewAutomationSessionSync(state, request.tabId);
-      if (needsSessionSync) {
-        const listTarget = {
-          environmentId,
-          input: {
-            threadId: request.threadId,
-          },
-        } as const;
-        registry.refresh(previewEnvironment.list(listTarget));
-        const result = await listPreviews(listTarget);
-        if (result._tag === "Failure") {
-          return raiseAtomCommandFailure(result);
-        }
-        reconcilePreviewServerSessions(threadRef, result.value.sessions);
-        state = readThreadPreviewState(threadRef);
+      const listTarget = {
+        environmentId,
+        input: {
+          threadId: request.threadId,
+        },
+      } as const;
+      registry.refresh(previewEnvironment.list(listTarget));
+      const result = await listPreviews(listTarget);
+      if (result._tag === "Failure") {
+        return raiseAtomCommandFailure(result);
       }
-      tabId = request.tabId ?? state.snapshot?.tabId ?? null;
+      reconcilePreviewServerSessions(threadRef, result.value.sessions);
+      state = readThreadPreviewState(threadRef);
+      tabId = resolvePreviewAutomationTarget(state, request.tabId ?? null).tabId;
       const unavailableTarget = {
         requestId: request.requestId,
         operation: request.operation,
@@ -349,11 +345,18 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
           return await currentStatus(threadRef, tabId);
         case "open": {
           const input = request.input as PreviewAutomationOpenInput;
-          let activeTabId = resolvePreviewAutomationOpenTab(
+          const openTarget = resolvePreviewAutomationOpenTab(
             state,
             request.tabId,
             input.reuseExistingTab ?? true,
           );
+          if (openTarget.explicitTargetMissing) {
+            throw new PreviewAutomationTargetUnavailableError({
+              ...unavailableTarget,
+              tabId: request.tabId ?? null,
+            });
+          }
+          let activeTabId = openTarget.tabId;
           let activeSnapshot = activeTabId
             ? (state.sessions[activeTabId] ?? state.snapshot ?? undefined)
             : undefined;

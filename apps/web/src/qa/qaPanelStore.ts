@@ -1,5 +1,3 @@
-import { scopedThreadKey } from "@t3tools/client-runtime/environment";
-import type { ScopedThreadRef } from "@t3tools/contracts";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 
@@ -11,26 +9,27 @@ import {
   type QaStageId,
   type QaStageTabId,
 } from "./stageRouting";
+import { qaReleaseKey, type QaReleaseRef } from "./releaseRef";
 
-export interface QaThreadPanelState {
+export interface QaReleasePanelState {
   readonly lastActiveStage: QaStageId;
   readonly viewedStage: QaStageId;
   readonly selectedTabByStage: Partial<Record<QaStageId, QaStageTabId>>;
 }
 
 interface QaPanelStoreState {
-  readonly byThreadKey: Record<string, QaThreadPanelState>;
-  readonly syncActiveStage: (ref: ScopedThreadRef, stage: QaStageId) => void;
-  readonly viewStage: (ref: ScopedThreadRef, stage: QaStageId) => void;
-  readonly selectTab: (ref: ScopedThreadRef, stage: QaStageId, tab: QaStageTabId) => void;
-  readonly removeThread: (ref: ScopedThreadRef) => void;
+  readonly byReleaseKey: Record<string, QaReleasePanelState>;
+  readonly syncActiveStage: (ref: QaReleaseRef, stage: QaStageId) => void;
+  readonly viewStage: (ref: QaReleaseRef, stage: QaStageId) => void;
+  readonly selectTab: (ref: QaReleaseRef, stage: QaStageId, tab: QaStageTabId) => void;
+  readonly removeRelease: (ref: QaReleaseRef) => void;
 }
 
-const STORAGE_KEY = "t3code:qa-panel:v1";
-const initialThreadStates = new Map<QaStageId, QaThreadPanelState>();
+const STORAGE_KEY = "t3code:qa-panel:v2";
+const initialReleaseStates = new Map<QaStageId, QaReleasePanelState>();
 
-function initialThreadState(stage: QaStageId): QaThreadPanelState {
-  const existing = initialThreadStates.get(stage);
+function initialReleaseState(stage: QaStageId): QaReleasePanelState {
+  const existing = initialReleaseStates.get(stage);
   if (existing) return existing;
 
   const initial = {
@@ -38,7 +37,7 @@ function initialThreadState(stage: QaStageId): QaThreadPanelState {
     viewedStage: stage,
     selectedTabByStage: { [stage]: defaultTabForStage(stage) },
   };
-  initialThreadStates.set(stage, initial);
+  initialReleaseStates.set(stage, initial);
   return initial;
 }
 
@@ -46,18 +45,20 @@ export function createQaPanelStore(storage?: StateStorage) {
   return create<QaPanelStoreState>()(
     persist(
       (set) => ({
-        byThreadKey: {},
+        byReleaseKey: {},
         syncActiveStage: (ref, stage) =>
           set((state) => {
-            const key = scopedThreadKey(ref);
-            const current = state.byThreadKey[key];
+            const key = qaReleaseKey(ref);
+            const current = state.byReleaseKey[key];
             if (!current) {
-              return { byThreadKey: { ...state.byThreadKey, [key]: initialThreadState(stage) } };
+              return {
+                byReleaseKey: { ...state.byReleaseKey, [key]: initialReleaseState(stage) },
+              };
             }
             if (current.lastActiveStage === stage) return state;
             return {
-              byThreadKey: {
-                ...state.byThreadKey,
+              byReleaseKey: {
+                ...state.byReleaseKey,
                 [key]: {
                   ...current,
                   lastActiveStage: stage,
@@ -72,12 +73,12 @@ export function createQaPanelStore(storage?: StateStorage) {
           }),
         viewStage: (ref, stage) =>
           set((state) => {
-            const key = scopedThreadKey(ref);
-            const current = state.byThreadKey[key] ?? initialThreadState(stage);
+            const key = qaReleaseKey(ref);
+            const current = state.byReleaseKey[key] ?? initialReleaseState(stage);
             if (current.viewedStage === stage) return state;
             return {
-              byThreadKey: {
-                ...state.byThreadKey,
+              byReleaseKey: {
+                ...state.byReleaseKey,
                 [key]: {
                   ...current,
                   viewedStage: stage,
@@ -92,12 +93,12 @@ export function createQaPanelStore(storage?: StateStorage) {
         selectTab: (ref, stage, tab) =>
           set((state) => {
             if (!isTabForStage(stage, tab)) return state;
-            const key = scopedThreadKey(ref);
-            const current = state.byThreadKey[key] ?? initialThreadState(stage);
+            const key = qaReleaseKey(ref);
+            const current = state.byReleaseKey[key] ?? initialReleaseState(stage);
             if (current.selectedTabByStage[stage] === tab) return state;
             return {
-              byThreadKey: {
-                ...state.byThreadKey,
+              byReleaseKey: {
+                ...state.byReleaseKey,
                 [key]: {
                   ...current,
                   selectedTabByStage: { ...current.selectedTabByStage, [stage]: tab },
@@ -105,23 +106,23 @@ export function createQaPanelStore(storage?: StateStorage) {
               },
             };
           }),
-        removeThread: (ref) =>
+        removeRelease: (ref) =>
           set((state) => {
-            const key = scopedThreadKey(ref);
-            if (!(key in state.byThreadKey)) return state;
-            const { [key]: _removed, ...rest } = state.byThreadKey;
-            return { byThreadKey: rest };
+            const key = qaReleaseKey(ref);
+            if (!(key in state.byReleaseKey)) return state;
+            const { [key]: _removed, ...rest } = state.byReleaseKey;
+            return { byReleaseKey: rest };
           }),
       }),
       {
         name: STORAGE_KEY,
-        version: 1,
+        version: 2,
         storage: createJSONStorage(
           () =>
             storage ??
             resolveStorage(typeof window === "undefined" ? undefined : window.localStorage),
         ),
-        partialize: (state) => ({ byThreadKey: state.byThreadKey }),
+        partialize: (state) => ({ byReleaseKey: state.byReleaseKey }),
       },
     ),
   );
@@ -129,15 +130,15 @@ export function createQaPanelStore(storage?: StateStorage) {
 
 export const useQaPanelStore = createQaPanelStore();
 
-export function selectQaThreadPanelState(
-  byThreadKey: Record<string, QaThreadPanelState>,
-  ref: ScopedThreadRef,
+export function selectQaReleasePanelState(
+  byReleaseKey: Record<string, QaReleasePanelState>,
+  ref: QaReleaseRef,
   activeStage: QaStageId,
-): QaThreadPanelState {
-  return byThreadKey[scopedThreadKey(ref)] ?? initialThreadState(activeStage);
+): QaReleasePanelState {
+  return byReleaseKey[qaReleaseKey(ref)] ?? initialReleaseState(activeStage);
 }
 
-export function selectedQaStageTab(state: QaThreadPanelState): QaStageTabId {
+export function selectedQaStageTab(state: QaReleasePanelState): QaStageTabId {
   const selected = state.selectedTabByStage[state.viewedStage];
   return selected && isTabForStage(state.viewedStage, selected)
     ? selected

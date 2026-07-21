@@ -32,16 +32,28 @@ export class DesktopBackendObservabilitySettingsReadError extends Schema.TaggedE
   }
 }
 
+export class DesktopManagedDevelopmentProfileRequiredError extends Schema.TaggedErrorClass<DesktopManagedDevelopmentProfileRequiredError>()(
+  "DesktopManagedDevelopmentProfileRequiredError",
+  {},
+) {
+  override get message(): string {
+    return "T3CODE_DEV_PROFILE is required for a managed desktop development backend.";
+  }
+}
+
 export class DesktopBackendConfiguration extends Context.Service<
   DesktopBackendConfiguration,
   {
+    readonly attachedBackend?: Option.Option<{
+      readonly expectedEnvironmentId: string;
+    }>;
     // Build the Windows-native primary backend's start config. Reads the
     // primary's port/host/exposure from DesktopServerExposure. Can fail
     // with PlatformError because bootstrap token generation now uses
     // crypto.randomBytes under the hood (post Effect 4 migration).
     readonly resolvePrimary: Effect.Effect<
       DesktopBackendManager.DesktopBackendStartConfig,
-      PlatformError.PlatformError
+      PlatformError.PlatformError | DesktopManagedDevelopmentProfileRequiredError
     >;
     // Build a WSL backend start config for the given distro on the given
     // port. The WSL backend is always loopback-only (the primary owns LAN
@@ -53,7 +65,7 @@ export class DesktopBackendConfiguration extends Context.Service<
       readonly distro: string | null;
     }) => Effect.Effect<
       DesktopBackendManager.DesktopBackendStartConfig,
-      PlatformError.PlatformError
+      PlatformError.PlatformError | DesktopManagedDevelopmentProfileRequiredError
     >;
     // The renderer-facing label for the primary instance, derived from the
     // same decision resolvePrimary makes (including the WSL-availability
@@ -170,6 +182,24 @@ interface SharedBootstrapInput {
   readonly bootstrapToken: string;
   readonly observabilitySettings: BackendObservabilitySettings;
 }
+
+const resolveManagedDevelopmentProfile = Effect.fn(
+  "desktop.backendConfiguration.resolveManagedDevelopmentProfile",
+)(function* (
+  environment: DesktopEnvironment.DesktopEnvironment["Service"],
+): Effect.fn.Return<
+  "root" | "qa:maker" | "qa:approver",
+  DesktopManagedDevelopmentProfileRequiredError
+> {
+  if (Option.isSome(environment.developmentProfile)) {
+    return environment.developmentProfile.value;
+  }
+  if (environment.isDevelopment) {
+    return yield* new DesktopManagedDevelopmentProfileRequiredError();
+  }
+  // Packaged desktop remains an explicitly trusted workspace-admin client.
+  return "root";
+});
 
 interface WslPreflightSuccess {
   readonly _tag: "Ready";
@@ -329,12 +359,13 @@ const resolvePrimaryStartConfig = Effect.fn("desktop.backendConfiguration.resolv
     input: SharedBootstrapInput,
   ): Effect.fn.Return<
     DesktopBackendManager.DesktopBackendStartConfig,
-    never,
+    DesktopManagedDevelopmentProfileRequiredError,
     DesktopEnvironment.DesktopEnvironment | DesktopServerExposure.DesktopServerExposure
   > {
     const environment = yield* DesktopEnvironment.DesktopEnvironment;
     const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;
     const backendExposure = yield* serverExposure.backendConfig;
+    const developmentProfile = yield* resolveManagedDevelopmentProfile(environment);
 
     const bootstrap = {
       mode: "desktop" as const,
@@ -343,10 +374,9 @@ const resolvePrimaryStartConfig = Effect.fn("desktop.backendConfiguration.resolv
       t3Home: environment.baseDir,
       host: backendExposure.bindHost,
       desktopBootstrapToken: input.bootstrapToken,
-      ...Option.match(environment.developmentProfile, {
-        onNone: () => ({}),
-        onSome: (developmentProfile) => ({ developmentProfile }),
-      }),
+      // The compatibility bootstrap is explicit even in packaged builds. The
+      // server never interprets an omitted persona as root.
+      developmentProfile,
       tailscaleServeEnabled: backendExposure.tailscaleServeEnabled,
       tailscaleServePort: backendExposure.tailscaleServePort,
       ...buildObservabilityFragment(input.observabilitySettings),
@@ -379,13 +409,14 @@ const resolveWslStartConfig = Effect.fn("desktop.backendConfiguration.resolveWsl
   },
 ): Effect.fn.Return<
   DesktopBackendManager.DesktopBackendStartConfig,
-  never,
+  DesktopManagedDevelopmentProfileRequiredError,
   | DesktopEnvironment.DesktopEnvironment
   | DesktopWslEnvironment.DesktopWslEnvironment
   | FileSystem.FileSystem
 > {
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const wslEnvironment = yield* DesktopWslEnvironment.DesktopWslEnvironment;
+  const developmentProfile = yield* resolveManagedDevelopmentProfile(environment);
 
   // Bind to 0.0.0.0 inside WSL so the backend is reachable both via
   // WSL2's automatic localhost forwarding (wslhost: Windows 127.0.0.1
@@ -409,10 +440,7 @@ const resolveWslStartConfig = Effect.fn("desktop.backendConfiguration.resolveWsl
     // the SQLite file with the primary).
     host: wslBindHost,
     desktopBootstrapToken: input.bootstrapToken,
-    ...Option.match(environment.developmentProfile, {
-      onNone: () => ({}),
-      onSome: (developmentProfile) => ({ developmentProfile }),
-    }),
+    developmentProfile,
     // PortSchema rejects 0, so when tailscale serve is disabled we still
     // need a valid number in this slot. The backend reads tailscaleServePort
     // only when tailscaleServeEnabled is true, so the actual value here is
@@ -635,6 +663,40 @@ export const make = Effect.gen(function* () {
     );
   });
 
+  const buildAttachedPrimaryConfig = Effect.sync(() => {
+    const attached = Option.getOrThrow(environment.attachedBackend);
+    const port = Number.parseInt(
+      attached.httpBaseUrl.port || (attached.httpBaseUrl.protocol === "https:" ? "443" : "80"),
+      10,
+    );
+    return {
+      // These process fields are intentionally inert. Attached mode is routed
+      // through DesktopAttachedBackend and never hands this config to a child
+      // process spawner.
+      executablePath: "",
+      args: [],
+      entryPath: "",
+      cwd: environment.backendCwd,
+      env: {},
+      extendEnv: false,
+      bootstrap: {
+        mode: "desktop" as const,
+        noBrowser: true,
+        port,
+        host: attached.httpBaseUrl.hostname,
+        desktopBootstrapToken: attached.credential,
+        developmentProfile: attached.profile,
+        tailscaleServeEnabled: false,
+        tailscaleServePort: 443,
+      },
+      bootstrapDelivery: "fd3" as const,
+      httpBaseUrl: attached.httpBaseUrl,
+      expectedEnvironmentId: attached.expectedEnvironmentId,
+      captureOutput: false,
+      preflightFailure: Option.none(),
+    } satisfies DesktopBackendManager.DesktopBackendStartConfig;
+  });
+
   // Single source of truth for what the primary actually runs as. Both
   // the start-config dispatch and the renderer-facing label derive from
   // this, so they can't disagree — e.g. the label reading "WSL" while the
@@ -656,7 +718,13 @@ export const make = Effect.gen(function* () {
   });
 
   return DesktopBackendConfiguration.of({
+    attachedBackend: Option.map(environment.attachedBackend, (attached) => ({
+      expectedEnvironmentId: attached.expectedEnvironmentId,
+    })),
     resolvePrimary: Effect.gen(function* () {
+      if (Option.isSome(environment.attachedBackend)) {
+        return yield* buildAttachedPrimaryConfig;
+      }
       const { useWsl, wslRequested } = yield* describePrimary;
       if (useWsl) {
         return yield* buildWslPrimaryConfig;
@@ -669,6 +737,9 @@ export const make = Effect.gen(function* () {
       return yield* buildWindowsPrimaryConfig;
     }).pipe(Effect.withSpan("desktop.backendConfiguration.resolvePrimary")),
     resolvePrimaryLabel: Effect.gen(function* () {
+      if (Option.isSome(environment.attachedBackend)) {
+        return "Shared QA backend";
+      }
       const { useWsl, distro } = yield* describePrimary;
       if (!useWsl) {
         return environment.platform === "win32" ? "Windows" : "Local environment";

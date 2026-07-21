@@ -8,6 +8,7 @@ import { ProviderOptionSelections } from "./model.ts";
 import { RepositoryIdentity } from "./environment.ts";
 import {
   ApprovalRequestId,
+  AuthSessionId,
   CheckpointRef,
   CommandId,
   EventId,
@@ -616,6 +617,12 @@ export const ThreadTurnStartCommand = Schema.Struct({
   ),
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
+  /**
+   * Authenticated server session that accepted this turn. This field is
+   * intentionally absent from ClientThreadTurnStartCommand and is overwritten
+   * by authenticated transports before dispatch.
+   */
+  initiatingSessionId: Schema.optional(AuthSessionId),
   createdAt: IsoDateTime,
 });
 
@@ -934,6 +941,12 @@ export const ThreadTurnStartRequestedPayload = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_PROVIDER_INTERACTION_MODE)),
   ),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
+  /**
+   * Durable server-side authorization provenance. Optional only so historical
+   * persisted events continue to decode; provider credential issuance treats
+   * a missing value as unauthenticated and fails closed.
+   */
+  initiatingSessionId: Schema.optional(AuthSessionId),
   createdAt: IsoDateTime,
 });
 

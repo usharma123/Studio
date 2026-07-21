@@ -11,8 +11,7 @@ import { cn } from "~/lib/utils";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { useEnterpriseModeStore } from "../enterpriseModeStore";
 import { QaApprovalDashboard } from "../qa/QaApprovalDashboard";
-import { isQaApproverDesktopProfile } from "../qa/qaRole";
-import { DESKTOP_DEVELOPMENT_PROFILE } from "../branding";
+import { useQaGlobalAccess } from "../qa/useQaGlobalAccess";
 
 export function NoActiveThreadState() {
   const projects = useProjects();
@@ -20,6 +19,7 @@ export function NoActiveThreadState() {
   const hasProjects = projects.length > 0;
   const openAddProject = useOpenAddProjectCommandPalette();
   const isQaMode = useEnterpriseModeStore((state) => state.mode === "qa");
+  const qaGlobalAccess = useQaGlobalAccess();
 
   if (isQaMode) {
     return (
@@ -38,7 +38,7 @@ export function NoActiveThreadState() {
           <main className="min-h-0 flex-1 overflow-y-auto px-6 py-8 lg:px-10">
             <QaApprovalDashboard
               environmentIds={environments.map((environment) => environment.environmentId)}
-              approver={isQaApproverDesktopProfile(DESKTOP_DEVELOPMENT_PROFILE)}
+              approver={qaGlobalAccess.uiRole === "approver"}
             />
           </main>
         </div>

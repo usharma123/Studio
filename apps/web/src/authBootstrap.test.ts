@@ -15,6 +15,8 @@ import { __setPrimaryHttpRunnerForTests, type PrimaryHttpEffectRunner } from "./
 
 type TestWindow = {
   location: URL;
+  localStorage?: Storage;
+  sessionStorage?: Storage;
   history: {
     replaceState: (_data: unknown, _unused: string, url: string) => void;
   };
@@ -41,15 +43,23 @@ const unauthenticatedSession = (auth: AuthSessionState["auth"]): AuthSessionStat
   auth,
 });
 
-const authenticatedSession = (auth: AuthSessionState["auth"]): AuthSessionState => ({
+const authenticatedSession = (
+  auth: AuthSessionState["auth"],
+  subject = "test:subject",
+): AuthSessionState => ({
   authenticated: true,
   auth,
+  subject,
   sessionMethod: "browser-session-cookie",
   expiresAt: SESSION_EXPIRES_AT,
 });
 
-const browserSession = (scopes: AuthBrowserSessionResult["scopes"]): AuthBrowserSessionResult => ({
+const browserSession = (
+  scopes: AuthBrowserSessionResult["scopes"],
+  subject = "test:subject",
+): AuthBrowserSessionResult => ({
   authenticated: true,
+  subject,
   scopes,
   sessionMethod: "browser-session-cookie",
   expiresAt: SESSION_EXPIRES_AT,
@@ -89,6 +99,20 @@ function installDesktopBootstrap() {
 function sequence<A>(...values: ReadonlyArray<A>) {
   let index = 0;
   return () => values[Math.min(index++, values.length - 1)]!;
+}
+
+function createStorage(initial: Readonly<Record<string, string>> = {}): Storage {
+  const values = new Map(Object.entries(initial));
+  return {
+    get length() {
+      return values.size;
+    },
+    clear: () => values.clear(),
+    getItem: (key) => values.get(key) ?? null,
+    key: (index) => Array.from(values.keys())[index] ?? null,
+    removeItem: (key) => values.delete(key),
+    setItem: (key, value) => values.set(key, value),
+  };
 }
 
 let disposeHttpTest: (() => Promise<void>) | undefined;
@@ -132,6 +156,7 @@ describe("resolveInitialServerAuthGateState", () => {
     __resetServerAuthBootstrapForTests();
     __setPrimaryHttpRunnerForTests();
     vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -447,6 +472,57 @@ describe("resolveInitialServerAuthGateState", () => {
       status: "authenticated",
     });
     expect(testApi.calls.session).toBe(1);
+  });
+
+  it("replaces a stale desktop subject and clears subject-scoped client caches", async () => {
+    const testWindow = installTestBrowser("http://localhost/");
+    const localStorage = createStorage({
+      "t3code:authenticated-subject:v1": "local:root",
+      "t3code:composer-drafts:v1": "root-only-draft",
+    });
+    const sessionStorage = createStorage({ "root-only-preview": "secret" });
+    testWindow.localStorage = localStorage;
+    testWindow.sessionStorage = sessionStorage;
+    testWindow.desktopBridge = {
+      getLocalEnvironmentBootstraps: () => [
+        {
+          id: "primary",
+          label: "QA Maker",
+          httpBaseUrl: "http://localhost:3773",
+          wsBaseUrl: "ws://localhost:3773",
+          bootstrapToken: "maker-bootstrap-token",
+        },
+      ],
+    } as unknown as DesktopBridge;
+
+    const deletedDatabases: string[] = [];
+    vi.stubGlobal("indexedDB", {
+      deleteDatabase: (name: string) => {
+        deletedDatabases.push(name);
+        const request = new EventTarget() as IDBOpenDBRequest;
+        queueMicrotask(() => request.dispatchEvent(new Event("success")));
+        return request;
+      },
+    });
+    const testApi = await installAuthApi({
+      session: sequence(
+        authenticatedSession(DESKTOP_AUTH, "local:root"),
+        authenticatedSession(DESKTOP_AUTH, "local:qa:maker"),
+      ),
+      browserSession: () =>
+        Effect.succeed(browserSession(["qa:read", "qa:make"], "local:qa:maker")),
+    });
+
+    const { resolveInitialServerAuthGateState } = await import("./environments/primary");
+    await expect(resolveInitialServerAuthGateState()).resolves.toEqual({
+      status: "authenticated",
+    });
+
+    expect(testApi.calls.browserSession).toEqual([{ credential: "maker-bootstrap-token" }]);
+    expect(localStorage.getItem("t3code:composer-drafts:v1")).toBeNull();
+    expect(localStorage.getItem("t3code:authenticated-subject:v1")).toBe("local:qa:maker");
+    expect(sessionStorage.length).toBe(0);
+    expect(deletedDatabases).toEqual(["t3code:connection-runtime"]);
   });
 
   it("creates a pairing credential from the authenticated auth endpoint", async () => {

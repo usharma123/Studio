@@ -82,6 +82,47 @@ const netLayer = Layer.succeed(NetService.NetService, {
 } satisfies NetService.NetService["Service"]);
 
 describe("DesktopWslBackend", () => {
+  it.effect("never registers a WSL process for an attached desktop client", () => {
+    const primary = makeStubInstance({
+      id: DesktopBackendPool.PRIMARY_INSTANCE_ID,
+      label: "Shared QA backend",
+      snapshot: primarySnapshot,
+    });
+    const attachedConfigurationLayer = Layer.succeed(
+      DesktopBackendConfiguration.DesktopBackendConfiguration,
+      {
+        attachedBackend: Option.some({ expectedEnvironmentId: "environment-shared" }),
+        resolvePrimary: Effect.die("unexpected resolvePrimary"),
+        resolvePrimaryLabel: Effect.succeed("Shared QA backend"),
+        resolveWsl: () => Effect.die("attached client must not resolve WSL"),
+      } satisfies DesktopBackendConfiguration.DesktopBackendConfiguration["Service"],
+    );
+
+    return Effect.gen(function* () {
+      const backend = yield* DesktopWslBackend.DesktopWslBackend;
+      yield* backend.reconcile;
+      assert.deepEqual(yield* backend.lastPreflightError, Option.none());
+    }).pipe(
+      Effect.provide(
+        DesktopWslBackend.layer.pipe(
+          Layer.provideMerge(DesktopBackendPool.layerTest([primary])),
+          Layer.provideMerge(attachedConfigurationLayer),
+          Layer.provideMerge(serverExposureLayer),
+          Layer.provideMerge(netLayer),
+          Layer.provideMerge(
+            DesktopAppSettings.layerTest({
+              ...DesktopAppSettings.DEFAULT_DESKTOP_SETTINGS,
+              wslBackendEnabled: true,
+              wslDistro: "Ubuntu",
+              wslOnly: false,
+            }),
+          ),
+          Layer.provideMerge(DesktopWslEnvironment.layerTest({ isAvailable: true })),
+        ),
+      ),
+    );
+  });
+
   it.effect("clears the stored preflight error when a registered WSL backend becomes ready", () => {
     let registeredSpec: DesktopBackendPool.BackendInstanceSpec | undefined;
     const primary = makeStubInstance({

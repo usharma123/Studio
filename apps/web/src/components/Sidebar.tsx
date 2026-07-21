@@ -87,7 +87,8 @@ import {
   getEnterpriseModeDefinition,
   useEnterpriseModeStore,
 } from "../enterpriseModeStore";
-import { isQaApproverDesktopProfile } from "../qa/qaRole";
+import { QaSidebarNavigation } from "../qa/QaSidebarNavigation";
+import { useQaGlobalAccess } from "../qa/useQaGlobalAccess";
 import { useOpenPrLink } from "../lib/openPullRequestLink";
 import { isTerminalFocused } from "../lib/terminalFocus";
 import { isMacPlatform } from "../lib/utils";
@@ -2662,10 +2663,7 @@ export function SidebarBrand() {
   const mode = useEnterpriseModeStore((state) => state.mode);
   const selectMode = useEnterpriseModeStore((state) => state.selectMode);
   const selectedMode = getEnterpriseModeDefinition(mode);
-  const presentedDesktopProfile =
-    mode === "qa" && DESKTOP_DEVELOPMENT_PROFILE === "root"
-      ? "qa:approver"
-      : DESKTOP_DEVELOPMENT_PROFILE;
+  const presentedDesktopProfile = DESKTOP_DEVELOPMENT_PROFILE;
   const desktopRole = presentedDesktopProfile
     ? DESKTOP_ROLE_PRESENTATION[presentedDesktopProfile]
     : null;
@@ -2829,7 +2827,8 @@ const SidebarProjectsContent = function SidebarProjectsContent(props: SidebarPro
   const navigate = useNavigate();
   const { isMobile, setOpenMobile } = useSidebar();
   const isQaMode = useEnterpriseModeStore((state) => state.mode === "qa");
-  const isQaApproverUi = isQaMode && isQaApproverDesktopProfile(DESKTOP_DEVELOPMENT_PROFILE);
+  const qaGlobalAccess = useQaGlobalAccess();
+  const canCreateQaProject = isQaMode && qaGlobalAccess.canCreateProject;
   const closeMobileSidebar = () => {
     if (isMobile) {
       setOpenMobile(false);
@@ -2837,6 +2836,10 @@ const SidebarProjectsContent = function SidebarProjectsContent(props: SidebarPro
   };
   const handleNewTaskClick = () => {
     closeMobileSidebar();
+    if (isQaMode) {
+      openAddProject();
+      return;
+    }
     void handleGlobalNewTask();
   };
   const handleProvidersClick = () => {
@@ -2875,7 +2878,7 @@ const SidebarProjectsContent = function SidebarProjectsContent(props: SidebarPro
     <SidebarContent className="gap-0">
       <SidebarGroup className="px-2 pt-2 pb-2">
         <SidebarMenu>
-          {!isQaApproverUi ? (
+          {!isQaMode || canCreateQaProject ? (
             <SidebarMenuItem>
               <SidebarMenuButton
                 size="sm"
@@ -2926,16 +2929,18 @@ const SidebarProjectsContent = function SidebarProjectsContent(props: SidebarPro
               </SidebarMenuButton>
             </SidebarMenuItem>
           ) : null}
-          <SidebarMenuItem>
-            <SidebarMenuButton
-              size="sm"
-              className="gap-2.5 px-2 py-2 text-muted-foreground/80 hover:bg-accent hover:text-foreground"
-              onClick={handleArchivedClick}
-            >
-              <ArchiveIcon className="size-4 text-muted-foreground/70" />
-              <span className="flex-1 truncate text-left text-sm">Archived</span>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
+          {!isQaMode ? (
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                size="sm"
+                className="gap-2.5 px-2 py-2 text-muted-foreground/80 hover:bg-accent hover:text-foreground"
+                onClick={handleArchivedClick}
+              >
+                <ArchiveIcon className="size-4 text-muted-foreground/70" />
+                <span className="flex-1 truncate text-left text-sm">Archived</span>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          ) : null}
         </SidebarMenu>
       </SidebarGroup>
       {showArm64IntelBuildWarning && arm64IntelBuildWarningDescription ? (
@@ -2965,20 +2970,22 @@ const SidebarProjectsContent = function SidebarProjectsContent(props: SidebarPro
       <SidebarGroup className="px-2 py-2">
         <div className="mb-1 flex items-center justify-between pl-2 pr-1.5">
           <span className="text-[11px] font-medium text-muted-foreground/60">
-            {isQaMode ? "QA projects" : "Projects"}
+            {isQaMode ? "QA releases" : "Projects"}
           </span>
           <div className="flex items-center gap-1">
-            <ProjectSortMenu
-              projectSortOrder={projectSortOrder}
-              threadSortOrder={threadSortOrder}
-              projectGroupingMode={projectGroupingMode}
-              threadPreviewCount={threadPreviewCount}
-              onProjectSortOrderChange={handleProjectSortOrderChange}
-              onThreadSortOrderChange={handleThreadSortOrderChange}
-              onProjectGroupingModeChange={handleProjectGroupingModeChange}
-              onThreadPreviewCountChange={handleThreadPreviewCountChange}
-            />
-            {!isQaApproverUi ? (
+            {!isQaMode ? (
+              <ProjectSortMenu
+                projectSortOrder={projectSortOrder}
+                threadSortOrder={threadSortOrder}
+                projectGroupingMode={projectGroupingMode}
+                threadPreviewCount={threadPreviewCount}
+                onProjectSortOrderChange={handleProjectSortOrderChange}
+                onThreadSortOrderChange={handleThreadSortOrderChange}
+                onProjectGroupingModeChange={handleProjectGroupingModeChange}
+                onThreadPreviewCountChange={handleThreadPreviewCountChange}
+              />
+            ) : null}
+            {!isQaMode || canCreateQaProject ? (
               <Tooltip>
                 <TooltipTrigger
                   render={
@@ -3001,7 +3008,9 @@ const SidebarProjectsContent = function SidebarProjectsContent(props: SidebarPro
           </div>
         </div>
 
-        {isManualProjectSorting ? (
+        {isQaMode ? (
+          <QaSidebarNavigation />
+        ) : isManualProjectSorting ? (
           <DndContext
             sensors={projectDnDSensors}
             collisionDetection={projectCollisionDetection}
@@ -3074,9 +3083,9 @@ const SidebarProjectsContent = function SidebarProjectsContent(props: SidebarPro
           </SidebarMenu>
         )}
 
-        {projectsLength === 0 && (
+        {!isQaMode && projectsLength === 0 && (
           <div className="px-2 pt-4 text-center text-xs text-muted-foreground/60">
-            {isQaMode ? "No QA projects yet" : "No projects yet"}
+            No projects yet
           </div>
         )}
       </SidebarGroup>
@@ -3086,6 +3095,7 @@ const SidebarProjectsContent = function SidebarProjectsContent(props: SidebarPro
 function useSidebarContent() {
   const projects = useProjects();
   const sidebarThreads = useThreadShells();
+  const isQaMode = useEnterpriseModeStore((state) => state.mode === "qa");
   const projectExpandedById = useUiStateStore((store) => store.projectExpandedById);
   const projectOrder = useUiStateStore((store) => store.projectOrder);
   const reorderProjects = useUiStateStore((store) => store.reorderProjects);
@@ -3349,7 +3359,7 @@ function useSidebarContent() {
     });
   })();
   const isManualProjectSorting = sidebarProjectSortOrder === "manual";
-  const visibleSidebarThreadKeys = sortedProjects.flatMap((project) => {
+  const visibleSidebarThreadKeys = (isQaMode ? [] : sortedProjects).flatMap((project) => {
     const projectThreads = sortThreads(
       (threadsByProjectKey.get(project.projectKey) ?? []).filter(
         (thread) => thread.archivedAt === null,

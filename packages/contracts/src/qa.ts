@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema";
 
 import {
+  EnvironmentId,
   IsoDateTime,
   NonNegativeInt,
   PositiveInt,
@@ -13,6 +14,14 @@ import { ProviderInstanceId } from "./providerInstance.ts";
 
 export const EnterpriseMode = Schema.Literals(["qa", "developer", "business_analyst"]);
 export type EnterpriseMode = typeof EnterpriseMode.Type;
+
+/**
+ * Stable identifier for a shared QA release. The QA database still stores this
+ * value in its legacy `thread_id` columns, but it is not a local conversation
+ * thread identifier.
+ */
+export const QaReleaseId = TrimmedNonEmptyString.pipe(Schema.brand("QaReleaseId"));
+export type QaReleaseId = typeof QaReleaseId.Type;
 
 export const QaDocumentStatus = Schema.Literals(["uploaded", "processing", "processed", "failed"]);
 export type QaDocumentStatus = typeof QaDocumentStatus.Type;
@@ -131,6 +140,8 @@ export type QaReleaseCapability = typeof QaReleaseCapability.Type;
 
 /** Principal-specific access is queried separately from the shared release snapshot. */
 export const QaReleaseAccess = Schema.Struct({
+  releaseId: QaReleaseId,
+  /** @deprecated Use `releaseId`; this is the legacy QA database key alias. */
   threadId: ThreadId,
   projectId: ProjectId,
   principalId: TrimmedNonEmptyString,
@@ -157,6 +168,8 @@ export const QaAssignedReleaseStatus = Schema.Literals([
 export type QaAssignedReleaseStatus = typeof QaAssignedReleaseStatus.Type;
 
 export const QaAssignedReleaseSummary = Schema.Struct({
+  releaseId: QaReleaseId,
+  /** @deprecated Use `releaseId`; this is the legacy QA database key alias. */
   threadId: ThreadId,
   projectId: ProjectId,
   projectTitle: TrimmedNonEmptyString,
@@ -818,6 +831,8 @@ export type QaReadinessDashboard = typeof QaReadinessDashboard.Type;
 export const QaReleaseSnapshot = Schema.Struct({
   mode: EnterpriseMode,
   projectId: ProjectId,
+  releaseId: QaReleaseId,
+  /** @deprecated Use `releaseId`; this is the legacy QA database key alias. */
   threadId: ThreadId,
   revision: PositiveInt,
   releaseNumber: PositiveInt,
@@ -851,6 +866,8 @@ export type QaReleaseSnapshot = typeof QaReleaseSnapshot.Type;
  */
 const QaReleaseSnapshotStreamEvent = Schema.Struct({
   type: Schema.Literal("snapshot"),
+  releaseId: QaReleaseId,
+  /** @deprecated Use `releaseId`; this is the legacy QA database key alias. */
   threadId: ThreadId,
   revision: PositiveInt,
   snapshot: QaReleaseSnapshot,
@@ -859,6 +876,8 @@ const QaReleaseSnapshotStreamEvent = Schema.Struct({
 
 const QaReleaseUpdatedStreamEvent = Schema.Struct({
   type: Schema.Literal("updated"),
+  releaseId: QaReleaseId,
+  /** @deprecated Use `releaseId`; this is the legacy QA database key alias. */
   threadId: ThreadId,
   revision: PositiveInt,
   reason: Schema.Literals([
@@ -953,18 +972,46 @@ export const QaReviewMutationResult = Schema.Struct({
 });
 export type QaReviewMutationResult = typeof QaReviewMutationResult.Type;
 
-/**
- * Creates the orchestration project, its first release thread, and the QA
- * records through one server-owned operation. The workspace root and runtime
- * defaults are intentionally not client-controlled for QA-scoped principals.
- */
+/** Creates a shared QA project and its first release in the QA database. */
 export const QaCreateProjectInput = Schema.Struct({
   projectId: ProjectId,
-  threadId: ThreadId,
+  releaseId: QaReleaseId,
   projectTitle: TrimmedNonEmptyString.check(Schema.isMaxLength(160)),
   releaseTitle: TrimmedNonEmptyString.check(Schema.isMaxLength(160)),
 });
 export type QaCreateProjectInput = typeof QaCreateProjectInput.Type;
+
+/**
+ * Lazily provisions the caller's local agent runtime for a shared release.
+ * Runtime identifiers are always server-owned.
+ */
+export const QaEnsureReleaseConversationInput = Schema.Struct({
+  releaseId: QaReleaseId,
+});
+export type QaEnsureReleaseConversationInput = typeof QaEnsureReleaseConversationInput.Type;
+
+export const QaReleaseConversation = Schema.Struct({
+  releaseId: QaReleaseId,
+  runtimeProjectId: ProjectId,
+  conversationThreadId: ThreadId,
+});
+export type QaReleaseConversation = typeof QaReleaseConversation.Type;
+
+/** Starts the active maker-owned planning stage in the local agent runtime. */
+export const QaStartStageGenerationInput = Schema.Struct({
+  releaseId: QaReleaseId,
+  expectedRevision: PositiveInt,
+});
+export type QaStartStageGenerationInput = typeof QaStartStageGenerationInput.Type;
+
+export const QaStageGenerationReceipt = Schema.Struct({
+  releaseId: QaReleaseId,
+  conversationThreadId: ThreadId,
+  stage: QaStageId,
+  revision: PositiveInt,
+  acceptedAt: IsoDateTime,
+});
+export type QaStageGenerationReceipt = typeof QaStageGenerationReceipt.Type;
 
 export const QaInitializeReleaseInput = Schema.Struct({
   projectId: ProjectId,
@@ -1346,6 +1393,23 @@ export const QaReadinessReviewResult = Schema.Struct({
   snapshot: QaReleaseSnapshot,
 });
 export type QaReadinessReviewResult = typeof QaReadinessReviewResult.Type;
+
+/**
+ * Authenticated app-server identity for a single agent-generated QA stage.
+ * The conversation is fixed when the stage job is claimed; the provider
+ * session is bound on its first mutation so replaced sessions cannot write.
+ */
+export const QaAgentGenerationClaimOwner = Schema.Struct({
+  environmentId: EnvironmentId,
+  conversationThreadId: ThreadId,
+});
+export type QaAgentGenerationClaimOwner = typeof QaAgentGenerationClaimOwner.Type;
+
+export const QaAgentGenerationOwner = Schema.Struct({
+  ...QaAgentGenerationClaimOwner.fields,
+  providerSessionId: TrimmedNonEmptyString,
+});
+export type QaAgentGenerationOwner = typeof QaAgentGenerationOwner.Type;
 
 /** Proposal-only inputs available to the thread-scoped app-server QA toolkit. */
 export const QaAgentStageProgressInput = Schema.Struct({

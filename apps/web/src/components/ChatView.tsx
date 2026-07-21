@@ -8,7 +8,6 @@ import {
   type ProjectScript,
   type ProjectId,
   type ProviderApprovalDecision,
-  type QaReleaseSnapshot,
   ProviderInstanceId,
   type ServerProvider,
   type ResolvedKeybindingsConfig,
@@ -92,7 +91,6 @@ import {
 } from "../pendingUserInput";
 import { useUiStateStore } from "../uiStateStore";
 import { useEnterpriseModeStore } from "../enterpriseModeStore";
-import { buildQaStageKickoffPrompt } from "@t3tools/shared/qaOrchestration";
 import {
   buildPlanImplementationThreadTitle,
   buildPlanImplementationPrompt,
@@ -109,7 +107,6 @@ import {
   type TurnDiffSummary,
 } from "../types";
 import { useTheme } from "../hooks/useTheme";
-import { useStableEventCallback } from "../hooks/useStableEventCallback";
 import { useTurnDiffSummaries } from "../hooks/useTurnDiffSummaries";
 import { isCommandPaletteOpen } from "../commandPaletteState";
 import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
@@ -132,8 +129,6 @@ import { closePreviewSession } from "./preview/closePreviewSession";
 import { subscribePreviewAction } from "./preview/previewActionBus";
 import { getConfiguredPreviewUrls } from "./preview/previewEmptyStateLogic";
 import { RightPanelTabs } from "./RightPanelTabs";
-import { QaDashboard } from "../qa/QaDashboard";
-import { qaEnvironment } from "../qa/client";
 import { QaAssistantHeader } from "../qa/QaAssistantHeader";
 import { isCurrentWindowDetachedQaAssistant } from "../qa/qaAssistantWindow";
 import { selectQaAssistantPresentation, useQaAssistantStore } from "../qa/qaAssistantStore";
@@ -945,8 +940,6 @@ function useChatViewContent(props: ChatViewProps) {
   });
   const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: false });
   const closePreview = useAtomCommand(previewEnvironment.close, "preview close");
-  const initializeQaRelease = useAtomCommand(qaEnvironment.initialize, { reportFailure: false });
-  const uploadQaDocument = useAtomCommand(qaEnvironment.uploadDocument, { reportFailure: false });
   const { environments } = useEnvironments();
   const primaryEnvironment = usePrimaryEnvironment();
   const retryEnvironment = useAtomCommand(environmentCatalog.retryNow, { reportFailure: false });
@@ -1231,16 +1224,10 @@ function useChatViewContent(props: ChatViewProps) {
   );
   const visibleRightPanelSurfaces = (() =>
     isQaMode
-      ? rightPanelState.surfaces.filter(
-          (surface) => surface.kind === "qa" || surface.kind === "preview",
-        )
+      ? rightPanelState.surfaces.filter((surface) => surface.kind === "preview")
       : rightPanelState.surfaces)();
   const visibleActiveRightPanelSurface =
-    !isQaMode ||
-    activeRightPanelSurface?.kind === "qa" ||
-    activeRightPanelSurface?.kind === "preview"
-      ? activeRightPanelSurface
-      : null;
+    !isQaMode || activeRightPanelSurface?.kind === "preview" ? activeRightPanelSurface : null;
   const activeFileSurface =
     activeRightPanelSurface?.kind === "file" ? activeRightPanelSurface : null;
   const activePreviewState = useThreadPreviewState(activeThreadRef);
@@ -2489,75 +2476,15 @@ function useChatViewContent(props: ChatViewProps) {
     if (!activeThreadRef || !activeProject) return;
     useRightPanelStore.getState().open(activeThreadRef, "files");
   };
-  const addQaSurface = () => {
-    if (!activeThreadRef || !activeProject) return;
-    useRightPanelStore.getState().open(activeThreadRef, "qa");
-  };
-  const uploadQaDocumentsFromComposer = async (files: readonly File[]) => {
-    if (enterpriseMode !== "qa" || !activeThreadRef || !activeProject || files.length === 0) {
-      return;
-    }
-    const initialized = await initializeQaRelease({
-      environmentId: activeThreadRef.environmentId,
-      input: { projectId: activeProject.id, threadId: activeThreadRef.threadId },
-    });
-    if (initialized._tag !== "Success") {
-      toastManager.add({
-        type: "error",
-        title: "Could not initialize QA document intake",
-      });
-      return;
-    }
-    let uploaded = 0;
-    for (const file of files) {
-      const result = await uploadQaDocument({
-        environmentId: activeThreadRef.environmentId,
-        input: {
-          threadId: activeThreadRef.threadId,
-          fileName: file.name,
-          mediaType: file.type || "application/octet-stream",
-          bytes: new Uint8Array(await file.arrayBuffer()),
-        },
-      });
-      if (result._tag !== "Success") {
-        toastManager.add({
-          type: "error",
-          title: `Could not add ${file.name} to QA intake`,
-        });
-        break;
-      }
-      uploaded += 1;
-    }
-    if (uploaded > 0) {
-      useRightPanelStore.getState().open(activeThreadRef, "qa");
-      toastManager.add({
-        type: "success",
-        title: `${uploaded} document${uploaded === 1 ? "" : "s"} added to QA intake`,
-      });
-    }
-  };
   useEffect(() => {
     if (enterpriseMode !== "qa" || detachedQaAssistant || !activeThreadRef || !activeProject)
       return;
     const store = useRightPanelStore.getState();
     const panel = selectThreadRightPanelState(store.byThreadKey, activeThreadRef);
     for (const surface of panel.surfaces) {
-      if (surface.kind !== "qa" && surface.kind !== "preview") {
+      if (surface.kind !== "preview") {
         store.closeSurface(activeThreadRef, surface.id);
       }
-    }
-    if (!panel.surfaces.some((surface) => surface.kind === "qa")) {
-      store.open(activeThreadRef, "qa");
-    } else if (
-      panel.activeSurfaceId !== null &&
-      panel.surfaces.some(
-        (surface) =>
-          surface.id === panel.activeSurfaceId &&
-          surface.kind !== "qa" &&
-          surface.kind !== "preview",
-      )
-    ) {
-      store.open(activeThreadRef, "qa");
     }
   }, [activeProject, activeThreadRef, detachedQaAssistant, enterpriseMode]);
   const openFileSurface = (relativePath: string) => {
@@ -4126,29 +4053,6 @@ function useChatViewContent(props: ChatViewProps) {
     sendInFlightRef.current = false;
     resetLocalDispatch();
   };
-  const onQaReleaseInitialized = async (snapshot: QaReleaseSnapshot) => {
-    if (!isServerThread || !activeThreadRef) return;
-    await updateThreadMetadata({
-      environmentId: activeThreadRef.environmentId,
-      input: { threadId: activeThreadRef.threadId, title: snapshot.title },
-    });
-  };
-  const submitPlanFollowUpFromQa = useStableEventCallback(onSubmitPlanFollowUp);
-  const onQaKickoffAgent = async (snapshot: QaReleaseSnapshot) => {
-    if (!activeProject) return;
-    const releaseLabel = `Release ${snapshot.releaseNumber}: ${snapshot.title}`;
-    const text = buildQaStageKickoffPrompt({
-      activeStage: snapshot.activeStage,
-      projectTitle: activeProject.title,
-      releaseLabel,
-    });
-    if (text === null) return;
-    await submitPlanFollowUpFromQa({
-      text,
-      interactionMode: "default",
-      preserveRightPanel: true,
-    });
-  };
   const onImplementPlanInNewThread = async () => {
     if (
       !activeThread ||
@@ -4436,88 +4340,76 @@ function useChatViewContent(props: ChatViewProps) {
       {panelToggleControls}
     </div>
   );
-  const qaPanelContent =
-    activeThreadRef && activeRightPanelSurface?.kind === "qa" && activeProject ? (
-      <QaDashboard
-        threadRef={activeThreadRef}
-        projectId={activeProject.id}
-        projectTitle={activeProject.title}
-        onInitialized={onQaReleaseInitialized}
-        onKickoffAgent={onQaKickoffAgent}
-      />
-    ) : null;
-  const rightPanelContent =
-    qaPanelContent ??
-    (activeThreadRef ? (
-      activeRightPanelSurface?.kind === "preview" ? (
-        <Suspense fallback={null}>
-          <PreviewPanel
-            mode="embedded"
-            threadRef={activeThreadRef}
-            tabId={activeRightPanelSurface.resourceId}
-            configuredUrls={configuredPreviewUrls}
-            visible
-          />
-        </Suspense>
-      ) : !isQaMode && activeRightPanelSurface?.kind === "terminal" ? (
-        <PersistentThreadTerminalPanel
-          threadRef={activeThreadRef}
-          surface={activeRightPanelSurface}
-          launchContext={activeTerminalLaunchContext ?? null}
-          focusRequestId={terminalFocusRequestId}
-          keybindings={keybindings}
-          onAddTerminalContext={addTerminalContextToDraft}
-          onSplitTerminal={splitPanelTerminal}
-          onSplitTerminalVertical={splitPanelTerminalVertical}
-          onNewTerminal={addTerminalSurface}
-          onActiveTerminalChange={activatePanelTerminal}
-          onCloseTerminal={closePanelTerminal}
-          splitShortcutLabel={splitTerminalShortcutLabel ?? undefined}
-          splitVerticalShortcutLabel={splitTerminalVerticalShortcutLabel ?? undefined}
-          newShortcutLabel={newTerminalShortcutLabel ?? undefined}
-          closeShortcutLabel={closeTerminalShortcutLabel ?? undefined}
-        />
-      ) : !isQaMode && activeRightPanelSurface?.kind === "diff" ? (
-        <Suspense fallback={null}>
-          <DiffPanel mode="embedded" composerDraftTarget={composerDraftTarget} />
-        </Suspense>
-      ) : !isQaMode && activeRightPanelSurface?.kind === "plan" ? (
-        <PlanSidebar
-          activePlan={activePlan}
-          activeProposedPlan={sidebarProposedPlan}
-          label={planSidebarLabel}
-          environmentId={environmentId}
-          threadRef={activeThreadRef}
-          markdownCwd={gitCwd ?? undefined}
-          workspaceRoot={activeWorkspaceRoot}
-          timestampFormat={timestampFormat}
+  const rightPanelContent = activeThreadRef ? (
+    activeRightPanelSurface?.kind === "preview" ? (
+      <Suspense fallback={null}>
+        <PreviewPanel
           mode="embedded"
+          threadRef={activeThreadRef}
+          tabId={activeRightPanelSurface.resourceId}
+          configuredUrls={configuredPreviewUrls}
+          visible
         />
-      ) : !isQaMode &&
-        (activeRightPanelSurface?.kind === "files" || activeRightPanelSurface?.kind === "file") &&
-        activeProject &&
-        activeWorkspaceRoot ? (
-        <Suspense fallback={null}>
-          <FilePreviewPanel
-            key={`${activeProject.environmentId}:${activeWorkspaceRoot}`}
-            environmentId={activeProject.environmentId}
-            cwd={activeWorkspaceRoot}
-            projectName={activeProject.title}
-            threadRef={activeThreadRef}
-            composerDraftTarget={composerDraftTarget}
-            keybindings={keybindings}
-            availableEditors={availableEditors}
-            relativePath={
-              activeRightPanelSurface.kind === "file" ? activeRightPanelSurface.relativePath : null
-            }
-            revealLine={activeFileSurface?.revealLine ?? null}
-            revealRequestId={activeFileSurface?.revealRequestId ?? 0}
-            onOpenFile={openFileSurface}
-            onPendingChange={handleFilePendingChange}
-          />
-        </Suspense>
-      ) : null
-    ) : null);
+      </Suspense>
+    ) : !isQaMode && activeRightPanelSurface?.kind === "terminal" ? (
+      <PersistentThreadTerminalPanel
+        threadRef={activeThreadRef}
+        surface={activeRightPanelSurface}
+        launchContext={activeTerminalLaunchContext ?? null}
+        focusRequestId={terminalFocusRequestId}
+        keybindings={keybindings}
+        onAddTerminalContext={addTerminalContextToDraft}
+        onSplitTerminal={splitPanelTerminal}
+        onSplitTerminalVertical={splitPanelTerminalVertical}
+        onNewTerminal={addTerminalSurface}
+        onActiveTerminalChange={activatePanelTerminal}
+        onCloseTerminal={closePanelTerminal}
+        splitShortcutLabel={splitTerminalShortcutLabel ?? undefined}
+        splitVerticalShortcutLabel={splitTerminalVerticalShortcutLabel ?? undefined}
+        newShortcutLabel={newTerminalShortcutLabel ?? undefined}
+        closeShortcutLabel={closeTerminalShortcutLabel ?? undefined}
+      />
+    ) : !isQaMode && activeRightPanelSurface?.kind === "diff" ? (
+      <Suspense fallback={null}>
+        <DiffPanel mode="embedded" composerDraftTarget={composerDraftTarget} />
+      </Suspense>
+    ) : !isQaMode && activeRightPanelSurface?.kind === "plan" ? (
+      <PlanSidebar
+        activePlan={activePlan}
+        activeProposedPlan={sidebarProposedPlan}
+        label={planSidebarLabel}
+        environmentId={environmentId}
+        threadRef={activeThreadRef}
+        markdownCwd={gitCwd ?? undefined}
+        workspaceRoot={activeWorkspaceRoot}
+        timestampFormat={timestampFormat}
+        mode="embedded"
+      />
+    ) : !isQaMode &&
+      (activeRightPanelSurface?.kind === "files" || activeRightPanelSurface?.kind === "file") &&
+      activeProject &&
+      activeWorkspaceRoot ? (
+      <Suspense fallback={null}>
+        <FilePreviewPanel
+          key={`${activeProject.environmentId}:${activeWorkspaceRoot}`}
+          environmentId={activeProject.environmentId}
+          cwd={activeWorkspaceRoot}
+          projectName={activeProject.title}
+          threadRef={activeThreadRef}
+          composerDraftTarget={composerDraftTarget}
+          keybindings={keybindings}
+          availableEditors={availableEditors}
+          relativePath={
+            activeRightPanelSurface.kind === "file" ? activeRightPanelSurface.relativePath : null
+          }
+          revealLine={activeFileSurface?.revealLine ?? null}
+          revealRequestId={activeFileSurface?.revealRequestId ?? 0}
+          onOpenFile={openFileSurface}
+          onPendingChange={handleFilePendingChange}
+        />
+      </Suspense>
+    ) : null
+  ) : null;
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background">
       {!detachedQaAssistant && rightPanelOpen && !shouldUseRightPanelSheet
@@ -4784,9 +4676,7 @@ function useChatViewContent(props: ChatViewProps) {
                         scheduleComposerFocus={scheduleComposerFocus}
                         setThreadError={setThreadError}
                         onExpandImage={onExpandTimelineImage}
-                        {...(enterpriseMode === "qa"
-                          ? { onQaDocumentFiles: uploadQaDocumentsFromComposer, qaMode: true }
-                          : {})}
+                        {...(enterpriseMode === "qa" ? { qaMode: true } : {})}
                       />
                     </div>
                   </div>
@@ -4911,7 +4801,6 @@ function useChatViewContent(props: ChatViewProps) {
           onAddTerminal={addTerminalSurface}
           onAddDiff={addDiffSurface}
           onAddFiles={addFilesSurface}
-          onAddQa={addQaSurface}
           browserAvailable={isPreviewSupportedInRuntime()}
           diffAvailable={isServerThread && isGitRepo}
           filesAvailable={activeProject !== null}
@@ -4940,7 +4829,6 @@ function useChatViewContent(props: ChatViewProps) {
             onAddTerminal={addTerminalSurface}
             onAddDiff={addDiffSurface}
             onAddFiles={addFilesSurface}
-            onAddQa={addQaSurface}
             browserAvailable={isPreviewSupportedInRuntime()}
             diffAvailable={isServerThread && isGitRepo}
             filesAvailable={activeProject !== null}

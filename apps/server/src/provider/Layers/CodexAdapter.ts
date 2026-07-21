@@ -84,6 +84,23 @@ export const QA_CODEX_APP_SERVER_ARGS = [
   `permissions.${QA_CODEX_PERMISSION_PROFILE}.filesystem.":workspace_roots".".qa"="read"`,
 ] as const;
 
+export function shouldUseQaCodexPermissionProfile(input: {
+  readonly mcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
+  readonly serverConfig: Pick<
+    ServerConfig["Service"],
+    "desktopBootstrapGrants" | "desktopDevelopmentProfile"
+  >;
+}): boolean {
+  if (input.mcpSession?.authorizationContext.kind === "qa-release") {
+    return true;
+  }
+  return (
+    input.serverConfig.desktopBootstrapGrants === undefined &&
+    (input.serverConfig.desktopDevelopmentProfile === "qa:maker" ||
+      input.serverConfig.desktopDevelopmentProfile === "qa:approver")
+  );
+}
+
 export interface CodexAdapterLiveOptions {
   readonly instanceId?: ProviderInstanceId;
   readonly environment?: NodeJS.ProcessEnv;
@@ -1401,11 +1418,12 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
-        const qaDesktopProfile =
-          serverConfig.desktopDevelopmentProfile === "qa:maker" ||
-          serverConfig.desktopDevelopmentProfile === "qa:approver";
+        const qaReleaseSession = shouldUseQaCodexPermissionProfile({
+          mcpSession,
+          serverConfig,
+        });
         const appServerArgs = [
-          ...(qaDesktopProfile ? QA_CODEX_APP_SERVER_ARGS : []),
+          ...(qaReleaseSession ? QA_CODEX_APP_SERVER_ARGS : []),
           ...(mcpSession
             ? [
                 "-c",
@@ -1431,8 +1449,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ...(isCodexResumeCursorSchema(input.resumeCursor)
             ? { resumeCursor: input.resumeCursor }
             : {}),
-          runtimeMode: qaDesktopProfile ? "approval-required" : input.runtimeMode,
-          ...(qaDesktopProfile ? { useConfiguredPermissionProfile: true } : {}),
+          runtimeMode: qaReleaseSession ? "approval-required" : input.runtimeMode,
+          ...(qaReleaseSession ? { useConfiguredPermissionProfile: true } : {}),
           ...(input.modelSelection?.instanceId === boundInstanceId
             ? { model: input.modelSelection.model }
             : {}),

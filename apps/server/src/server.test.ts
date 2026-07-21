@@ -5,6 +5,9 @@ import * as NodeCrypto from "node:crypto";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 import {
+  AuthQaApproverScopes,
+  AuthQaMakerScopes,
+  AuthQaRootScopes,
   AuthAccessTokenType,
   AuthEnvironmentBootstrapTokenType,
   AuthTokenExchangeGrantType,
@@ -21,8 +24,10 @@ import {
   type OrchestrationCommand,
   type OrchestrationEvent,
   ORCHESTRATION_WS_METHODS,
-  type PreviewEvent,
   ProjectId,
+  QaOperationError,
+  QaReleaseId,
+  type QaReleaseSnapshot,
   ProviderDriverKind,
   ProviderInstanceId,
   ResolvedKeybindingRule,
@@ -66,6 +71,7 @@ import {
 import { OtlpSerialization, OtlpTracer } from "effect/unstable/observability";
 import { RpcClient, RpcSerialization } from "effect/unstable/rpc";
 import * as Socket from "effect/unstable/socket/Socket";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { vi } from "vite-plus/test";
 
 const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
@@ -89,6 +95,8 @@ import { makeManualOnlyProviderMaintenanceCapabilities } from "./provider/provid
 import * as QaDatabase from "./qa/QaDatabase.ts";
 import * as QaDashboardQuery from "./qa/QaDashboardQuery.ts";
 import * as QaIngestionGateway from "./qa/QaIngestionGateway.ts";
+import * as QaIam from "./qa/QaIam.ts";
+import * as QaLocalRuntime from "./qa/QaLocalRuntime.ts";
 import * as QaReleaseEventBus from "./qa/QaReleaseEventBus.ts";
 import * as QaReviewService from "./qa/QaReviewService.ts";
 import * as QaWorkflow from "./qa/QaWorkflow.ts";
@@ -210,6 +218,142 @@ const makeDefaultOrchestrationThreadShell = (
   };
 };
 
+function makeQaStageGenerationSnapshot(input: {
+  readonly projectId: ProjectId;
+  readonly releaseId: QaReleaseId;
+  readonly revision?: number;
+}): QaReleaseSnapshot {
+  const updatedAt = "2026-07-16T12:00:00.000Z";
+  return {
+    mode: "qa",
+    projectId: input.projectId,
+    releaseId: input.releaseId,
+    threadId: ThreadId.make(input.releaseId),
+    revision: input.revision ?? 4,
+    releaseNumber: 1,
+    title: "v1",
+    status: "active",
+    phase: "ready",
+    activeStage: "strategy",
+    stages: [
+      {
+        stage: "intake",
+        status: "complete",
+        progress: 100,
+        activeJobId: null,
+        blockedReason: null,
+        updatedAt,
+      },
+      {
+        stage: "requirements",
+        status: "complete",
+        progress: 100,
+        activeJobId: null,
+        blockedReason: null,
+        updatedAt,
+      },
+      {
+        stage: "strategy",
+        status: "ready",
+        progress: 0,
+        activeJobId: null,
+        blockedReason: null,
+        updatedAt,
+      },
+      ...(["scenarios", "test_cases", "scripts", "readiness"] as const).map((stage) => ({
+        stage,
+        status: "locked" as const,
+        progress: 0,
+        activeJobId: null,
+        blockedReason: null,
+        updatedAt,
+      })),
+    ],
+    ingestionStatus: "completed",
+    ingestionProgress: 100,
+    documents: [],
+    requirements: [],
+    authoredFlows: [],
+    traceabilityNodes: [],
+    traceabilityEdges: [],
+    strategy: null,
+    scenarioPlan: null,
+    testCasePlan: null,
+    scriptPlan: null,
+    readinessDashboard: null,
+    approvalGates: [],
+    createdAt: updatedAt,
+    updatedAt,
+  };
+}
+
+function makeQaStageGenerationWorkflowHarness(initialSnapshot: QaReleaseSnapshot) {
+  let snapshot = initialSnapshot;
+
+  const updateStrategyStage = (
+    revision: number,
+    status: "ready" | "queued",
+    activeJobId: string | null,
+  ) => {
+    snapshot = {
+      ...snapshot,
+      revision,
+      stages: snapshot.stages.map((stage) =>
+        stage.stage === "strategy"
+          ? { ...stage, status, activeJobId, progress: 0, blockedReason: null }
+          : stage,
+      ),
+    };
+    return snapshot;
+  };
+
+  const workflow: Partial<QaWorkflow.QaWorkflow["Service"]> = {
+    getSnapshot: ({ threadId }) =>
+      Effect.succeed(String(threadId) === String(snapshot.threadId) ? snapshot : null),
+    claimAgentStageGeneration: (threadId, expectedRevision, jobId) =>
+      Effect.suspend(() => {
+        if (String(threadId) !== String(snapshot.threadId)) {
+          return Effect.fail(
+            new QaOperationError({
+              code: "release_not_found",
+              message: "The QA release was not found.",
+            }),
+          );
+        }
+        if (expectedRevision !== snapshot.revision) {
+          return Effect.fail(
+            new QaOperationError({
+              code: "invalid_workflow_state",
+              message: "The QA release revision changed.",
+            }),
+          );
+        }
+        const strategy = snapshot.stages.find((stage) => stage.stage === "strategy");
+        if (strategy?.status !== "ready" || strategy.activeJobId !== null) {
+          return Effect.fail(
+            new QaOperationError({
+              code: "invalid_workflow_state",
+              message: "The strategy stage already has an active generation job.",
+            }),
+          );
+        }
+        return Effect.succeed(updateStrategyStage(snapshot.revision + 1, "queued", jobId));
+      }),
+    releaseAgentStageGeneration: (threadId, jobId) =>
+      Effect.sync(() => {
+        const strategy = snapshot.stages.find((stage) => stage.stage === "strategy");
+        return String(threadId) === String(snapshot.threadId) && strategy?.activeJobId === jobId
+          ? updateStrategyStage(snapshot.revision + 1, "ready", null)
+          : snapshot;
+      }),
+  };
+
+  return {
+    workflow,
+    getSnapshot: () => snapshot,
+  };
+}
+
 const browserOtlpTracingLayer = Layer.mergeAll(
   FetchHttpClient.layer,
   OtlpSerialization.layerJson,
@@ -221,6 +365,32 @@ const makeAuthTestLayer = () =>
     Layer.provide(SqlitePersistenceMemory),
     Layer.provide(ServerSecretStore.layer),
   );
+
+const qaDatabaseTestLayer = Layer.effect(
+  QaDatabase.QaDatabase,
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`
+      CREATE TABLE IF NOT EXISTS application_principals (
+        id TEXT PRIMARY KEY,
+        subject TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL
+      )
+    `;
+    yield* sql`
+      CREATE TABLE IF NOT EXISTS qa_release_conversations (
+        release_thread_id TEXT NOT NULL,
+        principal_id TEXT NOT NULL,
+        environment_id TEXT NOT NULL,
+        conversation_thread_id TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (release_thread_id, principal_id, environment_id)
+      )
+    `;
+    return sql;
+  }),
+);
 
 const makeBrowserOtlpPayload = (spanName: string) =>
   Effect.gen(function* () {
@@ -355,6 +525,11 @@ const buildAppUnderTest = (options?: {
       CloudManagedEndpointRuntime.CloudManagedEndpointRuntime["Service"]
     >;
     relayClient?: Partial<RelayClient.RelayClient["Service"]>;
+    qaIam?: Partial<QaIam.QaIam["Service"]>;
+    qaReleaseEventBus?: Partial<QaReleaseEventBus.QaReleaseEventBus["Service"]>;
+    qaLocalRuntime?: Partial<QaLocalRuntime.QaLocalRuntime["Service"]>;
+    qaWorkflow?: Partial<QaWorkflow.QaWorkflow["Service"]>;
+    previewManager?: Partial<PreviewManager.PreviewManager["Service"]>;
     cloudCliTokenManager?: Partial<CloudCliTokenManager.CloudCliTokenManager["Service"]>;
   };
 }) =>
@@ -386,12 +561,12 @@ const buildAppUnderTest = (options?: {
       noBrowser: true,
       startupPresentation: "browser",
       desktopBootstrapToken: defaultDesktopBootstrapToken,
+      desktopDevelopmentProfile: "root",
       autoBootstrapProjectFromCwd: false,
       logWebSocketEvents: false,
       tailscaleServeEnabled: false,
       tailscaleServePort: 443,
       ...options?.config,
-      desktopDevelopmentProfile: options?.config?.desktopDevelopmentProfile,
     };
     const layerConfig = ServerConfig.layer(config);
     const defaultVcsDriver: VcsDriver.VcsDriver["Service"] = {
@@ -530,10 +705,21 @@ const buildAppUnderTest = (options?: {
         })
       : VcsStatusBroadcaster.layer.pipe(Layer.provide(gitWorkflowLayer));
     const qaReviewRoutesLayer = Layer.mergeAll(
+      options?.layers?.qaIam ? Layer.mock(QaIam.QaIam)({ ...options.layers.qaIam }) : QaIam.layer,
+      Layer.mock(QaLocalRuntime.QaLocalRuntime)({
+        ensureConversation: () => Effect.die("Unused QA local runtime in server test."),
+        ...options?.layers?.qaLocalRuntime,
+      }),
       QaDashboardQuery.layer,
-      QaReleaseEventBus.layer,
+      options?.layers?.qaReleaseEventBus
+        ? Layer.mock(QaReleaseEventBus.QaReleaseEventBus)({
+            ...options.layers.qaReleaseEventBus,
+          })
+        : QaReleaseEventBus.layer,
       QaReviewService.layer,
-      QaWorkflow.layer,
+      options?.layers?.qaWorkflow
+        ? Layer.mock(QaWorkflow.QaWorkflow)({ ...options.layers.qaWorkflow })
+        : QaWorkflow.layer,
     );
 
     const servedRoutesLayer = HttpRouter.serve(makeRoutesLayer, {
@@ -674,10 +860,13 @@ const buildAppUnderTest = (options?: {
             refresh: () => Effect.void,
             close: () => Effect.void,
             list: () => Effect.succeed({ sessions: [] }),
+            getAccessDescriptor: () => Effect.succeed(Option.none()),
             events: Stream.empty,
-            subscribeEvents: Effect.flatMap(PubSub.unbounded<PreviewEvent>(), (pubsub) =>
-              PubSub.subscribe(pubsub),
+            subscribeEvents: Effect.flatMap(
+              PubSub.unbounded<PreviewManager.PreviewEventEnvelope>(),
+              (pubsub) => PubSub.subscribe(pubsub),
             ),
+            ...options?.layers?.previewManager,
           }),
           Layer.mock(PortScanner.PortDiscovery)({
             scan: () => Effect.succeed([]),
@@ -821,7 +1010,7 @@ const buildAppUnderTest = (options?: {
       Layer.provide(workspaceAndProjectServicesLayer),
       Layer.provideMerge(FetchHttpClient.layer),
       Layer.provide(QaIngestionGateway.layerTest),
-      Layer.provide(QaDatabase.layerFromSqlClient),
+      Layer.provide(qaDatabaseTestLayer),
       Layer.provide(SqlitePersistenceMemory),
       Layer.provide(layerConfig),
     );
@@ -3702,6 +3891,74 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("closes an established websocket when its parent session is revoked", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest({
+        config: {
+          host: "0.0.0.0",
+        },
+      });
+
+      const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+      const pairingResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+        headers: {
+          cookie: ownerCookie,
+        },
+        body: yield* HttpBody.json({}),
+      });
+      const pairingBody = (yield* pairingResponse.json) as {
+        readonly credential: string;
+      };
+      const pairedSessionCookie = yield* getAuthenticatedSessionCookieHeader(
+        pairingBody.credential,
+      );
+      const clientsResponse = yield* HttpClient.get("/api/auth/clients", {
+        headers: {
+          cookie: ownerCookie,
+        },
+      });
+      const clients = (yield* clientsResponse.json) as ReadonlyArray<{
+        readonly sessionId: string;
+        readonly current: boolean;
+      }>;
+      const pairedSessionId = clients.find((entry) => !entry.current)?.sessionId;
+      assert.isDefined(pairedSessionId);
+
+      const wsUrl = appendSessionCookieToWsUrl(
+        yield* getWsServerUrl("/ws", { authenticated: false }),
+        pairedSessionCookie,
+      );
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            yield* client[WS_METHODS.serverGetConfig]({});
+
+            const revokeResponse = yield* HttpClient.post("/api/auth/clients/revoke", {
+              headers: {
+                cookie: ownerCookie,
+                "content-type": "application/json",
+              },
+              body: HttpBody.text(
+                jsonRequestBody({ sessionId: pairedSessionId }),
+                "application/json",
+              ),
+            });
+            assert.equal(revokeResponse.status, 200);
+
+            const postRevocation = yield* client[WS_METHODS.serverGetConfig]({}).pipe(
+              Effect.timeout("2 seconds"),
+              Effect.result,
+            );
+            assert.equal(postRevocation._tag, "Failure");
+            if (postRevocation._tag === "Failure") {
+              assert.notEqual(postRevocation.failure._tag, "TimeoutException");
+            }
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("allows reusing the desktop bootstrap credential", () =>
     Effect.gen(function* () {
       // The desktop-bootstrap grant is delivered over trusted IPC at
@@ -4744,7 +5001,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         withWsRpcClient(wsUrl, (client) =>
           client[WS_METHODS.qaCreateProject]({
             projectId: ProjectId.make("project-qa-approver-denied"),
-            threadId: ThreadId.make("thread-qa-approver-denied"),
+            releaseId: QaReleaseId.make("release-qa-approver-denied"),
             projectTitle: "Denied project",
             releaseTitle: "Denied release",
           }),
@@ -4801,36 +5058,191 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("rolls back the project and empty derived workspace when thread creation fails", () =>
+  it.effect("denies background stage generation to an approver before local provisioning", () =>
     Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const workspaceBase = yield* fs.makeTempDirectoryScoped({ prefix: "t3-qa-rollback-" });
+      let ensureCalls = 0;
       const commands: Array<OrchestrationCommand> = [];
-      const projectId = ProjectId.make("rollback-project-1234");
-      const expectedWorkspaceRoot = path.join(
-        workspaceBase,
-        ".t3-qa-projects",
-        "rollback-project-rollback",
-      );
-
       yield* buildAppUnderTest({
-        config: { desktopDevelopmentProfile: "qa:maker" },
+        config: { desktopDevelopmentProfile: "qa:approver" },
         layers: {
-          serverSettings: {
-            getSettings: Effect.succeed({
-              ...DEFAULT_SERVER_SETTINGS,
-              addProjectBaseDirectory: workspaceBase,
-            }),
+          qaLocalRuntime: {
+            ensureConversation: () => {
+              ensureCalls += 1;
+              return Effect.die("Approver generation must be rejected before provisioning.");
+            },
           },
           orchestrationEngine: {
             dispatch: (command) => {
               commands.push(command);
-              return command.type === "thread.create"
+              return Effect.succeed({ sequence: commands.length });
+            },
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.qaStartStageGeneration]({
+            releaseId: QaReleaseId.make("approver-generation-denied"),
+            expectedRevision: 1,
+          }),
+        ),
+      ).pipe(Effect.result);
+
+      if (result._tag !== "Failure" || result.failure._tag !== "EnvironmentAuthorizationError") {
+        assert.fail("Expected an EnvironmentAuthorizationError");
+      }
+      assert.equal(result.failure.requiredScope, "qa:make");
+      assert.equal(ensureCalls, 0);
+      assert.deepEqual(commands, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "dispatches a maker stage generation once when a duplicate uses the same revision",
+    () =>
+      Effect.gen(function* () {
+        const projectId = ProjectId.make("project-qa-stage-generation-once");
+        const releaseId = QaReleaseId.make("release-qa-stage-generation-once");
+        const conversationThreadId = ThreadId.make("conversation-qa-stage-generation-once");
+        const harness = makeQaStageGenerationWorkflowHarness(
+          makeQaStageGenerationSnapshot({ projectId, releaseId }),
+        );
+        const commands: Array<OrchestrationCommand> = [];
+
+        yield* buildAppUnderTest({
+          config: { desktopDevelopmentProfile: "qa:maker" },
+          layers: {
+            qaWorkflow: harness.workflow,
+            qaIam: {
+              authorizeRelease: (input) =>
+                Effect.succeed({
+                  principal: {
+                    id: "local:qa:maker",
+                    subject: input.subject,
+                    displayName: "Local QA Maker",
+                  },
+                  organizationId: "local-repro-org",
+                  projectId,
+                  projectName: "Shared project",
+                  role: "qa:maker",
+                  capabilities: ["qa:read", "qa:make", "qa:chat", "qa:test-application"],
+                  releaseThreadId: input.releaseThreadId,
+                }),
+            },
+            qaLocalRuntime: {
+              ensureConversation: () =>
+                Effect.succeed({
+                  releaseId,
+                  projectId: ProjectId.make("runtime-project-qa-stage-generation-once"),
+                  conversationThreadId,
+                  workspaceRoot: "/tmp/qa-stage-generation-once",
+                }),
+            },
+            orchestrationEngine: {
+              dispatch: (command) => {
+                commands.push(command);
+                return Effect.succeed({ sequence: commands.length });
+              },
+            },
+          },
+        });
+
+        const wsUrl = yield* getWsServerUrl("/ws");
+        const result = yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            Effect.gen(function* () {
+              const receipt = yield* client[WS_METHODS.qaStartStageGeneration]({
+                releaseId,
+                expectedRevision: 4,
+              });
+              const duplicate = yield* client[WS_METHODS.qaStartStageGeneration]({
+                releaseId,
+                expectedRevision: 4,
+              }).pipe(Effect.result);
+              const persisted = yield* client[WS_METHODS.qaGetSnapshot]({
+                threadId: ThreadId.make(releaseId),
+              });
+              return { receipt, duplicate, persisted };
+            }),
+          ),
+        );
+
+        assert.equal(result.receipt.releaseId, releaseId);
+        assert.equal(result.receipt.conversationThreadId, conversationThreadId);
+        assert.equal(result.receipt.stage, "strategy");
+        assert.equal(result.receipt.revision, 5);
+        if (
+          result.duplicate._tag !== "Failure" ||
+          result.duplicate.failure._tag !== "QaOperationError"
+        ) {
+          assert.fail("Expected the duplicate generation request to fail.");
+        }
+        assert.equal(result.duplicate.failure.code, "invalid_workflow_state");
+        assert.equal(commands.length, 1);
+        const dispatched = commands[0];
+        if (dispatched?.type !== "thread.turn.start") {
+          assert.fail("Expected one background thread.turn.start dispatch.");
+        }
+        assert.equal(dispatched.threadId, conversationThreadId);
+        assert.match(dispatched.message.text, /strategy/u);
+        assert.equal(result.persisted?.revision, 5);
+        const strategy = result.persisted?.stages.find((stage) => stage.stage === "strategy");
+        assert.equal(strategy?.status, "queued");
+        assert.match(strategy?.activeJobId ?? "", /^qa-stage-generation:/u);
+        assert.equal(harness.getSnapshot().revision, 5);
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("rolls back a failed stage dispatch and allows a retry", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project-qa-stage-generation-retry");
+      const releaseId = QaReleaseId.make("release-qa-stage-generation-retry");
+      const conversationThreadId = ThreadId.make("conversation-qa-stage-generation-retry");
+      const harness = makeQaStageGenerationWorkflowHarness(
+        makeQaStageGenerationSnapshot({ projectId, releaseId }),
+      );
+      const commands: Array<OrchestrationCommand> = [];
+      let rejectDispatch = true;
+
+      yield* buildAppUnderTest({
+        config: { desktopDevelopmentProfile: "qa:maker" },
+        layers: {
+          qaWorkflow: harness.workflow,
+          qaIam: {
+            authorizeRelease: (input) =>
+              Effect.succeed({
+                principal: {
+                  id: "local:qa:maker",
+                  subject: input.subject,
+                  displayName: "Local QA Maker",
+                },
+                organizationId: "local-repro-org",
+                projectId,
+                projectName: "Shared project",
+                role: "qa:maker",
+                capabilities: ["qa:read", "qa:make", "qa:chat", "qa:test-application"],
+                releaseThreadId: input.releaseThreadId,
+              }),
+          },
+          qaLocalRuntime: {
+            ensureConversation: () =>
+              Effect.succeed({
+                releaseId,
+                projectId: ProjectId.make("runtime-project-qa-stage-generation-retry"),
+                conversationThreadId,
+                workspaceRoot: "/tmp/qa-stage-generation-retry",
+              }),
+          },
+          orchestrationEngine: {
+            dispatch: (command) => {
+              commands.push(command);
+              return rejectDispatch
                 ? Effect.fail(
                     new OrchestrationCommandInvariantError({
                       commandType: command.type,
-                      detail: "Injected thread creation failure.",
+                      detail: "test background dispatch failure",
                     }),
                   )
                 : Effect.succeed({ sequence: commands.length });
@@ -4842,23 +5254,309 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const wsUrl = yield* getWsServerUrl("/ws");
       const result = yield* Effect.scoped(
         withWsRpcClient(wsUrl, (client) =>
-          client[WS_METHODS.qaCreateProject]({
-            projectId,
-            threadId: ThreadId.make("rollback-thread-1234"),
-            projectTitle: "Rollback project",
-            releaseTitle: "v1",
+          Effect.gen(function* () {
+            const failed = yield* client[WS_METHODS.qaStartStageGeneration]({
+              releaseId,
+              expectedRevision: 4,
+            }).pipe(Effect.result);
+            const rolledBack = yield* client[WS_METHODS.qaGetSnapshot]({
+              threadId: ThreadId.make(releaseId),
+            });
+            rejectDispatch = false;
+            const retried = yield* client[WS_METHODS.qaStartStageGeneration]({
+              releaseId,
+              expectedRevision: rolledBack?.revision ?? 0,
+            });
+            const persisted = yield* client[WS_METHODS.qaGetSnapshot]({
+              threadId: ThreadId.make(releaseId),
+            });
+            return { failed, rolledBack, retried, persisted };
           }),
+        ),
+      );
+
+      if (result.failed._tag !== "Failure" || result.failed.failure._tag !== "QaOperationError") {
+        assert.fail("Expected the failed background dispatch to return a QaOperationError.");
+      }
+      assert.equal(result.failed.failure.code, "persistence_failed");
+      assert.equal(result.rolledBack?.revision, 6);
+      const rolledBackStage = result.rolledBack?.stages.find((stage) => stage.stage === "strategy");
+      assert.equal(rolledBackStage?.status, "ready");
+      assert.isNull(rolledBackStage?.activeJobId ?? null);
+      assert.equal(result.retried.revision, 7);
+      assert.equal(result.retried.conversationThreadId, conversationThreadId);
+      assert.equal(commands.length, 2);
+      assert.isTrue(commands.every((command) => command.type === "thread.turn.start"));
+      const persistedStage = result.persisted?.stages.find((stage) => stage.stage === "strategy");
+      assert.equal(persistedStage?.status, "queued");
+      assert.match(persistedStage?.activeJobId ?? "", /^qa-stage-generation:/u);
+      assert.equal(harness.getSnapshot().revision, 7);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("revalidates live QA release access before every subscription event", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project-qa-live-authorization");
+      const releaseId = QaReleaseId.make("release-qa-live-authorization");
+      const threadId = ThreadId.make(releaseId);
+      const snapshot = makeQaStageGenerationSnapshot({ projectId, releaseId });
+      let accessAllowed = true;
+      let authorizationChecks = 0;
+
+      yield* buildAppUnderTest({
+        config: { desktopDevelopmentProfile: "qa:maker" },
+        layers: {
+          qaWorkflow: {
+            getSnapshot: ({ threadId: requestedThreadId }) =>
+              Effect.succeed(requestedThreadId === threadId ? snapshot : null),
+          },
+          qaIam: {
+            authorizeRelease: (input) =>
+              Effect.suspend(() => {
+                authorizationChecks += 1;
+                return accessAllowed
+                  ? Effect.succeed({
+                      principal: {
+                        id: "local:qa:maker",
+                        subject: input.subject,
+                        displayName: "Local QA Maker",
+                      },
+                      organizationId: "local-repro-org",
+                      projectId,
+                      projectName: "Shared project",
+                      role: "qa:maker" as const,
+                      capabilities: [
+                        "qa:read" as const,
+                        "qa:make" as const,
+                        "qa:chat" as const,
+                        "qa:test-application" as const,
+                      ],
+                      releaseThreadId: input.releaseThreadId,
+                    })
+                  : Effect.fail(
+                      new QaIam.QaIamError({
+                        code: "project_access_denied",
+                        message: "The project assignment was revoked.",
+                      }),
+                    );
+              }),
+          },
+          qaReleaseEventBus: {
+            publish: () => Effect.void,
+            events: Stream.fromEffect(
+              Effect.sync(() => {
+                // The initial snapshot is emitted first. Revoking access while
+                // the next source event is pulled proves the stream checks IAM
+                // again instead of relying on its subscription-time decision.
+                accessAllowed = false;
+                return {
+                  releaseId,
+                  threadId,
+                  revision: snapshot.revision + 1,
+                  reason: "progress" as const,
+                  at: snapshot.updatedAt,
+                };
+              }),
+            ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.qaSubscribeRelease]({ threadId }).pipe(Stream.runDrain),
         ),
       ).pipe(Effect.result);
 
-      if (result._tag !== "Failure" || result.failure._tag !== "QaOperationError") {
-        assert.fail("Expected a QaOperationError");
+      if (result._tag !== "Failure" || result.failure._tag !== "EnvironmentAuthorizationError") {
+        assert.fail("Expected live release access revocation to stop the subscription.");
       }
-      assert.deepEqual(
-        commands.map((command) => command.type),
-        ["project.create", "thread.create", "project.delete"],
+      assert.equal(result.failure.requiredScope, "qa:read");
+      assert.isAtLeast(authorizationChecks, 3);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("revalidates principal-specific QA conversation access before every thread event", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project-qa-conversation-live-authorization");
+      const releaseThreadId = ThreadId.make("release-qa-conversation-live-authorization");
+      const conversationThreadId = ThreadId.make("conversation-qa-conversation-live-authorization");
+      const occurredAt = "2026-07-16T12:00:00.000Z";
+      let accessAllowed = true;
+      let authorizationChecks = 0;
+      const thread = {
+        ...makeDefaultOrchestrationReadModel().threads[0]!,
+        id: conversationThreadId,
+        projectId,
+      };
+      const liveEvent: OrchestrationEvent = {
+        sequence: 2,
+        eventId: EventId.make("event-qa-conversation-live-authorization"),
+        commandId: CommandId.make("command-qa-conversation-live-authorization"),
+        causationEventId: null,
+        correlationId: CommandId.make("command-qa-conversation-live-authorization"),
+        metadata: {},
+        aggregateKind: "thread",
+        aggregateId: conversationThreadId,
+        type: "thread.message-sent",
+        payload: {
+          threadId: conversationThreadId,
+          messageId: MessageId.make("message-qa-conversation-live-authorization"),
+          role: "assistant",
+          text: "This event must not cross a revoked assignment.",
+          turnId: null,
+          streaming: false,
+          createdAt: occurredAt,
+          updatedAt: occurredAt,
+        },
+        occurredAt,
+      };
+
+      yield* buildAppUnderTest({
+        config: { desktopDevelopmentProfile: "qa:maker" },
+        layers: {
+          qaIam: {
+            authorizeConversation: (input) =>
+              Effect.suspend(() => {
+                authorizationChecks += 1;
+                return accessAllowed
+                  ? Effect.succeed({
+                      principal: {
+                        id: "local:qa:maker",
+                        subject: input.subject,
+                        displayName: "Local QA Maker",
+                      },
+                      organizationId: "local-repro-org",
+                      projectId,
+                      projectName: "Shared project",
+                      role: "qa:maker" as const,
+                      capabilities: [
+                        "qa:read" as const,
+                        "qa:make" as const,
+                        "qa:chat" as const,
+                        "qa:test-application" as const,
+                      ],
+                      releaseThreadId,
+                      conversation: {
+                        releaseThreadId,
+                        conversationThreadId,
+                        principalId: "local:qa:maker",
+                        environmentId: input.environmentId,
+                      },
+                    })
+                  : Effect.fail(
+                      new QaIam.QaIamError({
+                        code: "conversation_access_denied",
+                        message: "The conversation assignment was revoked.",
+                      }),
+                    );
+              }),
+          },
+          projectionSnapshotQuery: {
+            getThreadDetailSnapshot: () =>
+              Effect.succeed(Option.some({ snapshotSequence: 1, thread })),
+          },
+          orchestrationEngine: {
+            streamDomainEvents: Stream.fromEffect(
+              Effect.sync(() => {
+                // Pulling the next event simulates a project assignment being
+                // revoked after the initial authorized snapshot.
+                accessAllowed = false;
+                return liveEvent;
+              }),
+            ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: conversationThreadId,
+          }).pipe(Stream.runDrain),
+        ),
+      ).pipe(Effect.result);
+
+      if (result._tag !== "Failure" || result.failure._tag !== "EnvironmentAuthorizationError") {
+        assert.fail("Expected conversation revocation to stop the thread subscription.");
+      }
+      assert.equal(result.failure.requiredScope, "qa:chat");
+      assert.isAtLeast(authorizationChecks, 3);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("creates a maker QA project and release without orchestration writes", () =>
+    Effect.gen(function* () {
+      const commands: Array<OrchestrationCommand> = [];
+      const projectId = ProjectId.make("maker-shared-project-1234");
+      const releaseId = QaReleaseId.make("maker-shared-release-1234");
+
+      yield* buildAppUnderTest({
+        config: { desktopDevelopmentProfile: "qa:maker" },
+        layers: {
+          qaIam: {
+            registerProject: (input) =>
+              Effect.succeed({
+                principal: {
+                  id: "local:qa:maker",
+                  subject: input.subject,
+                  displayName: "Local QA Maker",
+                },
+                organizationId: "local-repro-org",
+                projectId: input.projectId,
+                projectName: input.projectName,
+                role: "qa:maker",
+                capabilities: ["qa:read", "qa:make", "qa:chat", "qa:test-application"],
+              }),
+            authorizeRelease: (input) =>
+              Effect.succeed({
+                principal: {
+                  id: "local:qa:maker",
+                  subject: input.subject,
+                  displayName: "Local QA Maker",
+                },
+                organizationId: "local-repro-org",
+                projectId,
+                projectName: "Shared project",
+                role: "qa:maker",
+                capabilities: ["qa:read", "qa:make", "qa:chat", "qa:test-application"],
+                releaseThreadId: input.releaseThreadId,
+              }),
+          },
+          orchestrationEngine: {
+            dispatch: (command) => {
+              commands.push(command);
+              return Effect.succeed({ sequence: commands.length });
+            },
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const snapshot = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.qaCreateProject]({
+            projectId,
+            releaseId,
+            projectTitle: "Shared project",
+            releaseTitle: "v1",
+          }),
+        ),
       );
-      assert.isFalse(yield* fs.exists(expectedWorkspaceRoot));
+      const persisted = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.qaGetSnapshot]({ threadId: ThreadId.make(releaseId) }),
+        ),
+      );
+
+      assert.equal(snapshot.projectId, projectId);
+      assert.equal(snapshot.releaseId, releaseId);
+      assert.equal(String(snapshot.threadId), String(releaseId));
+      assert.equal(snapshot.title, "v1");
+      assert.equal(persisted?.releaseId, releaseId);
+      assert.deepEqual(commands, []);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -5734,6 +6432,53 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         ),
       );
       assert.deepEqual(replayResult, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("fails closed when QA conversation lookup fails for root orchestration", () =>
+    Effect.gen(function* () {
+      let lookupCalls = 0;
+      const dispatchedCommands: Array<OrchestrationCommand> = [];
+      yield* buildAppUnderTest({
+        layers: {
+          qaIam: {
+            resolveConversationContext: () => {
+              lookupCalls += 1;
+              return Effect.fail(
+                new QaIam.QaIamError({
+                  code: "persistence_error",
+                  message: "The QA conversation lookup failed.",
+                  operation: "resolveConversationContext:test",
+                }),
+              );
+            },
+          },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                return { sequence: dispatchedCommands.length };
+              }),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "thread.session.stop",
+            commandId: CommandId.make("cmd-qa-conversation-lookup-failure"),
+            threadId: ThreadId.make("thread-qa-conversation-lookup-failure"),
+            createdAt: "2026-01-01T00:00:00.000Z",
+          }),
+        ).pipe(Effect.result),
+      );
+
+      assertTrue(result._tag === "Failure");
+      assertTrue(result.failure._tag === "OrchestrationDispatchCommandError");
+      assert.equal(lookupCalls, 1);
+      assert.deepEqual(dispatchedCommands, []);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -6862,6 +7607,525 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       assertFailure(result, terminalError);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("isolates shared-backend root, maker, and approver transports", () =>
+    Effect.gen(function* () {
+      const credentials = {
+        root: "111111111111111111111111111111111111111111111111",
+        maker: "222222222222222222222222222222222222222222222222",
+        approver: "333333333333333333333333333333333333333333333333",
+      } as const;
+      const makerConversationThreadId = ThreadId.make("conversation-shared-transport-maker");
+      const approverConversationThreadId = ThreadId.make("conversation-shared-transport-approver");
+      const arbitraryThreadId = ThreadId.make("thread-shared-transport-arbitrary");
+      const makerReleaseThreadId = ThreadId.make("release-shared-transport-maker");
+      const approverReleaseThreadId = ThreadId.make("release-shared-transport-approver");
+      const workspaceRoot = yield* FileSystem.FileSystem.pipe(
+        Effect.flatMap((fileSystem) =>
+          fileSystem.makeTempDirectoryScoped({ prefix: "t3-shared-transport-" }),
+        ),
+      );
+      const dispatchedCommands: Array<OrchestrationCommand> = [];
+
+      const conversationAccess = (
+        subject: "local:qa:maker" | "local:qa:approver",
+        conversationThreadId: ThreadId,
+        releaseThreadId: ThreadId,
+      ): QaIam.QaConversationAccess => ({
+        principal: {
+          id: subject,
+          subject,
+          displayName: subject === "local:qa:maker" ? "Local QA Maker" : "Local QA Approver",
+        },
+        organizationId: "local-repro-org",
+        projectId: ProjectId.make("project-shared-transport"),
+        projectName: "Shared transport project",
+        role: subject === "local:qa:maker" ? "qa:maker" : "qa:approver",
+        capabilities:
+          subject === "local:qa:maker"
+            ? ["qa:read", "qa:make", "qa:chat", "qa:test-application"]
+            : ["qa:read", "qa:approve", "qa:chat", "qa:test-application"],
+        releaseThreadId,
+        conversation: {
+          releaseThreadId,
+          conversationThreadId,
+          principalId: subject,
+          environmentId: testEnvironmentDescriptor.environmentId,
+        },
+      });
+      const conversations = new Map<ThreadId, QaIam.QaConversationAccess>([
+        [
+          makerConversationThreadId,
+          conversationAccess("local:qa:maker", makerConversationThreadId, makerReleaseThreadId),
+        ],
+        [
+          approverConversationThreadId,
+          conversationAccess(
+            "local:qa:approver",
+            approverConversationThreadId,
+            approverReleaseThreadId,
+          ),
+        ],
+      ]);
+      const threadFor = (threadId: ThreadId) => ({
+        ...makeDefaultOrchestrationReadModel().threads[0]!,
+        id: threadId,
+        projectId: ProjectId.make("project-shared-transport"),
+      });
+
+      yield* buildAppUnderTest({
+        config: {
+          desktopBootstrapToken: undefined,
+          desktopDevelopmentProfile: undefined,
+          desktopBootstrapGrants: [
+            { profile: "root", credential: credentials.root },
+            { profile: "qa:maker", credential: credentials.maker },
+            { profile: "qa:approver", credential: credentials.approver },
+          ],
+        },
+        layers: {
+          qaIam: {
+            resolveConversationContext: (input) => {
+              const access = conversations.get(ThreadId.make(input.conversationThreadId));
+              return access
+                ? Effect.succeed(access)
+                : Effect.fail(
+                    new QaIam.QaIamError({
+                      code: "conversation_not_found",
+                      message: "The thread is not a bound QA conversation.",
+                    }),
+                  );
+            },
+            authorizeConversation: (input) => {
+              const access = conversations.get(ThreadId.make(input.conversationThreadId));
+              return access?.principal.subject === input.subject
+                ? Effect.succeed(access)
+                : Effect.fail(
+                    new QaIam.QaIamError({
+                      code: access ? "conversation_access_denied" : "conversation_not_found",
+                      message: "The QA conversation is not assigned to this principal.",
+                    }),
+                  );
+            },
+          },
+          projectionSnapshotQuery: {
+            getThreadDetailSnapshot: (threadId) =>
+              Effect.succeed(
+                conversations.has(threadId)
+                  ? Option.some({ snapshotSequence: 1, thread: threadFor(threadId) })
+                  : Option.none(),
+              ),
+          },
+          orchestrationEngine: {
+            dispatch: (command) => {
+              dispatchedCommands.push(command);
+              return Effect.succeed({ sequence: dispatchedCommands.length });
+            },
+          },
+        },
+      });
+
+      const cookies = yield* Effect.all(
+        {
+          root: getAuthenticatedSessionCookieHeader(credentials.root),
+          maker: getAuthenticatedSessionCookieHeader(credentials.maker),
+          approver: getAuthenticatedSessionCookieHeader(credentials.approver),
+        },
+        { concurrency: "unbounded" },
+      );
+      const sessionUrl = yield* getHttpServerUrl("/api/auth/session");
+      const readSession = (cookie: string) =>
+        fetchEffect(sessionUrl, { headers: { cookie } }).pipe(
+          Effect.flatMap((response) =>
+            responseJsonEffect<{
+              readonly authenticated: boolean;
+              readonly sessionMethod?: string;
+              readonly subject?: string;
+              readonly scopes?: ReadonlyArray<string>;
+            }>(response),
+          ),
+        );
+      const sessions = yield* Effect.all(
+        {
+          root: readSession(cookies.root),
+          maker: readSession(cookies.maker),
+          approver: readSession(cookies.approver),
+        },
+        { concurrency: "unbounded" },
+      );
+
+      assert.equal(sessions.root.authenticated, true);
+      assert.equal(sessions.root.sessionMethod, "browser-session-cookie");
+      assert.equal(sessions.root.subject, "local:root");
+      assert.deepEqual(sessions.root.scopes, AuthQaRootScopes);
+      assert.equal(sessions.maker.authenticated, true);
+      assert.equal(sessions.maker.sessionMethod, "browser-session-cookie");
+      assert.equal(sessions.maker.subject, "local:qa:maker");
+      assert.deepEqual(sessions.maker.scopes, AuthQaMakerScopes);
+      assert.equal(sessions.approver.authenticated, true);
+      assert.equal(sessions.approver.sessionMethod, "browser-session-cookie");
+      assert.equal(sessions.approver.subject, "local:qa:approver");
+      assert.deepEqual(sessions.approver.scopes, AuthQaApproverScopes);
+
+      const standardCredentialResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+        headers: { cookie: cookies.root },
+        body: yield* HttpBody.json({}),
+      });
+      const standardCredential = (yield* standardCredentialResponse.json) as {
+        readonly credential: string;
+      };
+      const standardCookie = yield* getAuthenticatedSessionCookieHeader(
+        standardCredential.credential,
+      );
+
+      const unauthenticatedWsUrl = yield* getWsServerUrl("/ws", { authenticated: false });
+      const wsUrls = {
+        root: appendSessionCookieToWsUrl(unauthenticatedWsUrl, cookies.root),
+        maker: appendSessionCookieToWsUrl(unauthenticatedWsUrl, cookies.maker),
+        approver: appendSessionCookieToWsUrl(unauthenticatedWsUrl, cookies.approver),
+        standard: appendSessionCookieToWsUrl(unauthenticatedWsUrl, standardCookie),
+      };
+      const expectAuthorizationDenied = <A, E, R>(
+        operation: Effect.Effect<A, E, R>,
+        requiredScope: string,
+      ) =>
+        Effect.gen(function* () {
+          const result = yield* operation.pipe(Effect.result);
+          if (
+            result._tag !== "Failure" ||
+            typeof result.failure !== "object" ||
+            result.failure === null ||
+            !("_tag" in result.failure) ||
+            result.failure._tag !== "EnvironmentAuthorizationError"
+          ) {
+            return assert.fail(`Expected EnvironmentAuthorizationError for ${requiredScope}.`);
+          }
+          assert.equal(
+            (result.failure as { readonly requiredScope?: string }).requiredScope,
+            requiredScope,
+          );
+        });
+      const runQaClientChecks = (
+        wsUrl: string,
+        ownConversationThreadId: ThreadId,
+        foreignConversationThreadId: ThreadId,
+      ) =>
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const config = yield* client[WS_METHODS.serverGetConfig]({});
+            const ownThread = yield* client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+              threadId: ownConversationThreadId,
+            }).pipe(Stream.runHead);
+            assert.isTrue(Option.isSome(ownThread));
+
+            yield* expectAuthorizationDenied(
+              client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+                threadId: foreignConversationThreadId,
+              }).pipe(Stream.runHead),
+              "qa:chat",
+            );
+            yield* expectAuthorizationDenied(
+              client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+                threadId: arbitraryThreadId,
+              }).pipe(Stream.runHead),
+              "qa:chat",
+            );
+            yield* expectAuthorizationDenied(
+              client[ORCHESTRATION_WS_METHODS.getFullThreadDiff]({
+                threadId: arbitraryThreadId,
+                toTurnCount: 0,
+              }),
+              "orchestration:read",
+            );
+            yield* expectAuthorizationDenied(
+              client[ORCHESTRATION_WS_METHODS.getArchivedShellSnapshot]({}),
+              "orchestration:read",
+            );
+            yield* expectAuthorizationDenied(
+              client[ORCHESTRATION_WS_METHODS.subscribeShell]({}).pipe(Stream.runHead),
+              "orchestration:read",
+            );
+            yield* expectAuthorizationDenied(
+              client[WS_METHODS.terminalOpen]({
+                threadId: arbitraryThreadId,
+                terminalId: "default",
+                cwd: workspaceRoot,
+              }),
+              "terminal:operate",
+            );
+            yield* expectAuthorizationDenied(
+              client[WS_METHODS.vcsListRefs]({ cwd: workspaceRoot }),
+              "orchestration:read",
+            );
+            yield* expectAuthorizationDenied(
+              client[WS_METHODS.sourceControlLookupRepository]({
+                provider: "github",
+                repository: "owner/repository",
+              }),
+              "orchestration:read",
+            );
+            yield* expectAuthorizationDenied(
+              client[WS_METHODS.projectsListEntries]({ cwd: workspaceRoot }),
+              "orchestration:read",
+            );
+
+            const genericDispatch = yield* client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+              type: "project.create",
+              commandId: CommandId.make(`generic-project-${ownConversationThreadId}`),
+              projectId: ProjectId.make(`generic-project-${ownConversationThreadId}`),
+              title: "Forbidden generic project",
+              workspaceRoot,
+              createdAt: "2026-07-17T00:00:00.000Z",
+            }).pipe(Effect.result);
+            if (
+              genericDispatch._tag !== "Failure" ||
+              genericDispatch.failure._tag !== "OrchestrationDispatchCommandError"
+            ) {
+              return assert.fail("Expected generic QA project dispatch to be rejected.");
+            }
+            return config.environment.environmentId;
+          }),
+        );
+
+      const environmentIds = yield* Effect.scoped(
+        Effect.all(
+          {
+            root: withWsRpcClient(wsUrls.root, (client) =>
+              Effect.gen(function* () {
+                const config = yield* client[WS_METHODS.serverGetConfig]({});
+                yield* client[ORCHESTRATION_WS_METHODS.getArchivedShellSnapshot]({});
+                const shell = yield* client[ORCHESTRATION_WS_METHODS.subscribeShell]({}).pipe(
+                  Stream.runHead,
+                );
+                assert.isTrue(Option.isSome(shell));
+                return config.environment.environmentId;
+              }),
+            ),
+            maker: runQaClientChecks(
+              wsUrls.maker,
+              makerConversationThreadId,
+              approverConversationThreadId,
+            ),
+            approver: runQaClientChecks(
+              wsUrls.approver,
+              approverConversationThreadId,
+              makerConversationThreadId,
+            ),
+            standard: withWsRpcClient(wsUrls.standard, (client) =>
+              Effect.gen(function* () {
+                yield* expectAuthorizationDenied(
+                  client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+                    threadId: makerConversationThreadId,
+                  }).pipe(Stream.runHead),
+                  "qa:chat",
+                );
+                yield* expectAuthorizationDenied(
+                  client[ORCHESTRATION_WS_METHODS.getFullThreadDiff]({
+                    threadId: makerConversationThreadId,
+                    toTurnCount: 0,
+                  }),
+                  "qa:chat",
+                );
+                const dispatch = yield* client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+                  type: "thread.archive",
+                  commandId: CommandId.make("standard-non-owner-archive"),
+                  threadId: makerConversationThreadId,
+                }).pipe(Effect.result);
+                if (
+                  dispatch._tag !== "Failure" ||
+                  dispatch.failure._tag !== "OrchestrationDispatchCommandError"
+                ) {
+                  return assert.fail(
+                    "Expected a standard non-owner to be rejected before QA dispatch.",
+                  );
+                }
+
+                const threadUrl = yield* getHttpServerUrl(
+                  `/api/orchestration/threads/${makerConversationThreadId}`,
+                );
+                const threadResponse = yield* fetchEffect(threadUrl, {
+                  headers: { cookie: standardCookie },
+                });
+                assert.equal(threadResponse.status, 404);
+
+                const dispatchUrl = yield* getHttpServerUrl("/api/orchestration/dispatch");
+                const dispatchResponse = yield* fetchEffect(dispatchUrl, {
+                  method: "POST",
+                  headers: {
+                    cookie: standardCookie,
+                    "content-type": "application/json",
+                  },
+                  body: jsonRequestBody({
+                    type: "thread.archive",
+                    commandId: "standard-non-owner-http-archive",
+                    threadId: makerConversationThreadId,
+                  }),
+                });
+                assert.equal(dispatchResponse.status, 404);
+                return testEnvironmentDescriptor.environmentId;
+              }),
+            ),
+          },
+          { concurrency: "unbounded" },
+        ),
+      );
+
+      assert.deepEqual(environmentIds, {
+        root: testEnvironmentDescriptor.environmentId,
+        maker: testEnvironmentDescriptor.environmentId,
+        approver: testEnvironmentDescriptor.environmentId,
+        standard: testEnvironmentDescriptor.environmentId,
+      });
+      assert.deepEqual(dispatchedCommands, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("isolates preview list, actions, and events across shared-backend principals", () =>
+    Effect.gen(function* () {
+      const credentials = {
+        root: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        maker: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        approver: "cccccccccccccccccccccccccccccccccccccccccccccccc",
+      } as const;
+      const projectId = ProjectId.make("project-preview-transport-isolation");
+      const releaseThreadId = ThreadId.make("release-preview-transport-isolation");
+      const conversationThreadId = ThreadId.make("conversation-preview-transport-isolation");
+      const previewManager = yield* PreviewManager.make;
+      const subscriptionsReady = yield* Deferred.make<void>();
+      let subscriptionCount = 0;
+      const instrumentedEvents = Stream.unwrap(
+        Effect.gen(function* () {
+          subscriptionCount += 1;
+          if (subscriptionCount >= 1) {
+            yield* Deferred.succeed(subscriptionsReady, undefined);
+          }
+          return previewManager.events;
+        }),
+      );
+      const makerAccess: QaIam.QaConversationAccess = {
+        principal: {
+          id: "local:qa:maker",
+          subject: "local:qa:maker",
+          displayName: "Local QA Maker",
+        },
+        organizationId: "local-repro-org",
+        projectId,
+        projectName: "Preview isolation project",
+        role: "qa:maker",
+        capabilities: ["qa:read", "qa:make", "qa:chat", "qa:test-application"],
+        releaseThreadId,
+        conversation: {
+          releaseThreadId,
+          conversationThreadId,
+          principalId: "local:qa:maker",
+          environmentId: testEnvironmentDescriptor.environmentId,
+        },
+      };
+
+      yield* buildAppUnderTest({
+        config: {
+          desktopBootstrapToken: undefined,
+          desktopDevelopmentProfile: undefined,
+          desktopBootstrapGrants: [
+            { profile: "root", credential: credentials.root },
+            { profile: "qa:maker", credential: credentials.maker },
+            { profile: "qa:approver", credential: credentials.approver },
+          ],
+        },
+        layers: {
+          previewManager: { ...previewManager, events: instrumentedEvents },
+          qaIam: {
+            authorizeConversation: (input) =>
+              input.conversationThreadId === conversationThreadId &&
+              input.subject === makerAccess.principal.subject
+                ? Effect.succeed(makerAccess)
+                : Effect.fail(
+                    new QaIam.QaIamError({
+                      code:
+                        input.conversationThreadId === conversationThreadId
+                          ? "conversation_access_denied"
+                          : "conversation_not_found",
+                      message: "The preview conversation is not assigned to this principal.",
+                    }),
+                  ),
+          },
+        },
+      });
+
+      const cookies = yield* Effect.all(
+        {
+          maker: getAuthenticatedSessionCookieHeader(credentials.maker),
+          approver: getAuthenticatedSessionCookieHeader(credentials.approver),
+        },
+        { concurrency: "unbounded" },
+      );
+      const baseWsUrl = yield* getWsServerUrl("/ws", { authenticated: false });
+      const makerWsUrl = appendSessionCookieToWsUrl(baseWsUrl, cookies.maker);
+      const approverWsUrl = appendSessionCookieToWsUrl(baseWsUrl, cookies.approver);
+
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const foreignEventFiber = yield* withWsRpcClient(approverWsUrl, (client) =>
+            client[WS_METHODS.subscribePreviewEvents]({}).pipe(Stream.runHead),
+          ).pipe(Effect.forkScoped);
+          yield* Deferred.await(subscriptionsReady);
+
+          const opened = yield* withWsRpcClient(makerWsUrl, (client) =>
+            client[WS_METHODS.previewOpen]({
+              threadId: conversationThreadId,
+              url: "http://127.0.0.1:4173",
+            }),
+          );
+          const forgedListInput = {
+            threadId: conversationThreadId,
+            subject: "local:root",
+            role: "root",
+            scopes: AuthQaRootScopes,
+          } as const;
+          const foreignList = yield* withWsRpcClient(approverWsUrl, (client) =>
+            client[WS_METHODS.previewList](forgedListInput),
+          ).pipe(Effect.result);
+          if (
+            foreignList._tag !== "Failure" ||
+            foreignList.failure._tag !== "EnvironmentAuthorizationError"
+          ) {
+            return assert.fail("Expected the foreign preview list to be denied.");
+          }
+
+          const forgedNavigateInput = {
+            threadId: conversationThreadId,
+            tabId: opened.tabId,
+            url: "http://127.0.0.1:5173/forged",
+            subject: "local:root",
+            role: "root",
+            scopes: AuthQaRootScopes,
+          } as const;
+          const foreignAction = yield* withWsRpcClient(approverWsUrl, (client) =>
+            client[WS_METHODS.previewNavigate](forgedNavigateInput),
+          ).pipe(Effect.result);
+          if (
+            foreignAction._tag !== "Failure" ||
+            foreignAction.failure._tag !== "EnvironmentAuthorizationError"
+          ) {
+            return assert.fail("Expected the foreign preview action to be denied.");
+          }
+
+          const ownerList = yield* withWsRpcClient(makerWsUrl, (client) =>
+            client[WS_METHODS.previewList]({ threadId: conversationThreadId }),
+          );
+          assert.deepEqual(
+            ownerList.sessions.map((session) => session.tabId),
+            [opened.tabId],
+          );
+
+          yield* Effect.forEach(Array.from({ length: 10 }), () => Effect.yieldNow, {
+            discard: true,
+          });
+          assert.isUndefined(foreignEventFiber.pollUnsafe());
+        }),
+      );
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 });

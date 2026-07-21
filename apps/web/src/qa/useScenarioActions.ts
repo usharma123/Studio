@@ -1,16 +1,17 @@
-import type { QaReleaseSnapshot, ScopedThreadRef } from "@t3tools/contracts";
+import type { QaReleaseSnapshot } from "@t3tools/contracts";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { qaEnvironment } from "./client";
+import { legacyQaThreadId, type QaReleaseRef } from "./releaseRef";
 import type { ScenarioRowView } from "./scenarioModel";
 interface UseScenarioActionsOptions {
-  readonly threadRef: ScopedThreadRef;
+  readonly releaseRef: QaReleaseRef;
   readonly snapshot: QaReleaseSnapshot | null;
   readonly setBusy: (busy: "scenario" | null) => void;
   readonly setError: (error: string | null) => void;
   readonly setLatestSnapshot: (snapshot: QaReleaseSnapshot) => void;
-  readonly onKickoffAgent: (snapshot: QaReleaseSnapshot) => Promise<void> | void;
 }
 export function useScenarioActions(options: UseScenarioActionsOptions) {
+  const threadId = legacyQaThreadId(options.releaseRef.releaseId);
   const updateScenario = useAtomCommand(qaEnvironment.updateScenario, {
     reportFailure: false,
   });
@@ -30,9 +31,9 @@ export function useScenarioActions(options: UseScenarioActionsOptions) {
       options.snapshot!.revision,
       async (scenario, expectedRevision) => {
         const result = await updateScenario({
-          environmentId: options.threadRef.environmentId,
+          environmentId: options.releaseRef.environmentId,
           input: {
-            threadId: options.threadRef.threadId,
+            threadId,
             planId: plan.id,
             scenarioId: scenario.id,
             expectedRevision,
@@ -65,9 +66,9 @@ export function useScenarioActions(options: UseScenarioActionsOptions) {
     if (!plan) return false;
     const next = await runScenarioMutation(options, () =>
       submitScenarioPlan({
-        environmentId: options.threadRef.environmentId,
+        environmentId: options.releaseRef.environmentId,
         input: {
-          threadId: options.threadRef.threadId,
+          threadId,
           planId: plan.id,
           expectedRevision: options.snapshot!.revision,
         },
@@ -84,9 +85,9 @@ export function useScenarioActions(options: UseScenarioActionsOptions) {
     if (!plan) return false;
     const next = await runScenarioMutation(options, () =>
       reviewScenarioPlan({
-        environmentId: options.threadRef.environmentId,
+        environmentId: options.releaseRef.environmentId,
         input: {
-          threadId: options.threadRef.threadId,
+          threadId,
           planId: plan.id,
           expectedRevision: options.snapshot!.revision,
           decision,
@@ -97,7 +98,6 @@ export function useScenarioActions(options: UseScenarioActionsOptions) {
         },
       }),
     );
-    if (next && decision === "approved") await options.onKickoffAgent(next);
     return next !== null;
   };
   return {

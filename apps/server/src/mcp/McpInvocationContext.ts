@@ -15,6 +15,8 @@ export interface McpInvocationScope {
   readonly providerSessionId: string;
   readonly providerInstanceId: ProviderInstanceId;
   readonly capabilities: ReadonlySet<McpCapability>;
+  readonly principalSubject: string;
+  readonly workspaceAdministrator: boolean;
   readonly qaReleaseThreadId?: ThreadId;
   readonly qaPrincipalSubject?: string;
   readonly issuedAt: number;

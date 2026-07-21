@@ -1,7 +1,9 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
+import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -33,6 +35,23 @@ const makeSessionStoreLayer = (
     Layer.provide(SqlitePersistenceMemory),
     Layer.provide(ServerSecretStore.layer),
     Layer.provide(makeServerConfigLayer(overrides)),
+  );
+
+const makeRecordingTestClockLayer = (sleepDurations: Array<number>) =>
+  Layer.effect(
+    Clock.Clock,
+    TestClock.make().pipe(
+      Effect.map(
+        (clock) =>
+          ({
+            ...clock,
+            sleep: (duration) =>
+              Effect.sync(() => {
+                sleepDurations.push(Duration.toMillis(duration));
+              }).pipe(Effect.andThen(clock.sleep(duration))),
+          }) satisfies TestClock.TestClock,
+      ),
+    ),
   );
 
 const repositoryFailure = new PersistenceSqlError({
@@ -173,6 +192,84 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
       }
     }).pipe(Effect.provide(Layer.merge(makeSessionStoreLayer(), TestClock.layer()))),
   );
+
+  it.effect("revalidates established websocket parent sessions after revocation", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue({
+        method: "bearer-access-token",
+        subject: "established-websocket",
+      });
+
+      yield* sessions.assertActive(issued.sessionId);
+      const invalidated = yield* sessions
+        .awaitInvalidation(issued.sessionId)
+        .pipe(Effect.forkChild);
+
+      expect(yield* sessions.revoke(issued.sessionId)).toBe(true);
+      yield* Fiber.join(invalidated);
+
+      const error = yield* Effect.flip(sessions.assertActive(issued.sessionId));
+      expect(error._tag).toBe("WebSocketSessionRevokedError");
+    }).pipe(Effect.provide(makeSessionStoreLayer())),
+  );
+
+  it.effect("expires established websocket sessions using the Effect clock", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue({
+        method: "bearer-access-token",
+        subject: "established-websocket-expiry",
+        ttl: Duration.seconds(1),
+      });
+      const invalidated = yield* sessions
+        .awaitInvalidation(issued.sessionId)
+        .pipe(Effect.forkChild);
+
+      yield* TestClock.adjust(Duration.seconds(2));
+      yield* Fiber.join(invalidated);
+
+      const error = yield* Effect.flip(sessions.assertActive(issued.sessionId));
+      expect(error._tag).toBe("WebSocketSessionExpiredError");
+    }).pipe(Effect.provide(Layer.merge(makeSessionStoreLayer(), TestClock.layer()))),
+  );
+
+  it.effect("chunks invalidation waits that exceed the live clock timer limit", () => {
+    const maxTimerMillis = 2 ** 31 - 1;
+    const sleepDurations: Array<number> = [];
+
+    return Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue({
+        method: "bearer-access-token",
+        subject: "long-lived-websocket-expiry",
+      });
+      const observedAt = yield* Clock.currentTimeMillis;
+      const remainingMillis = issued.expiresAt.epochMilliseconds - observedAt;
+      expect(remainingMillis).toBeGreaterThan(maxTimerMillis);
+
+      const invalidated = yield* sessions
+        .awaitInvalidation(issued.sessionId)
+        .pipe(Effect.forkChild);
+      yield* TestClock.adjust(Duration.zero);
+
+      expect(sleepDurations).toHaveLength(1);
+      expect(sleepDurations[0]).toBeLessThanOrEqual(maxTimerMillis);
+
+      yield* TestClock.adjust(Duration.millis(remainingMillis));
+      yield* Fiber.join(invalidated);
+
+      expect(sleepDurations.length).toBeGreaterThan(1);
+      expect(sleepDurations.every((duration) => duration <= maxTimerMillis)).toBe(true);
+
+      const error = yield* Effect.flip(sessions.assertActive(issued.sessionId));
+      expect(error._tag).toBe("WebSocketSessionExpiredError");
+    }).pipe(
+      Effect.provide(
+        Layer.merge(makeSessionStoreLayer(), makeRecordingTestClockLayer(sleepDurations)),
+      ),
+    );
+  });
 
   it.effect("includes expiry context when session and websocket tokens expire", () =>
     Effect.gen(function* () {

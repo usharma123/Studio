@@ -5,11 +5,11 @@ import * as NodeReadline from "node:readline";
 import type * as NodeStream from "node:stream";
 
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
-import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
-import { decodeJsonResult } from "@t3tools/shared/schemaJson";
+import type * as SchemaAST from "effect/SchemaAST";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 export class BootstrapFdStatError extends Schema.TaggedErrorClass<BootstrapFdStatError>()(
@@ -76,12 +76,14 @@ export const readBootstrapEnvelope = Effect.fn("readBootstrapEnvelope")(function
   fd: number,
   options?: {
     timeoutMs?: number;
+    parseOptions?: SchemaAST.ParseOptions;
   },
 ): Effect.fn.Return<Option.Option<A>, BootstrapError> {
   const fdReady = yield* isFdReady(fd);
   if (!fdReady) return Option.none();
 
   const stream = yield* makeBootstrapInputStream(fd);
+  const decodeEnvelope = Schema.decodeExit(Schema.fromJsonString(schema));
 
   const timeoutMs = options?.timeoutMs ?? 1000;
 
@@ -118,15 +120,15 @@ export const readBootstrapEnvelope = Effect.fn("readBootstrapEnvelope")(function
     };
 
     const handleLine = (line: string) => {
-      const parsed = decodeJsonResult(schema)(line);
-      if (Result.isSuccess(parsed)) {
-        resume(Effect.succeedSome(parsed.success));
+      const parsed = decodeEnvelope(line, options?.parseOptions);
+      if (Exit.isSuccess(parsed)) {
+        resume(Effect.succeedSome(parsed.value));
       } else {
         resume(
           Effect.fail(
             new BootstrapEnvelopeDecodeError({
               fd,
-              cause: parsed.failure,
+              cause: parsed.cause,
             }),
           ),
         );

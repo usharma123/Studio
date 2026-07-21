@@ -226,7 +226,12 @@ export const resolveServerConfig = (
     const bootstrapFd = Option.getOrUndefined(normalizedFlags.bootstrapFd) ?? env.bootstrapFd;
     const bootstrapEnvelope =
       bootstrapFd !== undefined
-        ? yield* readBootstrapEnvelope(DesktopBackendBootstrap, bootstrapFd)
+        ? yield* readBootstrapEnvelope(DesktopBackendBootstrap, bootstrapFd, {
+            parseOptions: {
+              errors: "all",
+              onExcessProperty: "error",
+            },
+          })
         : Option.none();
     const bootstrap = Option.getOrUndefined(bootstrapEnvelope);
 
@@ -289,8 +294,11 @@ export const resolveServerConfig = (
       ),
       () => mode === "desktop",
     );
-    const desktopBootstrapToken = bootstrap?.desktopBootstrapToken;
-    const desktopDevelopmentProfile = bootstrap?.developmentProfile;
+    const desktopBootstrapGrants = bootstrap?.version === 2 ? bootstrap.grants : undefined;
+    const desktopBootstrapToken =
+      bootstrap?.version === 2 ? undefined : bootstrap?.desktopBootstrapToken;
+    const desktopDevelopmentProfile =
+      bootstrap?.version === 2 ? undefined : bootstrap?.developmentProfile;
     const autoBootstrapProjectFromCwd = Option.getOrElse(
       resolveOptionPrecedence(
         Option.fromUndefinedOr(options?.forceAutoBootstrapProjectFromCwd),
@@ -364,6 +372,7 @@ export const resolveServerConfig = (
       startupPresentation,
       desktopBootstrapToken,
       desktopDevelopmentProfile,
+      ...(desktopBootstrapGrants === undefined ? {} : { desktopBootstrapGrants }),
       autoBootstrapProjectFromCwd,
       logWebSocketEvents,
       tailscaleServeEnabled,

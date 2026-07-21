@@ -4,12 +4,15 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   ApprovalRequestId,
+  AuthOrchestrationOperateScope,
   CodexSettings,
+  EnvironmentId,
   ProviderDriverKind,
   type OrchestrationEvent,
   type OrchestrationThread,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -78,6 +81,9 @@ import { VcsStatusBroadcaster } from "../src/vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../src/git/GitWorkflowService.ts";
 import * as VcsProcess from "../src/vcs/VcsProcess.ts";
 import * as AgentAwarenessRelay from "../src/relay/AgentAwarenessRelay.ts";
+import * as SessionStore from "../src/auth/SessionStore.ts";
+import * as ServerEnvironment from "../src/environment/ServerEnvironment.ts";
+import * as QaIam from "../src/qa/QaIam.ts";
 
 const decodeCodexSettings = Schema.decodeEffect(CodexSettings);
 
@@ -322,10 +328,39 @@ export const makeOrchestrationIntegrationHarness = (
       generateBranchName: () => Effect.succeed({ branch: "update" }),
       generateThreadTitle: () => Effect.succeed({ title: "New thread" }),
     } as unknown as TextGenerationShape);
+    const sessionStoreLayer = Layer.mock(SessionStore.SessionStore, {
+      cookieName: "t3-orchestration-engine-harness-session",
+      resolveActiveAuthorization: (sessionId) =>
+        Effect.succeed({
+          sessionId,
+          subject: "orchestration-engine-harness:test",
+          scopes: [AuthOrchestrationOperateScope],
+          expiresAt: DateTime.makeUnsafe("2099-01-01T00:00:00.000Z"),
+        }),
+    });
+    const serverEnvironmentLayer = Layer.succeed(
+      ServerEnvironment.ServerEnvironment,
+      ServerEnvironment.ServerEnvironment.of({
+        getEnvironmentId: Effect.succeed(EnvironmentId.make("orchestration-engine-harness")),
+        getDescriptor: Effect.die("unused"),
+      }),
+    );
+    const qaIamLayer = Layer.mock(QaIam.QaIam, {
+      resolveConversationContext: () =>
+        Effect.fail(
+          new QaIam.QaIamError({
+            code: "conversation_not_found",
+            message: "No QA conversation is bound to this test thread.",
+          }),
+        ),
+    });
     const providerCommandReactorLayer = ProviderCommandReactorLive.pipe(
       Layer.provideMerge(runtimeServicesLayer),
       Layer.provideMerge(gitWorkflowLayer),
       Layer.provideMerge(textGenerationLayer),
+      Layer.provideMerge(sessionStoreLayer),
+      Layer.provideMerge(serverEnvironmentLayer),
+      Layer.provideMerge(qaIamLayer),
       Layer.provideMerge(serverSettingsLayer),
     );
     const checkpointReactorLayer = CheckpointReactorLive.pipe(

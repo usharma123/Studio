@@ -70,6 +70,7 @@ const make = Effect.gen(function* () {
               Effect.flatMap((at) =>
                 eventBus.publish({
                   type: "updated",
+                  releaseId: snapshot.releaseId,
                   threadId,
                   revision: snapshot.revision,
                   reason: "review_recorded",

@@ -85,6 +85,7 @@ export interface DesktopBackendStartConfig {
   readonly bootstrap: DesktopBackendBootstrapValue;
   readonly bootstrapDelivery: DesktopBackendBootstrapDelivery;
   readonly httpBaseUrl: URL;
+  readonly expectedEnvironmentId?: string;
   readonly captureOutput: boolean;
   readonly preflightFailure: Option.Option<PreflightFailure>;
   // Present for a WSL run after the configured/default distro has been
@@ -186,6 +187,10 @@ export interface DesktopBackendInstance {
   readonly start: Effect.Effect<void>;
   readonly stop: (options?: { readonly timeout?: Duration.Duration }) => Effect.Effect<void>;
   readonly currentConfig: Effect.Effect<Option.Option<DesktopBackendStartConfig>>;
+  // Attached instances can pre-exchange their one client credential before
+  // signaling readiness. Managed instances leave this absent and use the
+  // existing DesktopLocalEnvironmentAuth exchange path.
+  readonly currentBearerToken?: Effect.Effect<Option.Option<string>>;
   readonly snapshot: Effect.Effect<DesktopBackendSnapshot>;
   // Polls desiredRunning + the instance's own ready flag until the
   // backend reports ready, or the timeout elapses. Returns true on
@@ -206,7 +211,7 @@ export interface BackendInstanceSpec {
   // configResolve can now fail with PlatformError because the
   // bootstrap-token closure inside DesktopBackendConfiguration uses
   // crypto.randomBytes (Effect 4 beta.73 migration).
-  readonly configResolve: Effect.Effect<DesktopBackendStartConfig, PlatformError.PlatformError>;
+  readonly configResolve: Effect.Effect<DesktopBackendStartConfig, Error>;
   // Receives the *resolved* httpBaseUrl of the run that just became
   // ready. The window service uses this to decide what URL to load
   // (the WSL backend reports its distro IP, the Windows backend reports

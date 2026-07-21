@@ -164,10 +164,10 @@ function EmptyTestCases() {
   return (
     <section className="rounded-xl border bg-card px-5 py-10 text-center shadow-sm">
       <ClipboardCheck className="mx-auto size-5 text-muted-foreground" />
-      <h3 className="mt-3 text-sm font-medium">Test case generation is coordinated from chat</h3>
+      <h3 className="mt-3 text-sm font-medium">Test cases not generated yet</h3>
       <p className="mx-auto mt-1 max-w-md text-xs leading-5 text-muted-foreground">
-        The release agent remains the main driver. Executable, traceable test cases appear here for
-        workbook review.
+        A maker can select Generate above. The release agent runs in the background and saves
+        traceable test cases here for review.
       </p>
     </section>
   );

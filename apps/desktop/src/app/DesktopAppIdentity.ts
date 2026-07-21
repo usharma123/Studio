@@ -91,6 +91,9 @@ export const make = Effect.gen(function* () {
   });
 
   const resolveUserDataPath = Effect.gen(function* () {
+    if (Option.isSome(environment.developmentUserDataPath)) {
+      return environment.developmentUserDataPath.value;
+    }
     if (Option.isSome(environment.developmentProfile)) {
       return environment.path.join(environment.appDataDirectory, environment.userDataDirName);
     }

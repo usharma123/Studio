@@ -491,7 +491,6 @@ export interface ChatComposerProps {
   scheduleComposerFocus: () => void;
   setThreadError: (threadId: ThreadId | null, error: string | null) => void;
   onExpandImage: (preview: ExpandedImagePreview) => void;
-  onQaDocumentFiles?: (files: readonly File[]) => Promise<void> | void;
   qaMode?: boolean;
 }
 // --------------------------------------------------------------------------
@@ -564,7 +563,6 @@ const useChatComposerContent = function useChatComposerContent(props: ChatCompos
     scheduleComposerFocus,
     setThreadError,
     onExpandImage,
-    onQaDocumentFiles,
   } = props;
   // ------------------------------------------------------------------
   // Store subscriptions (prompt / images / terminal contexts)
@@ -1589,13 +1587,9 @@ const useChatComposerContent = function useChatComposerContent(props: ChatCompos
     const files = Array.from(event.clipboardData.files);
     if (files.length === 0) return;
     const imageFiles = files.filter((file) => file.type.startsWith("image/"));
-    const qaDocumentFiles = onQaDocumentFiles
-      ? files.filter((file) => !file.type.startsWith("image/"))
-      : [];
-    if (imageFiles.length === 0 && qaDocumentFiles.length === 0) return;
+    if (imageFiles.length === 0) return;
     event.preventDefault();
     addComposerImages(imageFiles);
-    if (qaDocumentFiles.length > 0) void onQaDocumentFiles?.(qaDocumentFiles);
   };
   const onComposerDragEnter = (event: React.DragEvent<HTMLDivElement>) => {
     if (!event.dataTransfer.types.includes("Files")) return;
@@ -1626,11 +1620,7 @@ const useChatComposerContent = function useChatComposerContent(props: ChatCompos
     setIsDragOverComposer(false);
     const files = Array.from(event.dataTransfer.files);
     const imageFiles = files.filter((file) => file.type.startsWith("image/"));
-    const qaDocumentFiles = onQaDocumentFiles
-      ? files.filter((file) => !file.type.startsWith("image/"))
-      : [];
     addComposerImages(imageFiles);
-    if (qaDocumentFiles.length > 0) void onQaDocumentFiles?.(qaDocumentFiles);
     focusComposer();
   };
   const handleInterruptPrimaryAction = () => {

@@ -12,11 +12,20 @@ import { PersistenceSqlError } from "../persistence/Errors.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as PairingGrantStore from "./PairingGrantStore.ts";
 
+const ROOT_DESKTOP_CREDENTIAL = "1".repeat(48);
+const MAKER_DESKTOP_CREDENTIAL = "2".repeat(48);
+const APPROVER_DESKTOP_CREDENTIAL = "3".repeat(48);
+const DESKTOP_BOOTSTRAP_GRANTS = [
+  { profile: "root", credential: ROOT_DESKTOP_CREDENTIAL },
+  { profile: "qa:maker", credential: MAKER_DESKTOP_CREDENTIAL },
+  { profile: "qa:approver", credential: APPROVER_DESKTOP_CREDENTIAL },
+] as const;
+
 const makeServerConfigLayer = (
   overrides?: Partial<
     Pick<
       ServerConfig.ServerConfig["Service"],
-      "desktopBootstrapToken" | "desktopDevelopmentProfile"
+      "desktopBootstrapToken" | "desktopDevelopmentProfile" | "desktopBootstrapGrants"
     >
   >,
 ) =>
@@ -37,7 +46,7 @@ const makePairingGrantStoreLayer = (
   overrides?: Partial<
     Pick<
       ServerConfig.ServerConfig["Service"],
-      "desktopBootstrapToken" | "desktopDevelopmentProfile"
+      "desktopBootstrapToken" | "desktopDevelopmentProfile" | "desktopBootstrapGrants"
     >
   >,
 ) =>
@@ -177,6 +186,99 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
       Effect.provide(
         makePairingGrantStoreLayer({
           desktopBootstrapToken: "desktop-bootstrap-token",
+          desktopDevelopmentProfile: "root",
+        }),
+      ),
+    ),
+  );
+
+  it.effect("seeds canonical reusable grants for every v2 desktop profile", () =>
+    Effect.gen(function* () {
+      const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
+      const [root, maker, approver, makerAgain] = yield* Effect.all([
+        bootstrapCredentials.consume(ROOT_DESKTOP_CREDENTIAL),
+        bootstrapCredentials.consume(MAKER_DESKTOP_CREDENTIAL),
+        bootstrapCredentials.consume(APPROVER_DESKTOP_CREDENTIAL),
+        bootstrapCredentials.consume(MAKER_DESKTOP_CREDENTIAL),
+      ]);
+
+      expect(root).toMatchObject({
+        method: "desktop-bootstrap",
+        subject: "local:root",
+        scopes: [
+          "orchestration:read",
+          "orchestration:operate",
+          "terminal:operate",
+          "review:write",
+          "relay:read",
+          "access:read",
+          "access:write",
+          "relay:write",
+          "qa:read",
+          "qa:make",
+          "qa:approve",
+          "qa:chat",
+          "preview:operate",
+        ],
+      });
+      expect(maker).toMatchObject({
+        method: "desktop-bootstrap",
+        subject: "local:qa:maker",
+        scopes: ["qa:read", "qa:make", "qa:chat", "preview:operate"],
+      });
+      expect(approver).toMatchObject({
+        method: "desktop-bootstrap",
+        subject: "local:qa:approver",
+        scopes: ["qa:read", "qa:approve", "qa:chat", "preview:operate"],
+      });
+      expect(makerAgain.subject).toBe("local:qa:maker");
+    }).pipe(
+      Effect.provide(
+        makePairingGrantStoreLayer({ desktopBootstrapGrants: DESKTOP_BOOTSTRAP_GRANTS }),
+      ),
+    ),
+  );
+
+  it.effect("does not seed a legacy credential without an explicit profile", () =>
+    Effect.gen(function* () {
+      const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
+      const error = yield* Effect.flip(bootstrapCredentials.consume("legacy-with-missing-profile"));
+
+      expect(error._tag).toBe("UnknownBootstrapCredentialError");
+    }).pipe(
+      Effect.provide(
+        makePairingGrantStoreLayer({
+          desktopBootstrapToken: "legacy-with-missing-profile",
+          desktopDevelopmentProfile: undefined,
+        }),
+      ),
+    ),
+  );
+
+  it.effect("does not seed malformed v2 grants or downgrade to a legacy root token", () =>
+    Effect.gen(function* () {
+      const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
+      const results = yield* Effect.all(
+        [ROOT_DESKTOP_CREDENTIAL, MAKER_DESKTOP_CREDENTIAL, "legacy-root-token"].map((credential) =>
+          Effect.flip(bootstrapCredentials.consume(credential)),
+        ),
+      );
+
+      expect(results.map((error) => error._tag)).toEqual([
+        "UnknownBootstrapCredentialError",
+        "UnknownBootstrapCredentialError",
+        "UnknownBootstrapCredentialError",
+      ]);
+    }).pipe(
+      Effect.provide(
+        makePairingGrantStoreLayer({
+          desktopBootstrapGrants: [
+            { profile: "root", credential: ROOT_DESKTOP_CREDENTIAL },
+            { profile: "qa:maker", credential: MAKER_DESKTOP_CREDENTIAL },
+            { profile: "qa:maker", credential: APPROVER_DESKTOP_CREDENTIAL },
+          ],
+          desktopBootstrapToken: "legacy-root-token",
+          desktopDevelopmentProfile: "root",
         }),
       ),
     ),
@@ -202,6 +304,7 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
         Layer.merge(
           makePairingGrantStoreLayer({
             desktopBootstrapToken: "desktop-bootstrap-token",
+            desktopDevelopmentProfile: "root",
           }),
           TestClock.layer(),
         ),

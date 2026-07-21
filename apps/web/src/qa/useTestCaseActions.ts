@@ -1,15 +1,16 @@
-import type { QaReleaseSnapshot, QaTestCase, ScopedThreadRef } from "@t3tools/contracts";
+import type { QaReleaseSnapshot, QaTestCase } from "@t3tools/contracts";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { qaEnvironment } from "./client";
+import { legacyQaThreadId, type QaReleaseRef } from "./releaseRef";
 interface UseTestCaseActionsOptions {
-  readonly threadRef: ScopedThreadRef;
+  readonly releaseRef: QaReleaseRef;
   readonly snapshot: QaReleaseSnapshot | null;
   readonly setBusy: (busy: "test-case" | null) => void;
   readonly setError: (error: string | null) => void;
   readonly setLatestSnapshot: (snapshot: QaReleaseSnapshot) => void;
-  readonly onKickoffAgent: (snapshot: QaReleaseSnapshot) => Promise<void> | void;
 }
 export function useTestCaseActions(options: UseTestCaseActionsOptions) {
+  const threadId = legacyQaThreadId(options.releaseRef.releaseId);
   const updateTestCase = useAtomCommand(qaEnvironment.updateTestCase, {
     reportFailure: false,
   });
@@ -29,9 +30,9 @@ export function useTestCaseActions(options: UseTestCaseActionsOptions) {
       plan.revision,
       async (testCase, expectedRevision) => {
         const result = await updateTestCase({
-          environmentId: options.threadRef.environmentId,
+          environmentId: options.releaseRef.environmentId,
           input: {
-            threadId: options.threadRef.threadId,
+            threadId,
             planId: plan.id,
             testCaseId: testCase.id,
             expectedRevision,
@@ -66,9 +67,9 @@ export function useTestCaseActions(options: UseTestCaseActionsOptions) {
     if (!plan) return false;
     const next = await runTestCaseMutation(options, () =>
       submitTestCasePlan({
-        environmentId: options.threadRef.environmentId,
+        environmentId: options.releaseRef.environmentId,
         input: {
-          threadId: options.threadRef.threadId,
+          threadId,
           planId: plan.id,
           expectedRevision: plan.revision,
         },
@@ -81,9 +82,9 @@ export function useTestCaseActions(options: UseTestCaseActionsOptions) {
     if (!plan) return false;
     const next = await runTestCaseMutation(options, () =>
       reviewTestCasePlan({
-        environmentId: options.threadRef.environmentId,
+        environmentId: options.releaseRef.environmentId,
         input: {
-          threadId: options.threadRef.threadId,
+          threadId,
           planId: plan.id,
           expectedRevision: plan.revision,
           decision,
@@ -95,7 +96,6 @@ export function useTestCaseActions(options: UseTestCaseActionsOptions) {
         },
       }),
     );
-    if (next && decision === "approved") await options.onKickoffAgent(next);
     return next !== null;
   };
   return {

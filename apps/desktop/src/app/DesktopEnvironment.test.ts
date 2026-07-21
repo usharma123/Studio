@@ -108,6 +108,121 @@ describe("DesktopEnvironment", () => {
     }),
   );
 
+  it.effect("uses an explicit backend entry only in desktop development", () =>
+    Effect.gen(function* () {
+      const development = yield* makeEnvironment(
+        {},
+        {
+          VITE_DEV_SERVER_URL: "http://localhost:5173",
+          T3CODE_DESKTOP_BACKEND_ENTRY_PATH: " /repo/apps/server/dist-desktop-root/bin.mjs ",
+        },
+      );
+      const production = yield* makeEnvironment(
+        {},
+        {
+          T3CODE_DESKTOP_BACKEND_ENTRY_PATH: "/tmp/untrusted/bin.mjs",
+        },
+      );
+
+      assert.equal(development.backendEntryPath, "/repo/apps/server/dist-desktop-root/bin.mjs");
+      assert.equal(production.backendEntryPath, "/repo/apps/server/dist/bin.mjs");
+    }),
+  );
+
+  it.effect("accepts only an absolute development user-data override", () =>
+    Effect.gen(function* () {
+      const environment = yield* makeEnvironment(
+        {},
+        {
+          VITE_DEV_SERVER_URL: "http://127.0.0.1:5733",
+          T3CODE_DEV_PROFILE: "root",
+          T3CODE_DESKTOP_USER_DATA_PATH: "/tmp/shared-clients/root/user-data",
+        },
+      );
+      const invalid = yield* makeEnvironment(
+        {},
+        {
+          VITE_DEV_SERVER_URL: "http://127.0.0.1:5733",
+          T3CODE_DEV_PROFILE: "root",
+          T3CODE_DESKTOP_USER_DATA_PATH: "relative/user-data",
+        },
+      ).pipe(Effect.flip);
+
+      assert.deepEqual(
+        environment.developmentUserDataPath,
+        Option.some("/tmp/shared-clients/root/user-data"),
+      );
+      assert.include(String(invalid), "T3CODE_DESKTOP_USER_DATA_PATH must be an absolute path");
+    }),
+  );
+
+  it.effect("accepts a complete loopback attached backend without sharing its backend home", () =>
+    Effect.gen(function* () {
+      const environment = yield* makeEnvironment(
+        {},
+        {
+          VITE_DEV_SERVER_URL: "http://127.0.0.1:5733",
+          T3CODE_HOME: "/tmp/shared-client-maker",
+          T3CODE_DEV_PROFILE: "qa:maker",
+          T3CODE_DESKTOP_ATTACHED_BACKEND_URL: "http://127.0.0.1:13773",
+          T3CODE_DESKTOP_ATTACHED_ENVIRONMENT_ID: "environment-shared",
+          T3CODE_DESKTOP_ATTACHED_CREDENTIAL: "a".repeat(48),
+        },
+      );
+
+      assert.equal(environment.baseDir, "/tmp/shared-client-maker");
+      assert.deepEqual(
+        Option.map(environment.attachedBackend, (attached) => ({
+          ...attached,
+          httpBaseUrl: attached.httpBaseUrl.href,
+        })),
+        Option.some({
+          httpBaseUrl: "http://127.0.0.1:13773/",
+          expectedEnvironmentId: "environment-shared",
+          credential: "a".repeat(48),
+          profile: "qa:maker",
+        }),
+      );
+    }),
+  );
+
+  it.effect("fails closed for partial or malformed attached backend configuration", () =>
+    Effect.gen(function* () {
+      const partial = yield* makeEnvironment(
+        {},
+        {
+          VITE_DEV_SERVER_URL: "http://127.0.0.1:5733",
+          T3CODE_DEV_PROFILE: "root",
+          T3CODE_DESKTOP_ATTACHED_BACKEND_URL: "http://127.0.0.1:13773",
+        },
+      ).pipe(Effect.flip);
+      const nonLoopback = yield* makeEnvironment(
+        {},
+        {
+          VITE_DEV_SERVER_URL: "http://127.0.0.1:5733",
+          T3CODE_DEV_PROFILE: "root",
+          T3CODE_DESKTOP_ATTACHED_BACKEND_URL: "https://qa.example.com",
+          T3CODE_DESKTOP_ATTACHED_ENVIRONMENT_ID: "environment-shared",
+          T3CODE_DESKTOP_ATTACHED_CREDENTIAL: "a".repeat(48),
+        },
+      ).pipe(Effect.flip);
+      const malformedCredential = yield* makeEnvironment(
+        {},
+        {
+          VITE_DEV_SERVER_URL: "http://127.0.0.1:5733",
+          T3CODE_DEV_PROFILE: "root",
+          T3CODE_DESKTOP_ATTACHED_BACKEND_URL: "http://127.0.0.1:13773",
+          T3CODE_DESKTOP_ATTACHED_ENVIRONMENT_ID: "environment-shared",
+          T3CODE_DESKTOP_ATTACHED_CREDENTIAL: "NOT-A-GRANT",
+        },
+      ).pipe(Effect.flip);
+
+      assert.include(String(partial), "requires URL, environment ID, credential, and profile");
+      assert.include(String(nonLoopback), "loopback HTTP URL");
+      assert.include(String(malformedCredential), "48 lowercase hexadecimal");
+    }),
+  );
+
   it.effect("isolates the default backend state from upstream T3 Code", () =>
     Effect.gen(function* () {
       const environment = yield* makeEnvironment();

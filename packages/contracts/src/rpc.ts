@@ -148,6 +148,7 @@ import {
   QaAddStrategyCommentInput,
   QaAssignedReleaseDashboard,
   QaCreateProjectInput,
+  QaEnsureReleaseConversationInput,
   QaGenerateStrategyInput,
   QaGetReleaseAccessInput,
   QaGetScenarioPlanInput,
@@ -163,6 +164,7 @@ import {
   QaOperationError,
   QaReleaseSnapshot,
   QaReleaseAccess,
+  QaReleaseConversation,
   QaReleaseStreamEvent,
   QaReplyReviewCommentInput,
   QaReplyStrategyCommentInput,
@@ -188,6 +190,8 @@ import {
   QaScriptPlanApprovalResult,
   QaScriptPlanMutationResult,
   QaStartIngestionInput,
+  QaStartStageGenerationInput,
+  QaStageGenerationReceipt,
   QaStrategyApprovalResult,
   QaStrategyDocument,
   QaStrategyMutationResult,
@@ -287,9 +291,12 @@ export const WS_METHODS = {
 
   // Enterprise QA workflow methods
   qaListAssignedReleases: "qa.listAssignedReleases",
+  qaSubscribeAssignedReleases: "qa.subscribeAssignedReleases",
   qaGetReleaseAccess: "qa.getReleaseAccess",
   qaGetSnapshot: "qa.getSnapshot",
   qaCreateProject: "qa.createProject",
+  qaEnsureReleaseConversation: "qa.ensureReleaseConversation",
+  qaStartStageGeneration: "qa.startStageGeneration",
   qaInitializeRelease: "qa.initializeRelease",
   qaUploadDocument: "qa.uploadDocument",
   qaStartIngestion: "qa.startIngestion",
@@ -342,6 +349,13 @@ export const WsQaListAssignedReleasesRpc = Rpc.make(WS_METHODS.qaListAssignedRel
   error: Schema.Union([QaOperationError, EnvironmentAuthorizationError]),
 });
 
+export const WsQaSubscribeAssignedReleasesRpc = Rpc.make(WS_METHODS.qaSubscribeAssignedReleases, {
+  payload: QaListAssignedReleasesInput,
+  success: QaAssignedReleaseDashboard,
+  error: Schema.Union([QaOperationError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+
 export const WsQaGetReleaseAccessRpc = Rpc.make(WS_METHODS.qaGetReleaseAccess, {
   payload: QaGetReleaseAccessInput,
   success: QaReleaseAccess,
@@ -357,6 +371,18 @@ export const WsQaGetSnapshotRpc = Rpc.make(WS_METHODS.qaGetSnapshot, {
 export const WsQaCreateProjectRpc = Rpc.make(WS_METHODS.qaCreateProject, {
   payload: QaCreateProjectInput,
   success: QaReleaseSnapshot,
+  error: Schema.Union([QaOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsQaEnsureReleaseConversationRpc = Rpc.make(WS_METHODS.qaEnsureReleaseConversation, {
+  payload: QaEnsureReleaseConversationInput,
+  success: QaReleaseConversation,
+  error: Schema.Union([QaOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsQaStartStageGenerationRpc = Rpc.make(WS_METHODS.qaStartStageGeneration, {
+  payload: QaStartStageGenerationInput,
+  success: QaStageGenerationReceipt,
   error: Schema.Union([QaOperationError, EnvironmentAuthorizationError]),
 });
 
@@ -1014,9 +1040,12 @@ export const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess,
 
 export const WsRpcGroup = RpcGroup.make(
   WsQaListAssignedReleasesRpc,
+  WsQaSubscribeAssignedReleasesRpc,
   WsQaGetReleaseAccessRpc,
   WsQaGetSnapshotRpc,
   WsQaCreateProjectRpc,
+  WsQaEnsureReleaseConversationRpc,
+  WsQaStartStageGenerationRpc,
   WsQaInitializeReleaseRpc,
   WsQaUploadDocumentRpc,
   WsQaStartIngestionRpc,

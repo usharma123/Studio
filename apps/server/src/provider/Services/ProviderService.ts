@@ -12,6 +12,7 @@
  * @module ProviderService
  */
 import type {
+  AuthSessionId,
   ProviderInterruptTurnInput,
   ProviderInstanceId,
   ProviderRespondToRequestInput,
@@ -32,6 +33,10 @@ import type { ProviderServiceError } from "../Errors.ts";
 import type { ProviderAdapterCapabilities } from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
 
+export interface ProviderSessionAuthorization {
+  readonly initiatingSessionId: AuthSessionId;
+}
+
 /**
  * ProviderServiceShape - Service API for provider session and turn orchestration.
  */
@@ -42,6 +47,7 @@ export interface ProviderServiceShape {
   readonly startSession: (
     threadId: ThreadId,
     input: ProviderSessionStartInput,
+    authorization?: ProviderSessionAuthorization,
   ) => Effect.Effect<ProviderSession, ProviderServiceError>;
 
   /**
@@ -49,6 +55,7 @@ export interface ProviderServiceShape {
    */
   readonly sendTurn: (
     input: ProviderSendTurnInput,
+    authorization?: ProviderSessionAuthorization,
   ) => Effect.Effect<ProviderTurnStartResult, ProviderServiceError>;
 
   /**

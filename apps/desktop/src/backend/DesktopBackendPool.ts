@@ -94,6 +94,7 @@ import { HttpClient } from "effect/unstable/http";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import * as DesktopBackendConfiguration from "./DesktopBackendConfiguration.ts";
+import * as DesktopAttachedBackend from "./DesktopAttachedBackend.ts";
 import * as DesktopBackendManager from "./DesktopBackendManager.ts";
 import * as DesktopObservability from "../app/DesktopObservability.ts";
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
@@ -273,7 +274,7 @@ export const layer = Layer.effect(
       },
     );
 
-    const primary = yield* DesktopBackendManager.makeBackendInstance({
+    const primarySpec = {
       id: DesktopBackendManager.PRIMARY_INSTANCE_ID,
       // Keep this lazy. The pool layer is initialized before startup loads
       // persisted desktop settings, so resolving the primary label here would
@@ -297,6 +298,14 @@ export const layer = Layer.effect(
         ),
       onShutdown: () => desktopWindow.handleBackendNotReady,
       onPreflightFailed: handlePrimaryPreflightFailure,
+    } satisfies DesktopBackendManager.BackendInstanceSpec;
+    const primary = yield* Option.match(configuration.attachedBackend ?? Option.none(), {
+      onNone: () => DesktopBackendManager.makeBackendInstance(primarySpec),
+      onSome: (attached) =>
+        DesktopAttachedBackend.makeAttachedBackendInstance({
+          ...primarySpec,
+          expectedEnvironmentId: attached.expectedEnvironmentId,
+        }),
     });
 
     const instancesRef = yield* SynchronizedRef.make<

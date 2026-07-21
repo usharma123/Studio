@@ -54,7 +54,6 @@ interface RightPanelTabsProps {
   onAddTerminal: () => void;
   onAddDiff: () => void;
   onAddFiles: () => void;
-  onAddQa: () => void;
   browserAvailable: boolean;
   diffAvailable: boolean;
   filesAvailable: boolean;
@@ -98,21 +97,12 @@ function RightPanelEmptyState(props: {
   onAddTerminal: () => void;
   onAddDiff: () => void;
   onAddFiles: () => void;
-  onAddQa: () => void;
   browserAvailable: boolean;
   diffAvailable: boolean;
   filesAvailable: boolean;
   qaMode?: boolean;
 }) {
   const actions = [
-    {
-      label: "QA dashboard",
-      description: "Track release workflow and approval gates.",
-      icon: ShieldCheck,
-      available: true,
-      disabledReason: null,
-      onClick: props.onAddQa,
-    },
     {
       label: props.qaMode ? "Test application" : "Browser",
       description: props.qaMode
@@ -147,9 +137,7 @@ function RightPanelEmptyState(props: {
       disabledReason: SURFACE_DISABLED_REASONS.diff,
       onClick: props.onAddDiff,
     },
-  ].filter((action) =>
-    props.qaMode ? action.label === "QA dashboard" || action.label === "Test application" : true,
-  );
+  ].filter((action) => (props.qaMode ? action.label === "Test application" : true));
   return (
     <div className="flex min-h-0 flex-1 items-center justify-center p-6">
       <div className="w-full max-w-xl">
@@ -461,10 +449,6 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                   <Plus className="size-4" />
                 </MenuTrigger>
                 <MenuPopup align="start" side="bottom" sideOffset={6} className="min-w-44">
-                  <SurfaceMenuItem available onClick={props.onAddQa}>
-                    <ShieldCheck />
-                    QA dashboard
-                  </SurfaceMenuItem>
                   <SurfaceMenuItem
                     available={props.browserAvailable}
                     disabledReason={SURFACE_DISABLED_REASONS.browser}
@@ -511,7 +495,6 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             onAddTerminal={props.onAddTerminal}
             onAddDiff={props.onAddDiff}
             onAddFiles={props.onAddFiles}
-            onAddQa={props.onAddQa}
             browserAvailable={props.browserAvailable}
             diffAvailable={props.diffAvailable}
             filesAvailable={props.filesAvailable}

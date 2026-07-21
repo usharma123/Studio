@@ -1,5 +1,8 @@
 import {
+  AuthOrchestrationOperateScope,
+  AuthQaChatScope,
   type ChatAttachment,
+  type AuthSessionId,
   CommandId,
   EventId,
   type ModelSelection,
@@ -32,6 +35,7 @@ import type { ProviderServiceError } from "../../provider/Errors.ts";
 import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import {
@@ -41,6 +45,9 @@ import {
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
+import * as SessionStore from "../../auth/SessionStore.ts";
+import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
+import * as QaIam from "../../qa/QaIam.ts";
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
 
@@ -196,6 +203,10 @@ const make = Effect.gen(function* () {
   const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
   const textGeneration = yield* TextGeneration;
   const serverSettingsService = yield* ServerSettingsService;
+  const sessionStore = yield* SessionStore.SessionStore;
+  const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
+  const qaIam = yield* QaIam.QaIam;
+  const environmentId = yield* serverEnvironment.getEnvironmentId;
   const serverCommandId = (tag: string) =>
     crypto.randomUUIDv4.pipe(Effect.map((uuid) => CommandId.make(`server:${tag}:${uuid}`)));
   const serverEventId = () => crypto.randomUUIDv4.pipe(Effect.map(EventId.make));
@@ -354,6 +365,7 @@ const make = Effect.gen(function* () {
     createdAt: string,
     options?: {
       readonly modelSelection?: ModelSelection;
+      readonly initiatingSessionId?: AuthSessionId;
     },
   ) {
     const thread = yield* resolveThread(threadId);
@@ -475,14 +487,30 @@ const make = Effect.gen(function* () {
       readonly resumeCursor?: unknown;
       readonly provider?: ProviderDriverKind;
     }) =>
-      providerService.startSession(threadId, {
-        threadId,
-        ...(preferredProvider ? { provider: preferredProvider } : {}),
-        providerInstanceId: desiredInstanceId,
-        ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
-        modelSelection: desiredModelSelection,
-        ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
-        runtimeMode: desiredRuntimeMode,
+      Effect.gen(function* () {
+        const initiatingSessionId =
+          options?.initiatingSessionId ??
+          McpProviderSession.readMcpProviderSession(threadId)?.initiatingSessionId;
+        if (initiatingSessionId === undefined) {
+          return yield* new ProviderAdapterRequestError({
+            provider: preferredProvider,
+            method: "thread.turn.start",
+            detail: `Thread '${threadId}' cannot start a provider session without authenticated session provenance.`,
+          });
+        }
+        return yield* providerService.startSession(
+          threadId,
+          {
+            threadId,
+            ...(preferredProvider ? { provider: preferredProvider } : {}),
+            providerInstanceId: desiredInstanceId,
+            ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
+            modelSelection: desiredModelSelection,
+            ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
+            runtimeMode: desiredRuntimeMode,
+          },
+          { initiatingSessionId },
+        );
       });
 
     const bindSessionToThread = (session: ProviderSession) =>
@@ -589,6 +617,7 @@ const make = Effect.gen(function* () {
     readonly attachments?: ReadonlyArray<ChatAttachment>;
     readonly modelSelection?: ModelSelection;
     readonly interactionMode?: "default" | "plan";
+    readonly initiatingSessionId: AuthSessionId;
     readonly createdAt: string;
   }) {
     const thread = yield* resolveThread(input.threadId);
@@ -597,11 +626,10 @@ const make = Effect.gen(function* () {
         new Error(`Thread '${input.threadId}' was not found in read model.`),
       );
     }
-    yield* ensureSessionForThread(
-      input.threadId,
-      input.createdAt,
-      input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {},
-    );
+    yield* ensureSessionForThread(input.threadId, input.createdAt, {
+      ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+      initiatingSessionId: input.initiatingSessionId,
+    });
     if (input.modelSelection !== undefined) {
       threadModelSelections.set(input.threadId, input.modelSelection);
     }
@@ -744,6 +772,53 @@ const make = Effect.gen(function* () {
     },
   );
 
+  const authorizeThreadForProviderWork = Effect.fn("authorizeThreadForProviderWork")(
+    function* (input: {
+      readonly threadId: ThreadId;
+      readonly initiatingSessionId: AuthSessionId;
+      readonly subject: string;
+      readonly scopes: ReadonlyArray<string>;
+      readonly provider: string;
+    }) {
+      const qaContext = yield* qaIam
+        .resolveConversationContext({
+          conversationThreadId: input.threadId,
+          environmentId,
+        })
+        .pipe(
+          Effect.map(Option.some),
+          Effect.catch((cause) =>
+            cause.code === "conversation_not_found"
+              ? Effect.succeed(Option.none())
+              : Effect.fail(cause),
+          ),
+        );
+      if (Option.isNone(qaContext)) {
+        if (input.scopes.includes(AuthOrchestrationOperateScope)) {
+          return;
+        }
+        return yield* new ProviderAdapterRequestError({
+          provider: providerErrorLabel(input.provider),
+          method: "thread.turn.start",
+          detail: `Authenticated session '${input.initiatingSessionId}' lacks orchestration:operate for this workspace thread.`,
+        });
+      }
+      if (!input.scopes.includes(AuthQaChatScope)) {
+        return yield* new ProviderAdapterRequestError({
+          provider: providerErrorLabel(input.provider),
+          method: "thread.turn.start",
+          detail: `Authenticated session '${input.initiatingSessionId}' lacks qa:chat for this QA conversation.`,
+        });
+      }
+      yield* qaIam.authorizeConversation({
+        subject: input.subject,
+        conversationThreadId: input.threadId,
+        environmentId,
+        capability: "qa:chat",
+      });
+    },
+  );
+
   const processTurnStartRequested = Effect.fn("processTurnStartRequested")(function* (
     event: Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>,
   ) {
@@ -768,37 +843,6 @@ const make = Effect.gen(function* () {
         createdAt: event.payload.createdAt,
       });
       return;
-    }
-
-    const isFirstUserMessageTurn =
-      thread.messages.filter((entry) => entry.role === "user").length === 1;
-    if (isFirstUserMessageTurn) {
-      const project = yield* resolveProject(thread.projectId);
-      const generationCwd =
-        resolveThreadWorkspaceCwd({
-          thread,
-          projects: project ? [project] : [],
-        }) ?? process.cwd();
-      const generationInput = {
-        messageText: message.text,
-        ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
-        ...(event.payload.titleSeed !== undefined ? { titleSeed: event.payload.titleSeed } : {}),
-      };
-
-      yield* maybeGenerateAndRenameWorktreeBranchForFirstTurn({
-        threadId: event.payload.threadId,
-        branch: thread.branch,
-        worktreePath: thread.worktreePath,
-        ...generationInput,
-      }).pipe(Effect.forkScoped);
-
-      if (canReplaceThreadTitle(thread.title, event.payload.titleSeed)) {
-        yield* maybeGenerateThreadTitleForFirstTurn({
-          threadId: event.payload.threadId,
-          cwd: generationCwd,
-          ...generationInput,
-        }).pipe(Effect.forkScoped);
-      }
     }
 
     const handleTurnStartFailure = (cause: Cause.Cause<unknown>) => {
@@ -837,6 +881,78 @@ const make = Effect.gen(function* () {
         ),
       );
 
+    const persistedInitiatingSessionId = event.payload.initiatingSessionId;
+    if (persistedInitiatingSessionId === undefined) {
+      yield* handleTurnStartFailure(
+        Cause.fail(
+          new ProviderAdapterRequestError({
+            provider: providerErrorLabel(String(event.payload.modelSelection?.instanceId ?? "")),
+            method: "thread.turn.start",
+            detail: `Turn '${event.eventId}' is missing authenticated session provenance.`,
+          }),
+        ),
+      );
+      return;
+    }
+
+    const activeAuthorization = yield* sessionStore
+      .resolveActiveAuthorization(persistedInitiatingSessionId)
+      .pipe(
+        Effect.map(Option.some),
+        Effect.catchCause((cause) => handleTurnStartFailure(cause).pipe(Effect.as(Option.none()))),
+      );
+    if (Option.isNone(activeAuthorization)) {
+      return;
+    }
+    const initiatingSessionId = activeAuthorization.value.sessionId;
+
+    const threadAuthorizationIsCurrent = yield* authorizeThreadForProviderWork({
+      threadId: event.payload.threadId,
+      initiatingSessionId,
+      subject: activeAuthorization.value.subject,
+      scopes: activeAuthorization.value.scopes,
+      provider: String(
+        event.payload.modelSelection?.instanceId ?? thread.modelSelection.instanceId,
+      ),
+    }).pipe(
+      Effect.as(true),
+      Effect.catchCause((cause) => handleTurnStartFailure(cause).pipe(Effect.as(false))),
+    );
+    if (!threadAuthorizationIsCurrent) {
+      return;
+    }
+
+    const isFirstUserMessageTurn =
+      thread.messages.filter((entry) => entry.role === "user").length === 1;
+    if (isFirstUserMessageTurn) {
+      const project = yield* resolveProject(thread.projectId);
+      const generationCwd =
+        resolveThreadWorkspaceCwd({
+          thread,
+          projects: project ? [project] : [],
+        }) ?? process.cwd();
+      const generationInput = {
+        messageText: message.text,
+        ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
+        ...(event.payload.titleSeed !== undefined ? { titleSeed: event.payload.titleSeed } : {}),
+      };
+
+      yield* maybeGenerateAndRenameWorktreeBranchForFirstTurn({
+        threadId: event.payload.threadId,
+        branch: thread.branch,
+        worktreePath: thread.worktreePath,
+        ...generationInput,
+      }).pipe(Effect.forkScoped);
+
+      if (canReplaceThreadTitle(thread.title, event.payload.titleSeed)) {
+        yield* maybeGenerateThreadTitleForFirstTurn({
+          threadId: event.payload.threadId,
+          cwd: generationCwd,
+          ...generationInput,
+        }).pipe(Effect.forkScoped);
+      }
+    }
+
     const sendTurnRequest = yield* buildSendTurnRequestForThread({
       threadId: event.payload.threadId,
       messageText: message.text,
@@ -845,6 +961,7 @@ const make = Effect.gen(function* () {
         ? { modelSelection: event.payload.modelSelection }
         : {}),
       interactionMode: event.payload.interactionMode,
+      initiatingSessionId,
       createdAt: event.payload.createdAt,
     }).pipe(
       Effect.map(Option.some),
@@ -856,7 +973,9 @@ const make = Effect.gen(function* () {
     }
 
     yield* providerService
-      .sendTurn(sendTurnRequest.value)
+      .sendTurn(sendTurnRequest.value, {
+        initiatingSessionId,
+      })
       .pipe(Effect.catchCause(recoverTurnStartFailure), Effect.forkScoped);
   });
 

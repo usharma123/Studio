@@ -55,14 +55,16 @@ const make = Effect.gen(function* () {
           ELSE NULL
         END AS "activeReviewStatus",
         assignments.role,
+        -- PostgreSQL COUNT returns int8, which node-postgres preserves as a string.
+        -- These dashboard counts are contractually bounded JavaScript integers.
         (
-          SELECT COUNT(*) FROM qa_review_threads review_threads
+          SELECT CAST(COUNT(*) AS INTEGER) FROM qa_review_threads review_threads
           WHERE review_threads.thread_id = releases.thread_id
             AND review_threads.severity = 'blocking'
             AND review_threads.current_status = 'open'
         ) AS "unresolvedBlockingCommentCount",
         (
-          SELECT COUNT(*) FROM qa_review_events review_events
+          SELECT CAST(COUNT(*) AS INTEGER) FROM qa_review_events review_events
           WHERE review_events.thread_id = releases.thread_id
             AND review_events.event_kind IN ('comment', 'reply', 'correction')
             AND review_events.actor_id <> principals.id
@@ -124,6 +126,7 @@ const make = Effect.gen(function* () {
                 ? "ready_for_review"
                 : "active";
         return {
+          releaseId: row.threadId,
           threadId: row.threadId,
           projectId: row.projectId,
           projectTitle: row.projectTitle,

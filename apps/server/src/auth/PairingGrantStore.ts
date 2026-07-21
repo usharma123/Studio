@@ -3,8 +3,11 @@ import {
   AuthQaMakerScopes,
   AuthQaRootScopes,
   AuthStandardClientScopes,
+  DesktopBootstrapGrants as DesktopBootstrapGrantsSchema,
+  DesktopDevelopmentProfile as DesktopDevelopmentProfileSchema,
   type AuthEnvironmentScope,
   type AuthPairingLink,
+  type DesktopDevelopmentProfile,
   type ServerAuthBootstrapMethod,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -250,19 +253,18 @@ const PAIRING_TOKEN_LENGTH = 12;
 const PAIRING_TOKEN_REJECTION_LIMIT =
   Math.floor(256 / PAIRING_TOKEN_ALPHABET.length) * PAIRING_TOKEN_ALPHABET.length;
 
+const TRUSTED_DESKTOP_GRANTS = {
+  root: { scopes: AuthQaRootScopes, subject: "local:root" },
+  "qa:maker": { scopes: AuthQaMakerScopes, subject: "local:qa:maker" },
+  "qa:approver": { scopes: AuthQaApproverScopes, subject: "local:qa:approver" },
+} as const satisfies Record<DesktopDevelopmentProfile, Pick<BootstrapGrant, "scopes" | "subject">>;
+
 const trustedDesktopGrant = (
-  profile: ServerConfig.ServerConfig["Service"]["desktopDevelopmentProfile"],
-): Pick<BootstrapGrant, "scopes" | "subject"> => {
-  switch (profile) {
-    case "qa:maker":
-      return { scopes: AuthQaMakerScopes, subject: "local:qa:maker" };
-    case "qa:approver":
-      return { scopes: AuthQaApproverScopes, subject: "local:qa:approver" };
-    case "root":
-    case undefined:
-      return { scopes: AuthQaRootScopes, subject: "local:root" };
-  }
-};
+  profile: DesktopDevelopmentProfile,
+): Pick<BootstrapGrant, "scopes" | "subject"> => TRUSTED_DESKTOP_GRANTS[profile];
+
+const isDesktopBootstrapGrants = Schema.is(DesktopBootstrapGrantsSchema);
+const isDesktopDevelopmentProfile = Schema.is(DesktopDevelopmentProfileSchema);
 
 export const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
@@ -313,23 +315,53 @@ export const make = Effect.gen(function* () {
       id,
     }).pipe(Effect.asVoid);
 
-  if (config.desktopBootstrapToken) {
-    const now = yield* DateTime.now;
-    const trustedGrant = trustedDesktopGrant(config.desktopDevelopmentProfile);
-    yield* seedGrant(config.desktopBootstrapToken, {
+  const seedTrustedDesktopGrant = (
+    credential: string,
+    profile: DesktopDevelopmentProfile,
+    now: DateTime.DateTime,
+  ) => {
+    const trustedGrant = trustedDesktopGrant(profile);
+    return seedGrant(credential, {
       method: "desktop-bootstrap",
       scopes: trustedGrant.scopes,
       subject: trustedGrant.subject,
       expiresAt: DateTime.add(now, {
         milliseconds: Duration.toMillis(DESKTOP_BOOTSTRAP_TTL_HOURS),
       }),
-      // Unbounded uses so the renderer can re-exchange the seed for a
-      // fresh bearer session after a page reload (or after the prior
-      // bearer expires). The seed itself stays inside the desktop
-      // process and the rendered page, both of which the user already
-      // implicitly trusts.
+      // Desktop bootstrap grants are reusable so their owning renderer can
+      // recover after a reload or renew an expired bearer session.
       remainingUses: "unbounded",
     });
+  };
+
+  if (config.desktopBootstrapGrants !== undefined) {
+    if (isDesktopBootstrapGrants(config.desktopBootstrapGrants)) {
+      const now = yield* DateTime.now;
+      yield* Effect.forEach(
+        config.desktopBootstrapGrants,
+        (grant) => seedTrustedDesktopGrant(grant.credential, grant.profile, now),
+        { discard: true },
+      );
+    } else {
+      // ServerConfig is normally produced by the strict bootstrap codec. Keep
+      // the store fail-closed if a test layer or future internal caller bypasses
+      // that boundary with malformed or duplicate grants.
+      yield* Effect.logError("Rejected invalid desktop multi-grant bootstrap configuration.");
+    }
+  } else if (
+    config.desktopBootstrapToken &&
+    isDesktopDevelopmentProfile(config.desktopDevelopmentProfile)
+  ) {
+    const now = yield* DateTime.now;
+    yield* seedTrustedDesktopGrant(
+      config.desktopBootstrapToken,
+      config.desktopDevelopmentProfile,
+      now,
+    );
+  } else if (config.desktopBootstrapToken) {
+    yield* Effect.logError(
+      "Rejected legacy desktop bootstrap credential without an explicit profile.",
+    );
   }
 
   const listActive: PairingGrantStore["Service"]["listActive"] = Effect.fn(

@@ -147,30 +147,56 @@ const bootstrap = Effect.gen(function* () {
   const desktopWindow = yield* DesktopWindow.DesktopWindow;
   yield* logBootstrapInfo("bootstrap start");
 
-  if (environment.isDevelopment && Option.isNone(environment.configuredBackendPort)) {
+  if (
+    environment.isDevelopment &&
+    Option.isNone(environment.attachedBackend) &&
+    Option.isNone(environment.configuredBackendPort)
+  ) {
     return yield* new DesktopDevelopmentBackendPortRequiredError();
   }
 
-  const backendPortSelection = yield* resolveDesktopBackendPort(environment.configuredBackendPort);
-  const backendPort = backendPortSelection.port;
-  yield* logBootstrapInfo(
-    backendPortSelection.selectedByScan
-      ? "selected backend port via sequential scan"
-      : "using configured backend port",
-    {
-      port: backendPort,
-      ...(backendPortSelection.selectedByScan ? { startPort: DEFAULT_DESKTOP_BACKEND_PORT } : {}),
-    },
-  );
-
   const settings = yield* desktopSettings.get;
-  if (settings.serverExposureMode !== environment.defaultDesktopSettings.serverExposureMode) {
-    yield* logBootstrapInfo("bootstrap restoring persisted server exposure mode", {
-      mode: settings.serverExposureMode,
-    });
-  }
-  const serverExposureState = yield* serverExposure.configureFromSettings({ port: backendPort });
-  const backendConfig = yield* serverExposure.backendConfig;
+  const attachedBackend = environment.attachedBackend;
+  const backendConfig = yield* Option.match(attachedBackend, {
+    onSome: (attached) =>
+      Effect.succeed({
+        httpBaseUrl: attached.httpBaseUrl,
+      }),
+    onNone: () =>
+      Effect.gen(function* () {
+        const backendPortSelection = yield* resolveDesktopBackendPort(
+          environment.configuredBackendPort,
+        );
+        const backendPort = backendPortSelection.port;
+        yield* logBootstrapInfo(
+          backendPortSelection.selectedByScan
+            ? "selected backend port via sequential scan"
+            : "using configured backend port",
+          {
+            port: backendPort,
+            ...(backendPortSelection.selectedByScan
+              ? { startPort: DEFAULT_DESKTOP_BACKEND_PORT }
+              : {}),
+          },
+        );
+        if (settings.serverExposureMode !== environment.defaultDesktopSettings.serverExposureMode) {
+          yield* logBootstrapInfo("bootstrap restoring persisted server exposure mode", {
+            mode: settings.serverExposureMode,
+          });
+        }
+        const exposureState = yield* serverExposure.configureFromSettings({ port: backendPort });
+        if (exposureState.endpointUrl) {
+          yield* logBootstrapInfo("bootstrap enabled network access", {
+            endpointUrl: exposureState.endpointUrl,
+          });
+        } else if (settings.serverExposureMode === "network-accessible") {
+          yield* logBootstrapWarning(
+            "bootstrap fell back to local-only because no advertised network host was available",
+          );
+        }
+        return yield* serverExposure.backendConfig;
+      }),
+  });
   const electronProtocol = yield* ElectronProtocol.ElectronProtocol;
   const rendererTarget = environment.isDevelopment
     ? Option.getOrThrow(environment.devServerUrl)
@@ -184,16 +210,6 @@ const bootstrap = Effect.gen(function* () {
   yield* logBootstrapInfo("bootstrap resolved backend endpoint", {
     baseUrl: backendConfig.httpBaseUrl.href,
   });
-  if (serverExposureState.endpointUrl) {
-    yield* logBootstrapInfo("bootstrap enabled network access", {
-      endpointUrl: serverExposureState.endpointUrl,
-    });
-  } else if (settings.serverExposureMode === "network-accessible") {
-    yield* logBootstrapWarning(
-      "bootstrap fell back to local-only because no advertised network host was available",
-    );
-  }
-
   yield* installDesktopIpcHandlers();
   yield* logBootstrapInfo("bootstrap ipc handlers registered");
 
@@ -211,7 +227,9 @@ const bootstrap = Effect.gen(function* () {
     // primary is already starting; reconcile fires off the WSL register
     // in parallel rather than blocking primary readiness on a possibly
     // slow first wsl.exe spawn.
-    yield* Effect.forkScoped(wslBackend.reconcile);
+    if (Option.isNone(attachedBackend)) {
+      yield* Effect.forkScoped(wslBackend.reconcile);
+    }
   }
 }).pipe(Effect.withSpan("desktop.bootstrap"));
 

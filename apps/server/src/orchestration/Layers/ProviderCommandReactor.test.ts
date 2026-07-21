@@ -1,9 +1,14 @@
 // @effect-diagnostics nodeBuiltinImport:off
+// oxlint-disable t3code/no-manual-effect-runtime-in-tests -- This suite exercises a manually scoped reactor runtime and its asynchronous event drain.
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import {
+  AuthOrchestrationOperateScope,
+  AuthQaMakerScopes,
+  AuthSessionId,
+  EnvironmentId,
   ModelSelection,
   ProviderRuntimeEvent,
   ProviderSession,
@@ -22,6 +27,7 @@ import {
   TurnId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
@@ -60,11 +66,52 @@ import * as Clock from "effect/Clock";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as GitWorkflowService from "../../git/GitWorkflowService.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import * as SessionStore from "../../auth/SessionStore.ts";
+import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
+import * as QaIam from "../../qa/QaIam.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asApprovalRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
+const TEST_INITIATING_SESSION_ID = AuthSessionId.make("provider-reactor-test-session");
+const TEST_ENVIRONMENT_ID = EnvironmentId.make("provider-reactor-test-environment");
+
+const makeQaIam = (
+  resolveConversationContext: QaIam.QaIam["Service"]["resolveConversationContext"],
+  authorizeConversation: QaIam.QaIam["Service"]["authorizeConversation"] = (input) =>
+    resolveConversationContext({
+      conversationThreadId: input.conversationThreadId,
+      environmentId: input.environmentId,
+    }),
+) =>
+  QaIam.QaIam.of({
+    getPrincipalBySubject: () => Effect.die("unused"),
+    listAssignedProjects: () => Effect.die("unused"),
+    resolveProjectAccess: () => Effect.die("unused"),
+    authorizeProject: () => Effect.die("unused"),
+    registerProject: () => Effect.die("unused"),
+    authorizeRelease: () => Effect.die("unused"),
+    bindReleaseConversation: () => Effect.die("unused"),
+    authorizeConversation,
+    appendAuditEvent: () => Effect.die("unused"),
+    resolveConversationContext,
+  });
+
+const missingConversationQaIam = makeQaIam(() =>
+  Effect.fail(
+    new QaIam.QaIamError({
+      code: "conversation_not_found",
+      message: "No QA conversation is bound to this thread.",
+    }),
+  ),
+);
+
+const fakeServerEnvironment = ServerEnvironment.ServerEnvironment.of({
+  getEnvironmentId: Effect.succeed(TEST_ENVIRONMENT_ID),
+  getDescriptor: Effect.die("unused"),
+});
 
 const deriveServerPathsSync = (baseDir: string, devUrl: URL | undefined) =>
   Effect.runSync(deriveServerPaths(baseDir, devUrl).pipe(Effect.provide(NodeServices.layer)));
@@ -98,6 +145,7 @@ describe("ProviderCommandReactor", () => {
   const createdBaseDirs = new Set<string>();
 
   afterEach(async () => {
+    McpProviderSession.clearAllMcpProviderSessions();
     if (scope) {
       await Effect.runPromise(Scope.close(scope, Exit.void));
     }
@@ -145,6 +193,9 @@ describe("ProviderCommandReactor", () => {
     readonly threadModelSelection?: ModelSelection;
     readonly sessionModelSwitch?: "unsupported" | "in-session";
     readonly requiresNewThreadForModelChange?: boolean;
+    readonly canonicalSessionId?: AuthSessionId;
+    readonly resolveActiveAuthorization?: SessionStore.SessionStore["Service"]["resolveActiveAuthorization"];
+    readonly qaIam?: QaIam.QaIam["Service"];
   }) {
     const now = "2026-01-01T00:00:00.000Z";
     const baseDir =
@@ -155,71 +206,106 @@ describe("ProviderCommandReactor", () => {
     const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
     let nextSessionIndex = 1;
     const runtimeSessions: Array<ProviderSession> = [];
+    const resolveActiveAuthorization = vi.fn<
+      SessionStore.SessionStore["Service"]["resolveActiveAuthorization"]
+    >(
+      input?.resolveActiveAuthorization ??
+        ((sessionId) =>
+          Effect.succeed({
+            sessionId: input?.canonicalSessionId ?? sessionId,
+            subject: "provider-reactor:test",
+            scopes: [AuthOrchestrationOperateScope],
+            expiresAt: DateTime.makeUnsafe("2099-01-01T00:00:00.000Z"),
+          })),
+    );
     const modelSelection = input?.threadModelSelection ?? {
       instanceId: ProviderInstanceId.make("codex"),
       model: "gpt-5-codex",
     };
-    const startSession = vi.fn((_: unknown, input: unknown) => {
-      const sessionIndex = nextSessionIndex++;
-      const resumeCursor =
-        typeof input === "object" && input !== null && "resumeCursor" in input
-          ? input.resumeCursor
-          : undefined;
-      const threadId =
-        typeof input === "object" &&
-        input !== null &&
-        "threadId" in input &&
-        typeof input.threadId === "string"
-          ? ThreadId.make(input.threadId)
-          : ThreadId.make(`thread-${sessionIndex}`);
-      const inputModelSelection =
-        typeof input === "object" && input !== null && "modelSelection" in input
-          ? (input.modelSelection as ModelSelection | undefined)
-          : undefined;
-      const providerInstanceId =
-        typeof input === "object" && input !== null && "providerInstanceId" in input
-          ? (input.providerInstanceId as ProviderInstanceId | undefined)
-          : inputModelSelection?.instanceId;
-      const provider =
-        typeof input === "object" &&
-        input !== null &&
-        "provider" in input &&
-        typeof input.provider === "string"
-          ? (input.provider as ProviderSession["provider"])
-          : ProviderDriverKind.make(inputModelSelection?.instanceId ?? modelSelection.instanceId);
-      const session: ProviderSession = {
-        provider,
-        ...(providerInstanceId ? { providerInstanceId } : {}),
-        status: "ready" as const,
-        runtimeMode:
+    const startSession = vi.fn(
+      (
+        _: unknown,
+        input: unknown,
+        authorization?: { readonly initiatingSessionId: AuthSessionId },
+      ) => {
+        const sessionIndex = nextSessionIndex++;
+        const resumeCursor =
+          typeof input === "object" && input !== null && "resumeCursor" in input
+            ? input.resumeCursor
+            : undefined;
+        const threadId =
           typeof input === "object" &&
           input !== null &&
-          "runtimeMode" in input &&
-          (input.runtimeMode === "approval-required" || input.runtimeMode === "full-access")
-            ? input.runtimeMode
-            : "full-access",
-        ...(typeof input === "object" &&
-        input !== null &&
-        "cwd" in input &&
-        typeof input.cwd === "string"
-          ? { cwd: input.cwd }
-          : {}),
-        ...((inputModelSelection?.model ?? modelSelection.model)
-          ? { model: inputModelSelection?.model ?? modelSelection.model }
-          : {}),
-        threadId,
-        resumeCursor: resumeCursor ?? { opaque: `resume-${sessionIndex}` },
-        createdAt: now,
-        updatedAt: now,
-      };
-      runtimeSessions.push(session);
-      return Effect.succeed(session);
-    });
-    const sendTurn = vi.fn((_: unknown) =>
-      Effect.succeed({
-        threadId: ThreadId.make("thread-1"),
-        turnId: asTurnId("turn-1"),
-      }),
+          "threadId" in input &&
+          typeof input.threadId === "string"
+            ? ThreadId.make(input.threadId)
+            : ThreadId.make(`thread-${sessionIndex}`);
+        const inputModelSelection =
+          typeof input === "object" && input !== null && "modelSelection" in input
+            ? (input.modelSelection as ModelSelection | undefined)
+            : undefined;
+        const providerInstanceId =
+          typeof input === "object" && input !== null && "providerInstanceId" in input
+            ? (input.providerInstanceId as ProviderInstanceId | undefined)
+            : inputModelSelection?.instanceId;
+        const provider =
+          typeof input === "object" &&
+          input !== null &&
+          "provider" in input &&
+          typeof input.provider === "string"
+            ? (input.provider as ProviderSession["provider"])
+            : ProviderDriverKind.make(inputModelSelection?.instanceId ?? modelSelection.instanceId);
+        const session: ProviderSession = {
+          provider,
+          ...(providerInstanceId ? { providerInstanceId } : {}),
+          status: "ready" as const,
+          runtimeMode:
+            typeof input === "object" &&
+            input !== null &&
+            "runtimeMode" in input &&
+            (input.runtimeMode === "approval-required" || input.runtimeMode === "full-access")
+              ? input.runtimeMode
+              : "full-access",
+          ...(typeof input === "object" &&
+          input !== null &&
+          "cwd" in input &&
+          typeof input.cwd === "string"
+            ? { cwd: input.cwd }
+            : {}),
+          ...((inputModelSelection?.model ?? modelSelection.model)
+            ? { model: inputModelSelection?.model ?? modelSelection.model }
+            : {}),
+          threadId,
+          resumeCursor: resumeCursor ?? { opaque: `resume-${sessionIndex}` },
+          createdAt: now,
+          updatedAt: now,
+        };
+        runtimeSessions.push(session);
+        if (authorization !== undefined && providerInstanceId !== undefined) {
+          McpProviderSession.setMcpProviderSession({
+            initiatingSessionId: authorization.initiatingSessionId,
+            environmentId: TEST_ENVIRONMENT_ID,
+            threadId,
+            providerSessionId: `provider-reactor-session-${sessionIndex}`,
+            providerInstanceId,
+            endpoint: "http://127.0.0.1/mcp",
+            authorizationHeader: "Bearer provider-reactor-test",
+            authorizationContext: {
+              kind: "standard",
+              principalSubject: "provider-reactor:test",
+              workspaceAdministrator: false,
+            },
+          });
+        }
+        return Effect.succeed(session);
+      },
+    );
+    const sendTurn = vi.fn(
+      (_: unknown, _authorization?: { readonly initiatingSessionId: AuthSessionId }) =>
+        Effect.succeed({
+          threadId: ThreadId.make("thread-1"),
+          turnId: asTurnId("turn-1"),
+        }),
     );
     const interruptTurn = vi.fn((_: unknown) => Effect.void);
     const respondToRequest = vi.fn<ProviderServiceShape["respondToRequest"]>(() => Effect.void);
@@ -233,6 +319,7 @@ describe("ProviderCommandReactor", () => {
         if (!threadId) {
           return;
         }
+        McpProviderSession.clearMcpProviderSession(threadId);
         const index = runtimeSessions.findIndex((session) => session.threadId === threadId);
         if (index >= 0) {
           runtimeSessions.splice(index, 1);
@@ -369,6 +456,14 @@ describe("ProviderCommandReactor", () => {
         }),
       ),
       Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(
+        Layer.mock(SessionStore.SessionStore, {
+          cookieName: "t3-provider-reactor-test-session",
+          resolveActiveAuthorization,
+        }),
+      ),
+      Layer.provideMerge(Layer.succeed(ServerEnvironment.ServerEnvironment, fakeServerEnvironment)),
+      Layer.provideMerge(Layer.succeed(QaIam.QaIam, input?.qaIam ?? missingConversationQaIam)),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
       Layer.provideMerge(NodeServices.layer),
     );
@@ -380,6 +475,12 @@ describe("ProviderCommandReactor", () => {
     scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
     const drain = () => Effect.runPromise(reactor.drain);
+    const dispatchAsAuthenticatedSession: typeof engine.dispatch = (command) =>
+      engine.dispatch(
+        command.type === "thread.turn.start"
+          ? { ...command, initiatingSessionId: TEST_INITIATING_SESSION_ID }
+          : command,
+      );
 
     await Effect.runPromise(
       engine.dispatch({
@@ -409,7 +510,8 @@ describe("ProviderCommandReactor", () => {
     );
 
     return {
-      engine,
+      engine: { dispatch: dispatchAsAuthenticatedSession },
+      rawEngine: engine,
       readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
       startSession,
       sendTurn,
@@ -421,6 +523,7 @@ describe("ProviderCommandReactor", () => {
       refreshStatus,
       generateBranchName,
       generateThreadTitle,
+      resolveActiveAuthorization,
       runtimeSessions,
       stateDir,
       drain,
@@ -428,7 +531,8 @@ describe("ProviderCommandReactor", () => {
   }
 
   it("reacts to thread.turn.start by ensuring session and sending provider turn", async () => {
-    const harness = await createHarness();
+    const canonicalSessionId = AuthSessionId.make("provider-reactor-canonical-session");
+    const harness = await createHarness({ canonicalSessionId });
     const now = "2026-01-01T00:00:00.000Z";
 
     await Effect.runPromise(
@@ -459,11 +563,240 @@ describe("ProviderCommandReactor", () => {
       },
       runtimeMode: "approval-required",
     });
+    expect(harness.resolveActiveAuthorization).toHaveBeenCalledWith(TEST_INITIATING_SESSION_ID);
+    expect(harness.startSession.mock.calls[0]?.[2]).toEqual({
+      initiatingSessionId: canonicalSessionId,
+    });
+    expect(harness.sendTurn.mock.calls[0]?.[1]).toEqual({
+      initiatingSessionId: canonicalSessionId,
+    });
 
     const readModel = await harness.readModel();
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
     expect(thread?.session?.threadId).toBe("thread-1");
     expect(thread?.session?.runtimeMode).toBe("approval-required");
+  });
+
+  it("fails closed when a persisted turn lacks authenticated session provenance", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await Effect.runPromise(
+      harness.rawEngine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-missing-provenance-generation-eligible"),
+        threadId: ThreadId.make("thread-1"),
+        title: "New thread",
+        branch: "t3code/missing-provenance",
+        worktreePath: "/tmp/provider-project-missing-provenance",
+      }),
+    );
+
+    await Effect.runPromise(
+      harness.rawEngine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-missing-provenance"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-missing-provenance"),
+          role: "user",
+          text: "This historical event must not start a provider.",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => {
+      const readModel = await harness.readModel();
+      const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+      return (
+        thread?.activities.some((activity) => activity.kind === "provider.turn.start.failed") ??
+        false
+      );
+    });
+
+    expect(harness.startSession).not.toHaveBeenCalled();
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    expect(harness.generateBranchName).not.toHaveBeenCalled();
+    expect(harness.generateThreadTitle).not.toHaveBeenCalled();
+    expect(harness.resolveActiveAuthorization).not.toHaveBeenCalled();
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(
+      thread?.activities.find((activity) => activity.kind === "provider.turn.start.failed"),
+    ).toMatchObject({
+      payload: {
+        detail: expect.stringContaining("missing authenticated session provenance"),
+      },
+    });
+  });
+
+  it.each([
+    {
+      state: "inactive",
+      makeError: (sessionId: AuthSessionId, _now: string) =>
+        new SessionStore.UnknownSessionTokenError({ sessionId }),
+      expectedDetail: "Unknown session token",
+    },
+    {
+      state: "revoked",
+      makeError: (sessionId: AuthSessionId, now: string) =>
+        new SessionStore.SessionTokenRevokedError({
+          sessionId,
+          revokedAt: DateTime.makeUnsafe(now),
+        }),
+      expectedDetail: "Session token revoked",
+    },
+  ])(
+    "fails closed before provider-derived work when the initiating session is $state",
+    async ({ state, makeError, expectedDetail }) => {
+      const now = "2026-01-01T00:00:00.000Z";
+      const harness = await createHarness({
+        resolveActiveAuthorization: (sessionId) => Effect.fail(makeError(sessionId, now)),
+      });
+
+      await Effect.runPromise(
+        harness.engine.dispatch({
+          type: "thread.meta.update",
+          commandId: CommandId.make(`cmd-${state}-provenance-generation-eligible`),
+          threadId: ThreadId.make("thread-1"),
+          title: "New thread",
+          branch: `t3code/${state}-provenance`,
+          worktreePath: `/tmp/provider-project-${state}-provenance`,
+        }),
+      );
+      await Effect.runPromise(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make(`cmd-turn-start-${state}-provenance`),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId(`user-message-${state}-provenance`),
+            role: "user",
+            text: `This ${state} session must not trigger provider-derived work.`,
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: now,
+        }),
+      );
+
+      await waitFor(async () => {
+        const readModel = await harness.readModel();
+        const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+        return (
+          thread?.activities.some((activity) => activity.kind === "provider.turn.start.failed") ??
+          false
+        );
+      });
+
+      expect(harness.resolveActiveAuthorization).toHaveBeenCalledWith(TEST_INITIATING_SESSION_ID);
+      expect(harness.generateBranchName).not.toHaveBeenCalled();
+      expect(harness.generateThreadTitle).not.toHaveBeenCalled();
+      expect(harness.startSession).not.toHaveBeenCalled();
+      expect(harness.sendTurn).not.toHaveBeenCalled();
+      const readModel = await harness.readModel();
+      const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+      expect(
+        thread?.activities.find((activity) => activity.kind === "provider.turn.start.failed"),
+      ).toMatchObject({
+        payload: {
+          detail: expect.stringContaining(expectedDetail),
+        },
+      });
+    },
+  );
+
+  it("fails closed before generators when live QA conversation access is denied", async () => {
+    const now = "2026-01-01T00:00:00.000Z";
+    const conversationAccess: QaIam.QaConversationAccess = {
+      principal: {
+        id: "principal-maker",
+        subject: "local:qa:maker",
+        displayName: "Local QA Maker",
+      },
+      organizationId: "local-repro-org",
+      projectId: "project-repro",
+      projectName: "Repro",
+      role: "qa:maker",
+      capabilities: ["qa:read", "qa:make", "qa:chat", "qa:test-application"],
+      releaseThreadId: "release-maker",
+      conversation: {
+        releaseThreadId: "release-maker",
+        conversationThreadId: "thread-1",
+        principalId: "principal-maker",
+        environmentId: TEST_ENVIRONMENT_ID,
+      },
+    };
+    const authorizeConversation = vi.fn<QaIam.QaIam["Service"]["authorizeConversation"]>(() =>
+      Effect.fail(
+        new QaIam.QaIamError({
+          code: "conversation_access_denied",
+          message: "The maker assignment was revoked.",
+        }),
+      ),
+    );
+    const harness = await createHarness({
+      resolveActiveAuthorization: (sessionId) =>
+        Effect.succeed({
+          sessionId,
+          subject: "local:qa:maker",
+          scopes: AuthQaMakerScopes,
+          expiresAt: DateTime.makeUnsafe("2099-01-01T00:00:00.000Z"),
+        }),
+      qaIam: makeQaIam(() => Effect.succeed(conversationAccess), authorizeConversation),
+    });
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-live-qa-denial-generation-eligible"),
+        threadId: ThreadId.make("thread-1"),
+        title: "New thread",
+        branch: "t3code/live-qa-denial",
+        worktreePath: "/tmp/provider-project-live-qa-denial",
+      }),
+    );
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-live-qa-denial"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-live-qa-denial"),
+          role: "user",
+          text: "Revoked QA access must stop every provider-derived action.",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => {
+      const readModel = await harness.readModel();
+      const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+      return (
+        thread?.activities.some((activity) => activity.kind === "provider.turn.start.failed") ??
+        false
+      );
+    });
+
+    expect(authorizeConversation).toHaveBeenCalledWith({
+      subject: "local:qa:maker",
+      conversationThreadId: ThreadId.make("thread-1"),
+      environmentId: TEST_ENVIRONMENT_ID,
+      capability: "qa:chat",
+    });
+    expect(harness.generateBranchName).not.toHaveBeenCalled();
+    expect(harness.generateThreadTitle).not.toHaveBeenCalled();
+    expect(harness.startSession).not.toHaveBeenCalled();
+    expect(harness.sendTurn).not.toHaveBeenCalled();
   });
 
   it("generates a thread title on the first turn", async () => {
@@ -1374,6 +1707,20 @@ describe("ProviderCommandReactor", () => {
         createdAt: now,
       }),
     );
+    McpProviderSession.setMcpProviderSession({
+      initiatingSessionId: TEST_INITIATING_SESSION_ID,
+      environmentId: EnvironmentId.make("provider-reactor-test-environment"),
+      threadId: ThreadId.make("thread-1"),
+      providerSessionId: "provider-reactor-runtime-mode-session",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      endpoint: "http://127.0.0.1/mcp",
+      authorizationHeader: "Bearer provider-reactor-runtime-mode-test",
+      authorizationContext: {
+        kind: "standard",
+        principalSubject: "provider-reactor:test",
+        workspaceAdministrator: false,
+      },
+    });
 
     await Effect.runPromise(
       harness.engine.dispatch({

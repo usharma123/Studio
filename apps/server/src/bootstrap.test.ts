@@ -201,6 +201,25 @@ it.layer(NodeServices.layer)("readBootstrapEnvelope", (it) => {
     }),
   );
 
+  it.effect("can reject excess bootstrap fields at a security boundary", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const filePath = yield* fs.makeTempFileScoped({ prefix: "t3-bootstrap-", suffix: ".ndjson" });
+      yield* fs.writeFileString(filePath, '{"mode":"desktop","subject":"local:root"}\n');
+
+      const fd = yield* Effect.acquireRelease(
+        Effect.sync(() => NodeFS.openSync(filePath, "r")),
+        (fd) => Effect.sync(() => NodeFS.closeSync(fd)),
+      );
+      const error = yield* readBootstrapEnvelope(TestEnvelopeSchema, fd, {
+        timeoutMs: 100,
+        parseOptions: { onExcessProperty: "error" },
+      }).pipe(Effect.flip);
+
+      assert.instanceOf(error, BootstrapEnvelopeDecodeError);
+    }),
+  );
+
   it.effect("returns none when the bootstrap read times out before any value arrives", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

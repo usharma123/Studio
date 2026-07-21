@@ -6,7 +6,7 @@
  *
  * @module ServerConfig
  */
-import type { DesktopDevelopmentProfile } from "@t3tools/contracts";
+import type { DesktopBootstrapGrants, DesktopDevelopmentProfile } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -73,6 +73,7 @@ export class ServerConfig extends Context.Service<
     readonly startupPresentation: StartupPresentation;
     readonly desktopBootstrapToken: string | undefined;
     readonly desktopDevelopmentProfile: DesktopDevelopmentProfile | undefined;
+    readonly desktopBootstrapGrants?: DesktopBootstrapGrants;
     readonly autoBootstrapProjectFromCwd: boolean;
     readonly logWebSocketEvents: boolean;
     readonly tailscaleServeEnabled: boolean;

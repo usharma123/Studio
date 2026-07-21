@@ -1,8 +1,4 @@
-import type {
-  EnvironmentId,
-  QaAssignedReleaseDashboard,
-  QaAssignedReleaseSummary,
-} from "@t3tools/contracts";
+import type { EnvironmentId, QaAssignedReleaseSummary } from "@t3tools/contracts";
 import { Link } from "@tanstack/react-router";
 import {
   AlertCircle,
@@ -13,13 +9,17 @@ import {
   MessageSquare,
   ShieldCheck,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useRef } from "react";
 
 import { cn } from "~/lib/utils";
-import { useEnvironmentQuery } from "~/state/query";
+import { qaReleaseRouteTarget } from "~/qaReleaseRoutes";
 
-import { qaEnvironment } from "./client";
+import {
+  type AssignedQaReleaseDashboardError,
+  QaAssignedReleaseDashboardProbes,
+  useAssignedQaReleases,
+} from "./useAssignedQaReleases";
 
 type QaDashboardFilter = "awaiting_review" | "in_progress" | "completed";
 
@@ -39,50 +39,21 @@ export function QaApprovalDashboard(props: QaApprovalDashboardProps) {
     props.approver ? "awaiting_review" : "in_progress",
   );
   const filterTouchedRef = useRef(false);
-  const [dashboards, setDashboards] = useState<
-    ReadonlyMap<EnvironmentId, QaAssignedReleaseDashboard | null>
-  >(new Map());
-  const environmentIds = useMemo(() => [...new Set(props.environmentIds)], [props.environmentIds]);
-  const reportDashboard = useCallback(
-    (environmentId: EnvironmentId, dashboard: QaAssignedReleaseDashboard | null) => {
-      setDashboards((current) => {
-        if (current.get(environmentId) === dashboard) return current;
-        const next = new Map(current);
-        next.set(environmentId, dashboard);
-        return next;
-      });
-    },
-    [],
-  );
-  const releases = environmentIds
-    .flatMap((environmentId) =>
-      (dashboards.get(environmentId)?.releases ?? []).map((release) => ({
-        environmentId,
-        release,
-      })),
-    )
-    .toSorted((left, right) => right.release.updatedAt.localeCompare(left.release.updatedAt));
+  const assigned = useAssignedQaReleases(props.environmentIds);
+  const { releases } = assigned;
   const filtered = releases.filter(({ release }) => release.bucket === filter);
   const effectiveApprover =
     props.approver || releases.some(({ release }) => release.uiRole === "approver");
-  const awaitingCount = environmentIds.reduce(
-    (total, environmentId) => total + (dashboards.get(environmentId)?.awaitingReviewCount ?? 0),
-    0,
-  );
-  const loading = environmentIds.some((environmentId) => !dashboards.has(environmentId));
   useEffect(() => {
     if (effectiveApprover && !filterTouchedRef.current) setFilter("awaiting_review");
   }, [effectiveApprover]);
 
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-col gap-5">
-      {environmentIds.map((environmentId) => (
-        <QaAssignedReleaseDashboardProbe
-          key={environmentId}
-          environmentId={environmentId}
-          onDashboard={reportDashboard}
-        />
-      ))}
+      <QaAssignedReleaseDashboardProbes
+        environmentIds={assigned.environmentIds}
+        onDashboard={assigned.reportDashboard}
+      />
 
       <header className="flex items-start gap-3">
         <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-primary/20 bg-primary/8 text-primary">
@@ -100,10 +71,14 @@ export function QaApprovalDashboard(props: QaApprovalDashboardProps) {
         </div>
         {effectiveApprover ? (
           <span className="pt-1 text-xs tabular-nums text-muted-foreground">
-            {awaitingCount} awaiting review
+            {assigned.awaitingReviewCount} awaiting review
           </span>
         ) : null}
       </header>
+
+      {assigned.errors.length > 0 && releases.length > 0 ? (
+        <DashboardLoadError errors={assigned.errors} />
+      ) : null}
 
       <section className="overflow-hidden rounded-xl border border-border/70 bg-card/25">
         <div className="flex items-center gap-1 border-b border-border/60 px-3 pt-2">
@@ -127,17 +102,19 @@ export function QaApprovalDashboard(props: QaApprovalDashboardProps) {
           ))}
         </div>
 
-        {loading ? (
+        {assigned.loading ? (
           <div className="flex items-center justify-center gap-2 px-5 py-12 text-xs text-muted-foreground">
             <LoaderCircle className="size-4 animate-spin" /> Loading assigned releases
           </div>
+        ) : assigned.errors.length > 0 && releases.length === 0 ? (
+          <DashboardLoadError errors={assigned.errors} embedded />
         ) : filtered.length === 0 ? (
           <DashboardEmpty filter={filter} />
         ) : (
           <div className="divide-y divide-border/55">
             {filtered.map(({ environmentId, release }) => (
               <ReleaseRow
-                key={`${environmentId}:${release.threadId}`}
+                key={`${environmentId}:${release.releaseId}`}
                 environmentId={environmentId}
                 release={release}
               />
@@ -149,25 +126,33 @@ export function QaApprovalDashboard(props: QaApprovalDashboardProps) {
   );
 }
 
-function QaAssignedReleaseDashboardProbe(props: {
-  readonly environmentId: EnvironmentId;
-  readonly onDashboard: (
-    environmentId: EnvironmentId,
-    dashboard: QaAssignedReleaseDashboard | null,
-  ) => void;
+function DashboardLoadError(props: {
+  readonly errors: ReadonlyArray<AssignedQaReleaseDashboardError>;
+  readonly embedded?: boolean;
 }) {
-  const query = useEnvironmentQuery(
-    qaEnvironment.listAssignedReleases({
-      environmentId: props.environmentId,
-      input: {},
-    }),
+  const first = props.errors[0];
+  if (!first) return null;
+  const label =
+    props.errors.length === 1
+      ? "Could not load QA releases."
+      : `Could not load QA releases from ${props.errors.length} environments.`;
+  return (
+    <div
+      role="alert"
+      className={cn(
+        "flex items-start gap-2 px-4 py-3 text-xs text-destructive",
+        props.embedded
+          ? "my-8 justify-center"
+          : "rounded-lg border border-destructive/25 bg-destructive/5",
+      )}
+    >
+      <AlertCircle className="mt-0.5 size-3.5 shrink-0" />
+      <div className="min-w-0">
+        <p className="font-medium">{label}</p>
+        <p className="mt-0.5 break-words text-[11px] text-muted-foreground">{first.message}</p>
+      </div>
+    </div>
   );
-  const onDashboard = props.onDashboard;
-  useEffect(() => {
-    if (query.data) onDashboard(props.environmentId, query.data);
-    else if (!query.isPending) onDashboard(props.environmentId, null);
-  }, [onDashboard, props.environmentId, query.data, query.isPending]);
-  return null;
 }
 
 function ReleaseRow(props: {
@@ -178,8 +163,10 @@ function ReleaseRow(props: {
   const needsAttention = release.bucket === "awaiting_review";
   return (
     <Link
-      to="/$environmentId/$threadId"
-      params={{ environmentId: props.environmentId, threadId: release.threadId }}
+      {...qaReleaseRouteTarget({
+        environmentId: props.environmentId,
+        releaseId: release.releaseId,
+      })}
       className="group flex items-center gap-3 px-4 py-3 transition-colors hover:bg-accent/45"
     >
       <div className="flex size-8 shrink-0 items-center justify-center rounded-md border border-border/70 bg-background/70">
