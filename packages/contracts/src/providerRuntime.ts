@@ -252,6 +252,9 @@ const ProviderRuntimeEventBase = Schema.Struct({
   // for the routing-key-vs-driver-id distinction. Once every emitter
   // populates it (post-slice-4), routing flips to instance-id-only.
   providerInstanceId: Schema.optional(ProviderInstanceId),
+  // Identity of the MCP credential-bound provider session that produced this
+  // event. Adapters without an MCP binding leave it absent.
+  providerSessionId: Schema.optional(TrimmedNonEmptyStringSchema),
   threadId: ThreadId,
   createdAt: IsoDateTime,
   turnId: Schema.optional(TurnId),

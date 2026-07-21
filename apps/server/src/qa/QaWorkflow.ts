@@ -108,7 +108,7 @@ type QaWorkflowShape = {
   ) => Effect.Effect<QaReleaseSnapshot, QaOperationError>;
   readonly releaseAgentStageGenerationForOwner: (
     threadId: QaGetSnapshotInput["threadId"],
-    owner: QaAgentGenerationClaimOwner,
+    owner: QaAgentGenerationOwner,
   ) => Effect.Effect<QaAgentStageGenerationReleaseResult, QaOperationError>;
   readonly recoverStaleAgentStageGenerations: (input: {
     readonly environmentId: QaAgentGenerationClaimOwner["environmentId"];
@@ -2269,7 +2269,7 @@ const make = Effect.gen(function* () {
 
   const releaseAgentStageGenerationForOwner = (
     threadId: QaGetSnapshotInput["threadId"],
-    owner: QaAgentGenerationClaimOwner,
+    owner: QaAgentGenerationOwner,
   ) =>
     mapQaFailure(
       "releaseAgentStageGenerationForOwner",
@@ -2285,6 +2285,7 @@ const make = Effect.gen(function* () {
             WHERE thread_id = ${threadId}
               AND active_environment_id = ${owner.environmentId}
               AND active_conversation_thread_id = ${owner.conversationThreadId}
+              AND active_provider_session_id = ${owner.providerSessionId}
               AND active_job_id IS NOT NULL
               AND status IN ('queued', 'running')
             RETURNING thread_id AS "threadId"

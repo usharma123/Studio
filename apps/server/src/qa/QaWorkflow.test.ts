@@ -675,34 +675,111 @@ layer("QaWorkflow", (it) => {
       assert.equal(duplicate.code, "invalid_workflow_state");
       assert.match(duplicate.message, /revision changed/u);
 
+      const ignoredUnboundRelease = yield* qa.releaseAgentStageGenerationForOwner(
+        threadId,
+        generationOwner,
+      );
+      assert.isFalse(ignoredUnboundRelease.released);
+      assert.equal(ignoredUnboundRelease.snapshot.revision, 3);
+
+      const running = yield* qa.reportAgentStageProgress(threadId, generationOwner, {
+        stage: "strategy",
+        progress: 10,
+      });
+      assert.equal(running.revision, 4);
+
       const ignoredRelease = yield* qa.releaseAgentStageGenerationForOwner(threadId, {
-        ...generationClaimOwner,
+        ...generationOwner,
         conversationThreadId: ThreadId.make("conversation-not-the-owner"),
       });
       assert.isFalse(ignoredRelease.released);
-      assert.equal(ignoredRelease.snapshot.revision, 3);
+      assert.equal(ignoredRelease.snapshot.revision, 4);
       assert.equal(
         ignoredRelease.snapshot.stages.find((stage) => stage.stage === "strategy")?.status,
-        "queued",
+        "running",
       );
 
       const releasedByOwner = yield* qa.releaseAgentStageGenerationForOwner(
         threadId,
-        generationClaimOwner,
+        generationOwner,
       );
       assert.isTrue(releasedByOwner.released);
-      assert.equal(releasedByOwner.snapshot.revision, 4);
+      assert.equal(releasedByOwner.snapshot.revision, 5);
       assert.equal(
         releasedByOwner.snapshot.stages.find((stage) => stage.stage === "strategy")?.status,
         "ready",
       );
 
-      yield* qa.claimAgentStageGeneration(threadId, 4, "qa-generation:retry", generationClaimOwner);
+      yield* qa.claimAgentStageGeneration(threadId, 5, "qa-generation:retry", generationClaimOwner);
       const released = yield* qa.releaseAgentStageGeneration(threadId, "qa-generation:retry");
-      assert.equal(released.revision, 6);
+      assert.equal(released.revision, 7);
       assert.equal(released.stages.find((stage) => stage.stage === "strategy")?.status, "ready");
       assert.isNull(
         released.stages.find((stage) => stage.stage === "strategy")?.activeJobId ?? null,
+      );
+    }),
+  );
+
+  it.effect("does not release a newer generation claim for an older terminal event", () =>
+    Effect.gen(function* () {
+      const qa = yield* QaWorkflow;
+      const sql = yield* SqlClient.SqlClient;
+      const projectId = ProjectId.make("project-qa-generation-terminal-race");
+      const threadId = ThreadId.make("release-qa-generation-terminal-race");
+      yield* qa.initializeRelease({ projectId, threadId });
+      yield* sql`
+        UPDATE qa_releases
+        SET active_stage = 'strategy', revision = 2
+        WHERE thread_id = ${threadId}
+      `;
+      yield* sql`
+        UPDATE qa_stage_states
+        SET status = 'ready', progress = 0, active_job_id = NULL
+        WHERE thread_id = ${threadId} AND stage = 'strategy'
+      `;
+
+      const oldOwner = {
+        ...generationClaimOwner,
+        providerSessionId: "provider-session-generation-old",
+      };
+      const newOwner = {
+        ...generationClaimOwner,
+        providerSessionId: "provider-session-generation-new",
+      };
+
+      yield* qa.claimAgentStageGeneration(threadId, 2, "qa-generation:old", generationClaimOwner);
+      yield* qa.reportAgentStageProgress(threadId, oldOwner, {
+        stage: "strategy",
+        progress: 10,
+      });
+      yield* qa.releaseAgentStageGeneration(threadId, "qa-generation:old");
+      yield* qa.claimAgentStageGeneration(threadId, 5, "qa-generation:new", generationClaimOwner);
+      yield* qa.reportAgentStageProgress(threadId, newOwner, {
+        stage: "strategy",
+        progress: 20,
+      });
+
+      const ignored = yield* qa.releaseAgentStageGenerationForOwner(threadId, oldOwner);
+      assert.isFalse(ignored.released);
+      assert.equal(ignored.snapshot.revision, 7);
+      assert.equal(
+        ignored.snapshot.stages.find((stage) => stage.stage === "strategy")?.activeJobId,
+        "qa-generation:new",
+      );
+      assert.equal(
+        ignored.snapshot.stages.find((stage) => stage.stage === "strategy")?.status,
+        "running",
+      );
+
+      const released = yield* qa.releaseAgentStageGenerationForOwner(threadId, newOwner);
+      assert.isTrue(released.released);
+      assert.equal(released.snapshot.revision, 8);
+      assert.equal(
+        released.snapshot.stages.find((stage) => stage.stage === "strategy")?.status,
+        "ready",
+      );
+      assert.isNull(
+        released.snapshot.stages.find((stage) => stage.stage === "strategy")?.activeJobId ?? null,
       );
     }),
   );

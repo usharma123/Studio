@@ -582,6 +582,80 @@ function startLifecycleRuntime() {
 }
 
 lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
+  it.effect("keeps the provider session identity captured before its binding is replaced", () => {
+    const threadId = asThreadId("thread-provider-session-identity");
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const environmentId = EnvironmentId.make("environment-provider-session-identity");
+    const originalProviderSessionId = "provider-session-original";
+
+    return Effect.gen(function* () {
+      McpProviderSession.setMcpProviderSession({
+        initiatingSessionId: AuthSessionId.make("auth-session-original"),
+        environmentId,
+        threadId,
+        providerSessionId: originalProviderSessionId,
+        providerInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer original-token",
+        authorizationContext: {
+          kind: "standard",
+          principalSubject: "local:root",
+          workspaceAdministrator: true,
+        },
+      });
+
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const originalRuntime = lifecycleRuntimeFactory.lastRuntime;
+      NodeAssert.ok(originalRuntime);
+
+      McpProviderSession.setMcpProviderSession({
+        initiatingSessionId: AuthSessionId.make("auth-session-replacement"),
+        environmentId,
+        threadId,
+        providerSessionId: "provider-session-replacement",
+        providerInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer replacement-token",
+        authorizationContext: {
+          kind: "standard",
+          principalSubject: "local:root",
+          workspaceAdministrator: true,
+        },
+      });
+
+      const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      yield* originalRuntime.emit({
+        id: asEventId("evt-original-session-closed"),
+        kind: "session",
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "session/closed",
+        message: "Original session stopped",
+      });
+
+      const firstEvent = yield* Fiber.join(firstEventFiber);
+      NodeAssert.equal(firstEvent._tag, "Some");
+      if (firstEvent._tag !== "Some") {
+        return;
+      }
+      NodeAssert.equal(firstEvent.value.type, "session.exited");
+      NodeAssert.equal(firstEvent.value.providerSessionId, originalProviderSessionId);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          McpProviderSession.clearMcpProviderSession(threadId);
+        }),
+      ),
+    );
+  });
+
   it.effect("maps completed agent message items to canonical item.completed events", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();

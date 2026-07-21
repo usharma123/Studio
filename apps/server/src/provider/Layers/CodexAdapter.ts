@@ -1418,6 +1418,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        const providerSessionId = mcpSession?.providerSessionId;
         const qaReleaseSession = shouldUseQaCodexPermissionProfile({
           mcpSession,
           serverConfig,
@@ -1481,7 +1482,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
           Effect.gen(function* () {
             yield* writeNativeEvent(event);
-            const runtimeEvents = mapToRuntimeEvents(event, event.threadId);
+            const runtimeEvents = mapToRuntimeEvents(event, event.threadId).map((runtimeEvent) =>
+              providerSessionId === undefined
+                ? runtimeEvent
+                : { ...runtimeEvent, providerSessionId },
+            );
             if (runtimeEvents.length === 0) {
               yield* Effect.logDebug("ignoring unhandled Codex provider event", {
                 method: event.method,

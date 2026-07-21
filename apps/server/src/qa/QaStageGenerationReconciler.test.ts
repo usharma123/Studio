@@ -25,12 +25,14 @@ import {
 const environmentId = EnvironmentId.make("environment-qa-generation-reconciler");
 const conversationThreadId = ThreadId.make("conversation-qa-generation-reconciler");
 const releaseThreadId = ThreadId.make("release-qa-generation-reconciler");
+const providerSessionId = "provider-session-qa-generation-reconciler";
 
 const eventBase = {
   eventId: EventId.make("event-qa-generation-reconciler"),
   provider: ProviderDriverKind.make("codex"),
   threadId: conversationThreadId,
   createdAt: "2026-07-16T12:00:00.000Z",
+  providerSessionId,
 } as const;
 
 const snapshot = {
@@ -153,6 +155,7 @@ describe("QaStageGenerationReconciler", () => {
           expect(harness.release).toHaveBeenCalledWith(releaseThreadId, {
             environmentId,
             conversationThreadId,
+            providerSessionId,
           });
           expect(harness.publish).toHaveBeenCalledWith({
             type: "updated",
@@ -163,6 +166,28 @@ describe("QaStageGenerationReconciler", () => {
             snapshot,
             at: event.createdAt,
           });
+        }),
+      ),
+    );
+  });
+
+  it.effect("ignores terminal events without a provider session identity", () => {
+    const harness = makeHarness({ released: true });
+    const event: ProviderRuntimeEvent = {
+      eventId: eventBase.eventId,
+      provider: eventBase.provider,
+      threadId: eventBase.threadId,
+      createdAt: eventBase.createdAt,
+      type: "turn.completed",
+      payload: { state: "completed" },
+    };
+
+    return harness.reconcile(event).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          expect(harness.resolveConversationContext).not.toHaveBeenCalled();
+          expect(harness.release).not.toHaveBeenCalled();
+          expect(harness.publish).not.toHaveBeenCalled();
         }),
       ),
     );

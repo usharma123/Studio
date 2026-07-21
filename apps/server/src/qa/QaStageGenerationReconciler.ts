@@ -74,6 +74,7 @@ export const makeQaStageGenerationReconciler = Effect.gen(function* () {
     event: ProviderRuntimeEvent,
   ) {
     if (!isQaStageGenerationTerminalEvent(event)) return;
+    if (event.providerSessionId === undefined) return;
 
     const conversation = yield* iam
       .resolveConversationContext({
@@ -93,6 +94,7 @@ export const makeQaStageGenerationReconciler = Effect.gen(function* () {
       {
         environmentId,
         conversationThreadId: event.threadId,
+        providerSessionId: event.providerSessionId,
       },
     );
     if (!result.released) return;
