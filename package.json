@@ -12,6 +12,7 @@
     "dev:desktop:root": "node scripts/dev-runner.ts dev:desktop --profile root",
     "dev:desktop:qa-maker": "node scripts/dev-runner.ts dev:desktop --profile qa:maker",
     "dev:desktop:qa-approver": "node scripts/dev-runner.ts dev:desktop --profile qa:approver",
+    "dev:desktop:qa-shared": "node scripts/qa-shared-dev-supervisor.mjs",
     "start": "vp run --filter t3 start",
     "start:desktop": "vp run --filter @t3tools/desktop start",
     "start:marketing": "vp run --filter @t3tools/marketing preview",

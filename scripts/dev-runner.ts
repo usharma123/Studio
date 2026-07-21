@@ -1,6 +1,9 @@
 #!/usr/bin/env node
+// @effect-diagnostics nodeBuiltinImport:off - Development artifact paths are resolved before the Effect runtime starts.
 
 import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -60,6 +63,38 @@ const DESKTOP_PROFILE_SLUGS = {
   "qa:maker": "qa-maker",
   "qa:approver": "qa-approver",
 } as const satisfies Record<DesktopDevelopmentProfileValue, string>;
+const REPO_ROOT = NodeURL.fileURLToPath(new URL("..", import.meta.url));
+
+export interface DesktopDevelopmentBuildPaths {
+  readonly desktopOutputDir: string;
+  readonly serverOutputDir: string;
+  readonly backendEntryPath: string;
+}
+
+export function resolveDesktopDevelopmentBuildPaths(
+  profile: DesktopDevelopmentProfileValue | undefined,
+  repoRoot = REPO_ROOT,
+): DesktopDevelopmentBuildPaths {
+  const profileSlug = profile === undefined ? undefined : DESKTOP_PROFILE_SLUGS[profile];
+  const desktopOutputDir = NodePath.join(
+    repoRoot,
+    "apps",
+    "desktop",
+    profileSlug === undefined ? "dist-electron" : `dist-electron-${profileSlug}`,
+  );
+  const serverOutputDir = NodePath.join(
+    repoRoot,
+    "apps",
+    "server",
+    profileSlug === undefined ? "dist" : `dist-desktop-${profileSlug}`,
+  );
+
+  return {
+    desktopOutputDir,
+    serverOutputDir,
+    backendEntryPath: NodePath.join(serverOutputDir, "bin.mjs"),
+  };
+}
 
 export function getDevRunnerModeArgs(mode: DevMode): ReadonlyArray<string> {
   return MODE_ARGS[mode];
@@ -326,7 +361,11 @@ export function createDevRunnerEnv({
     }
 
     if (isDesktopMode) {
+      const buildPaths = resolveDesktopDevelopmentBuildPaths(profile);
       output.HOST = DESKTOP_DEV_LOOPBACK_HOST;
+      output.T3CODE_DESKTOP_OUTPUT_DIR = buildPaths.desktopOutputDir;
+      output.T3CODE_SERVER_OUTPUT_DIR = buildPaths.serverOutputDir;
+      output.T3CODE_DESKTOP_BACKEND_ENTRY_PATH = buildPaths.backendEntryPath;
       delete output.T3CODE_DESKTOP_WS_URL;
     }
 

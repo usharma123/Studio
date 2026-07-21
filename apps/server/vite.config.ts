@@ -16,6 +16,7 @@ export function shouldBundleCliDependency(id: string): boolean {
 }
 
 const repoEnv = loadRepoEnv();
+const serverOutputDir = process.env.T3CODE_SERVER_OUTPUT_DIR?.trim() || "dist";
 
 export default mergeConfig(
   baseConfig,
@@ -27,11 +28,19 @@ export default mergeConfig(
           dependsOn: ["@t3tools/web#build"],
           cache: false,
         },
+        "build:desktop-dev": {
+          command: "vp pack",
+          cache: false,
+        },
+        "dev:desktop-shared": {
+          command: "vp pack --watch",
+          cache: false,
+        },
       },
     },
     pack: {
       entry: ["src/bin.ts"],
-      outDir: "dist",
+      outDir: serverOutputDir,
       sourcemap: true,
       clean: true,
       deps: {

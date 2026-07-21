@@ -1,6 +1,7 @@
 // This file mostly exists because we want the branded app name instead of "electron".
 
 import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 import * as NodeOS from "node:os";
@@ -12,21 +13,143 @@ const isDevelopment = Boolean(process.env.VITE_DEV_SERVER_URL);
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 export const desktopDir = NodePath.resolve(__dirname, "..");
 const repoRoot = NodePath.resolve(desktopDir, "..", "..");
-const devBundleIdSuffix = NodePath.basename(repoRoot)
-  .toLowerCase()
-  .replaceAll(/[^a-z0-9]+/g, "");
-export const APP_DISPLAY_NAME = "Studio";
-export const APP_BUNDLE_ID = isDevelopment
-  ? `com.codexstudio.desktop.dev.${devBundleIdSuffix || "local"}`
-  : "com.codexstudio.desktop";
-const APP_PROTOCOL_SCHEMES = isDevelopment ? ["codex-studio-dev"] : ["codex-studio"];
-const LAUNCHER_VERSION = 13;
+const BASE_APP_DISPLAY_NAME = "Studio";
+const LAUNCHER_VERSION = 14;
 const DEVELOPMENT_RUNTIME_BINARY_NAME = "Electron.real";
 const DEVELOPMENT_PROFILE_SLUGS = {
   root: "root",
   "qa:maker": "qa-maker",
   "qa:approver": "qa-approver",
 };
+const LEGACY_DEVELOPMENT_INSTANCES = {
+  root: "desktop-root",
+  "qa:maker": "desktop-qa-maker",
+  "qa:approver": "desktop-qa-approver",
+};
+
+export function resolveDevelopmentProfile(environment = process.env) {
+  const profile = environment.T3CODE_DEV_PROFILE?.trim();
+  const profileSlug = profile ? DEVELOPMENT_PROFILE_SLUGS[profile] : undefined;
+  if (profile && !profileSlug) {
+    throw new Error(`Invalid T3CODE_DEV_PROFILE: ${profile}`);
+  }
+  return { profile, profileSlug };
+}
+
+export function resolveDevelopmentArtifactPaths({
+  environment = process.env,
+  desktopRoot = desktopDir,
+} = {}) {
+  const configuredDesktopOutputDir = environment.T3CODE_DESKTOP_OUTPUT_DIR?.trim();
+  const configuredBackendEntryPath = environment.T3CODE_DESKTOP_BACKEND_ENTRY_PATH?.trim();
+  const desktopOutputDir = configuredDesktopOutputDir
+    ? NodePath.resolve(desktopRoot, configuredDesktopOutputDir)
+    : NodePath.join(desktopRoot, "dist-electron");
+  const backendEntryPath = configuredBackendEntryPath
+    ? NodePath.resolve(desktopRoot, configuredBackendEntryPath)
+    : NodePath.resolve(desktopRoot, "../server/dist/bin.mjs");
+
+  return {
+    desktopOutputDir,
+    mainEntryPath: NodePath.join(desktopOutputDir, "main.cjs"),
+    preloadPath: NodePath.join(desktopOutputDir, "preload.cjs"),
+    previewPickPreloadPath: NodePath.join(desktopOutputDir, "preview-pick-preload.cjs"),
+    backendEntryPath,
+  };
+}
+
+export function resolveDevelopmentWatchTargets(artifactPaths) {
+  return [
+    {
+      directory: artifactPaths.desktopOutputDir,
+      files: new Set(["main.cjs", "preload.cjs"]),
+    },
+    {
+      directory: NodePath.dirname(artifactPaths.backendEntryPath),
+      files: new Set([NodePath.basename(artifactPaths.backendEntryPath)]),
+    },
+  ];
+}
+
+function resolveDevelopmentInstance(environment, profile) {
+  const developmentInstance = environment.T3CODE_DEV_INSTANCE?.trim();
+  if (!developmentInstance || developmentInstance === LEGACY_DEVELOPMENT_INSTANCES[profile]) {
+    return { developmentInstance: null, instanceSlug: null };
+  }
+
+  const normalizedInstanceSlug = developmentInstance
+    .toLowerCase()
+    .replaceAll(/[^a-z0-9]+/g, "-")
+    .replaceAll(/^-+|-+$/g, "");
+  if (!normalizedInstanceSlug) {
+    throw new Error(`Invalid T3CODE_DEV_INSTANCE: ${developmentInstance}`);
+  }
+
+  // The readable normalization is not injective (for example, "branch/a" and
+  // "branch a" both become "branch-a"). Every custom instance therefore gets
+  // a case-sensitive digest suffix. Lowercase hexadecimal is also safe in an
+  // Apple bundle identifier and remains distinct after its case-insensitive
+  // comparison. Keep the full digest so these process/runtime identities do
+  // not trade one practical collision class for another.
+  const instanceDigest = NodeCrypto.createHash("sha256")
+    .update(developmentInstance, "utf8")
+    .digest("hex");
+  const instanceSlug = `${normalizedInstanceSlug}-${instanceDigest}`;
+
+  return { developmentInstance, instanceSlug };
+}
+
+export function resolveDevelopmentLauncherIdentity({
+  environment = process.env,
+  desktopRoot = desktopDir,
+  repositoryRoot = repoRoot,
+} = {}) {
+  const { profile, profileSlug } = resolveDevelopmentProfile(environment);
+  const { developmentInstance, instanceSlug } = resolveDevelopmentInstance(environment, profile);
+  const repoSlug = NodePath.basename(repositoryRoot)
+    .toLowerCase()
+    .replaceAll(/[^a-z0-9]+/g, "");
+  const baseBundleId = `com.codexstudio.desktop.dev.${repoSlug || "local"}`;
+  const isQaProfile = profile === "qa:maker" || profile === "qa:approver";
+  const profileRuntimeDir = profileSlug
+    ? NodePath.join(desktopRoot, ".electron-runtime", profileSlug)
+    : NodePath.join(desktopRoot, ".electron-runtime");
+  const profileBundleId = isQaProfile ? `${baseBundleId}.${profileSlug}` : baseBundleId;
+  const runtimeDir = instanceSlug
+    ? NodePath.join(profileRuntimeDir, "instances", instanceSlug)
+    : profileRuntimeDir;
+  const bundleId = instanceSlug ? `${profileBundleId}.${instanceSlug}` : profileBundleId;
+  const appDisplayName = instanceSlug
+    ? `${BASE_APP_DISPLAY_NAME} (${instanceSlug})`
+    : BASE_APP_DISPLAY_NAME;
+
+  return {
+    profile: profile ?? null,
+    profileSlug: profileSlug ?? null,
+    developmentInstance,
+    instanceSlug,
+    runtimeDir,
+    appDisplayName,
+    appBundlePath: NodePath.join(runtimeDir, `${appDisplayName}.app`),
+    metadataPath: NodePath.join(runtimeDir, "metadata.json"),
+    bundleId,
+    // The generic dev deep-link remains owned by root/the legacy unprofiled
+    // client. QA personas are separate clients and must not race to become its
+    // LaunchServices handler.
+    protocolSchemes: isQaProfile || instanceSlug ? [] : ["codex-studio-dev"],
+  };
+}
+
+const developmentLauncherIdentity = resolveDevelopmentLauncherIdentity();
+export const APP_DISPLAY_NAME = isDevelopment
+  ? developmentLauncherIdentity.appDisplayName
+  : BASE_APP_DISPLAY_NAME;
+export const APP_BUNDLE_ID = isDevelopment
+  ? developmentLauncherIdentity.bundleId
+  : "com.codexstudio.desktop";
+const APP_PROTOCOL_SCHEMES = isDevelopment
+  ? developmentLauncherIdentity.protocolSchemes
+  : ["codex-studio"];
 const defaultIconPath = NodePath.join(desktopDir, "resources", "icon.icns");
 const developmentMacIconPngPath = NodePath.join(
   repoRoot,
@@ -42,13 +165,16 @@ export function resolveDevelopmentUserDataPath({
   homeDirectory = NodeOS.homedir(),
   platform = hostPlatform,
 } = {}) {
-  const profile = environment.T3CODE_DEV_PROFILE?.trim();
-  const profileSlug = profile ? DEVELOPMENT_PROFILE_SLUGS[profile] : undefined;
-  if (profile && !profileSlug) {
-    throw new Error(`Invalid T3CODE_DEV_PROFILE: ${profile}`);
-  }
+  const { profileSlug } = resolveDevelopmentProfile(environment);
 
   const path = platform === "win32" ? NodePath.win32 : NodePath.posix;
+  const configuredPath = environment.T3CODE_DESKTOP_USER_DATA_PATH?.trim();
+  if (configuredPath) {
+    if (!path.isAbsolute(configuredPath)) {
+      throw new Error("T3CODE_DESKTOP_USER_DATA_PATH must be absolute.");
+    }
+    return path.normalize(configuredPath);
+  }
   const appDataDirectory =
     platform === "win32"
       ? environment.APPDATA?.trim() || path.join(homeDirectory, "AppData", "Roaming")
@@ -135,12 +261,22 @@ export function makeDevelopmentLauncherScript({
   environment,
   userDataPath = resolveDevelopmentUserDataPath({ environment, platform: "darwin" }),
 }) {
+  // This allowlist is persisted in the macOS runtime wrapper. Keep credentials,
+  // tokens, and other client secrets out of it: the dev runner supplies those
+  // through the live process environment, which the wrapper's exec preserves.
   const envEntries = [
     ["VITE_DEV_SERVER_URL", environment.VITE_DEV_SERVER_URL],
+    ["VITE_HTTP_URL", environment.VITE_HTTP_URL],
+    ["VITE_WS_URL", environment.VITE_WS_URL],
     ["T3CODE_PORT", environment.T3CODE_PORT],
     ["T3CODE_HOME", environment.T3CODE_HOME],
     ["T3CODE_DEV_PROFILE", environment.T3CODE_DEV_PROFILE],
     ["T3CODE_DEV_INSTANCE", environment.T3CODE_DEV_INSTANCE],
+    ["T3CODE_DESKTOP_OUTPUT_DIR", environment.T3CODE_DESKTOP_OUTPUT_DIR],
+    ["T3CODE_DESKTOP_BACKEND_ENTRY_PATH", environment.T3CODE_DESKTOP_BACKEND_ENTRY_PATH],
+    ["T3CODE_DESKTOP_USER_DATA_PATH", environment.T3CODE_DESKTOP_USER_DATA_PATH],
+    ["T3CODE_DESKTOP_ATTACHED_BACKEND_URL", environment.T3CODE_DESKTOP_ATTACHED_BACKEND_URL],
+    ["T3CODE_DESKTOP_ATTACHED_ENVIRONMENT_ID", environment.T3CODE_DESKTOP_ATTACHED_ENVIRONMENT_ID],
     ["T3CODE_COMMIT_HASH", environment.T3CODE_COMMIT_HASH],
     ["T3CODE_OTLP_TRACES_URL", environment.T3CODE_OTLP_TRACES_URL],
     ["T3CODE_OTLP_EXPORT_INTERVAL_MS", environment.T3CODE_OTLP_EXPORT_INTERVAL_MS],
@@ -158,11 +294,12 @@ export function makeDevelopmentLauncherScript({
 }
 
 function writeDevelopmentLauncherScript(targetBinaryPath, electronBinaryPath) {
+  const artifactPaths = resolveDevelopmentArtifactPaths();
   NodeFS.writeFileSync(
     targetBinaryPath,
     makeDevelopmentLauncherScript({
       electronBinaryPath,
-      mainEntryPath: NodePath.join(desktopDir, "dist-electron", "main.cjs"),
+      mainEntryPath: artifactPaths.mainEntryPath,
       desktopRoot: desktopDir,
       environment: process.env,
     }),
@@ -310,8 +447,12 @@ function readJson(path) {
 
 function buildMacLauncher(electronBinaryPath) {
   const sourceAppBundlePath = NodePath.resolve(NodePath.dirname(electronBinaryPath), "../..");
-  const runtimeDir = NodePath.join(desktopDir, ".electron-runtime");
-  const targetAppBundlePath = NodePath.join(runtimeDir, `${APP_DISPLAY_NAME}.app`);
+  const runtimeDir = isDevelopment
+    ? developmentLauncherIdentity.runtimeDir
+    : NodePath.join(desktopDir, ".electron-runtime");
+  const targetAppBundlePath = isDevelopment
+    ? developmentLauncherIdentity.appBundlePath
+    : NodePath.join(runtimeDir, `${APP_DISPLAY_NAME}.app`);
   const targetBinaryPath = NodePath.join(targetAppBundlePath, "Contents", "MacOS", "Electron");
   const developmentRuntimeBinaryPath = NodePath.join(
     targetAppBundlePath,
@@ -320,7 +461,9 @@ function buildMacLauncher(electronBinaryPath) {
     DEVELOPMENT_RUNTIME_BINARY_NAME,
   );
   const iconPath = isDevelopment ? ensureDevelopmentIconIcns(runtimeDir) : defaultIconPath;
-  const metadataPath = NodePath.join(runtimeDir, "metadata.json");
+  const metadataPath = isDevelopment
+    ? developmentLauncherIdentity.metadataPath
+    : NodePath.join(runtimeDir, "metadata.json");
 
   NodeFS.mkdirSync(runtimeDir, { recursive: true });
 
@@ -332,6 +475,14 @@ function buildMacLauncher(electronBinaryPath) {
     appDisplayName: APP_DISPLAY_NAME,
     appBundleId: APP_BUNDLE_ID,
     appProtocolSchemes: APP_PROTOCOL_SCHEMES,
+    ...(isDevelopment
+      ? {
+          developmentProfile: developmentLauncherIdentity.profile,
+          developmentInstance: developmentLauncherIdentity.developmentInstance,
+          mainEntryPath: resolveDevelopmentArtifactPaths().mainEntryPath,
+          userDataPath: resolveDevelopmentUserDataPath(),
+        }
+      : {}),
   };
 
   const currentMetadata = readJson(metadataPath);

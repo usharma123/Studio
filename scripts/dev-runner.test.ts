@@ -17,6 +17,7 @@ import {
   createDevRunnerEnv,
   findFirstAvailableOffset,
   getDevRunnerModeArgs,
+  resolveDesktopDevelopmentBuildPaths,
   resolveModePortOffsets,
   resolveOffset,
   runDevRunnerWithInput,
@@ -128,6 +129,49 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
   });
 
   describe("createDevRunnerEnv", () => {
+    it.effect("resolves pairwise-distinct standalone desktop profile build outputs", () =>
+      Effect.sync(() => {
+        const repoRoot = "/repo";
+        const root = resolveDesktopDevelopmentBuildPaths("root", repoRoot);
+        const maker = resolveDesktopDevelopmentBuildPaths("qa:maker", repoRoot);
+        const approver = resolveDesktopDevelopmentBuildPaths("qa:approver", repoRoot);
+
+        assert.deepStrictEqual(root, {
+          desktopOutputDir: "/repo/apps/desktop/dist-electron-root",
+          serverOutputDir: "/repo/apps/server/dist-desktop-root",
+          backendEntryPath: "/repo/apps/server/dist-desktop-root/bin.mjs",
+        });
+        assert.deepStrictEqual(maker, {
+          desktopOutputDir: "/repo/apps/desktop/dist-electron-qa-maker",
+          serverOutputDir: "/repo/apps/server/dist-desktop-qa-maker",
+          backendEntryPath: "/repo/apps/server/dist-desktop-qa-maker/bin.mjs",
+        });
+        assert.deepStrictEqual(approver, {
+          desktopOutputDir: "/repo/apps/desktop/dist-electron-qa-approver",
+          serverOutputDir: "/repo/apps/server/dist-desktop-qa-approver",
+          backendEntryPath: "/repo/apps/server/dist-desktop-qa-approver/bin.mjs",
+        });
+        assert.equal(
+          new Set([root.desktopOutputDir, maker.desktopOutputDir, approver.desktopOutputDir]).size,
+          3,
+        );
+        assert.equal(
+          new Set([root.serverOutputDir, maker.serverOutputDir, approver.serverOutputDir]).size,
+          3,
+        );
+      }),
+    );
+
+    it.effect("keeps unprofiled desktop development on the legacy build outputs", () =>
+      Effect.sync(() => {
+        assert.deepStrictEqual(resolveDesktopDevelopmentBuildPaths(undefined, "/repo"), {
+          desktopOutputDir: "/repo/apps/desktop/dist-electron",
+          serverOutputDir: "/repo/apps/server/dist",
+          backendEntryPath: "/repo/apps/server/dist/bin.mjs",
+        });
+      }),
+    );
+
     it.effect("defaults T3CODE_HOME to ~/.codex-studio when not provided", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
@@ -305,6 +349,42 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
         assert.equal(env.T3CODE_DEV_PROFILE, "qa:maker");
         assert.equal(env.T3CODE_DEV_INSTANCE, "desktop-qa-maker");
         assert.equal(env.T3CODE_QA_DATABASE_URL, "postgresql://qa-shared.example/test");
+        assert.match(env.T3CODE_DESKTOP_OUTPUT_DIR ?? "", /dist-electron-qa-maker$/);
+        assert.match(env.T3CODE_SERVER_OUTPUT_DIR ?? "", /dist-desktop-qa-maker$/);
+        assert.equal(
+          env.T3CODE_DESKTOP_BACKEND_ENTRY_PATH,
+          `${env.T3CODE_SERVER_OUTPUT_DIR}/bin.mjs`,
+        );
+      }),
+    );
+
+    it.effect("overwrites stale standalone profile build paths from the parent environment", () =>
+      Effect.gen(function* () {
+        const env = yield* createDevRunnerEnv({
+          mode: "dev:desktop",
+          baseEnv: {
+            T3CODE_DESKTOP_OUTPUT_DIR: "/tmp/wrong-desktop-output",
+            T3CODE_SERVER_OUTPUT_DIR: "/tmp/wrong-server-output",
+            T3CODE_DESKTOP_BACKEND_ENTRY_PATH: "/tmp/wrong-server-output/bin.mjs",
+          },
+          serverOffset: 0,
+          webOffset: 0,
+          t3Home: "/tmp/t3",
+          noBrowser: undefined,
+          autoBootstrapProjectFromCwd: undefined,
+          logWebSocketEvents: undefined,
+          host: undefined,
+          port: undefined,
+          devUrl: undefined,
+          profile: "qa:approver",
+        });
+
+        assert.match(env.T3CODE_DESKTOP_OUTPUT_DIR ?? "", /dist-electron-qa-approver$/);
+        assert.match(env.T3CODE_SERVER_OUTPUT_DIR ?? "", /dist-desktop-qa-approver$/);
+        assert.equal(
+          env.T3CODE_DESKTOP_BACKEND_ENTRY_PATH,
+          `${env.T3CODE_SERVER_OUTPUT_DIR}/bin.mjs`,
+        );
       }),
     );
 

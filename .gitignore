@@ -28,6 +28,8 @@ squashfs-root/
 .vercel
 .gstack/
 dist-electron/
+apps/desktop/dist-electron-*/
+apps/server/dist-desktop-*/
 .electron-runtime/
 node_modules/
 .alchemy/
