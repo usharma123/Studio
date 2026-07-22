@@ -1,5 +1,10 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { AuthAdministrativeScopes } from "@t3tools/contracts";
+import {
+  AuthAdministrativeScopes,
+  AuthQaApproverScopes,
+  AuthQaMakerScopes,
+  AuthQaRootScopes,
+} from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -41,6 +46,27 @@ const makeCookieRequest = (
   }) as unknown as Parameters<
     EnvironmentAuth.EnvironmentAuth["Service"]["authenticateHttpRequest"]
   >[0];
+
+const makeBearerRequest = (
+  accessToken: string,
+): Parameters<EnvironmentAuth.EnvironmentAuth["Service"]["authenticateHttpRequest"]>[0] =>
+  ({
+    cookies: {},
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+    },
+  }) as unknown as Parameters<
+    EnvironmentAuth.EnvironmentAuth["Service"]["authenticateHttpRequest"]
+  >[0];
+
+const ROOT_DESKTOP_CREDENTIAL = "1".repeat(48);
+const MAKER_DESKTOP_CREDENTIAL = "2".repeat(48);
+const APPROVER_DESKTOP_CREDENTIAL = "3".repeat(48);
+const DESKTOP_BOOTSTRAP_GRANTS = [
+  { profile: "root", credential: ROOT_DESKTOP_CREDENTIAL },
+  { profile: "qa:maker", credential: MAKER_DESKTOP_CREDENTIAL },
+  { profile: "qa:approver", credential: APPROVER_DESKTOP_CREDENTIAL },
+] as const;
 
 const requestMetadata = {
   deviceType: "desktop" as const,
@@ -132,6 +158,122 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
 
       expect(token.scope).toBe("orchestration:read");
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
+  it.effect("creates simultaneous sessions for each canonical desktop v2 grant", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const exchanges = yield* Effect.all(
+        [ROOT_DESKTOP_CREDENTIAL, MAKER_DESKTOP_CREDENTIAL, APPROVER_DESKTOP_CREDENTIAL].map(
+          (credential) => serverAuth.createBrowserSession(credential, requestMetadata),
+        ),
+        { concurrency: "unbounded" },
+      );
+      const sessions = yield* Effect.all(
+        exchanges.map((exchange) =>
+          serverAuth.authenticateHttpRequest(makeCookieRequest(exchange.sessionToken)),
+        ),
+        { concurrency: "unbounded" },
+      );
+
+      expect(sessions.map(({ subject }) => subject)).toEqual([
+        "local:root",
+        "local:qa:maker",
+        "local:qa:approver",
+      ]);
+      expect(sessions[0]?.scopes).toEqual(AuthQaRootScopes);
+      expect(sessions[1]?.scopes).toEqual(AuthQaMakerScopes);
+      expect(sessions[2]?.scopes).toEqual(AuthQaApproverScopes);
+    }).pipe(
+      Effect.provide(
+        makeEnvironmentAuthLayer({ desktopBootstrapGrants: DESKTOP_BOOTSTRAP_GRANTS }),
+      ),
+    ),
+  );
+
+  it.effect("enforces each desktop v2 grant's exact token-exchange scope ceiling", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const tokens = yield* Effect.all(
+        {
+          root: serverAuth.exchangeBootstrapCredentialForAccessToken(
+            ROOT_DESKTOP_CREDENTIAL,
+            undefined,
+            requestMetadata,
+          ),
+          maker: serverAuth.exchangeBootstrapCredentialForAccessToken(
+            MAKER_DESKTOP_CREDENTIAL,
+            undefined,
+            requestMetadata,
+          ),
+          approver: serverAuth.exchangeBootstrapCredentialForAccessToken(
+            APPROVER_DESKTOP_CREDENTIAL,
+            undefined,
+            requestMetadata,
+          ),
+        },
+        { concurrency: "unbounded" },
+      );
+
+      expect(tokens.root.scope).toBe(AuthQaRootScopes.join(" "));
+      expect(tokens.maker.scope).toBe(AuthQaMakerScopes.join(" "));
+      expect(tokens.approver.scope).toBe(AuthQaApproverScopes.join(" "));
+
+      const sessions = yield* Effect.all(
+        {
+          root: serverAuth.authenticateHttpRequest(makeBearerRequest(tokens.root.access_token)),
+          maker: serverAuth.authenticateHttpRequest(makeBearerRequest(tokens.maker.access_token)),
+          approver: serverAuth.authenticateHttpRequest(
+            makeBearerRequest(tokens.approver.access_token),
+          ),
+        },
+        { concurrency: "unbounded" },
+      );
+      expect(sessions.root.subject).toBe("local:root");
+      expect(sessions.maker.subject).toBe("local:qa:maker");
+      expect(sessions.approver.subject).toBe("local:qa:approver");
+
+      const narrowedMakerToken = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
+        MAKER_DESKTOP_CREDENTIAL,
+        ["qa:read"],
+        requestMetadata,
+      );
+      expect(narrowedMakerToken.scope).toBe("qa:read");
+
+      const errors = yield* Effect.all(
+        {
+          makerApproval: serverAuth
+            .exchangeBootstrapCredentialForAccessToken(
+              MAKER_DESKTOP_CREDENTIAL,
+              ["qa:approve"],
+              requestMetadata,
+            )
+            .pipe(Effect.flip),
+          makerWorkspace: serverAuth
+            .exchangeBootstrapCredentialForAccessToken(
+              MAKER_DESKTOP_CREDENTIAL,
+              ["orchestration:read"],
+              requestMetadata,
+            )
+            .pipe(Effect.flip),
+          approverMutation: serverAuth
+            .exchangeBootstrapCredentialForAccessToken(
+              APPROVER_DESKTOP_CREDENTIAL,
+              ["qa:make"],
+              requestMetadata,
+            )
+            .pipe(Effect.flip),
+        },
+        { concurrency: "unbounded" },
+      );
+      expect(errors.makerApproval._tag).toBe("ServerAuthScopeNotGrantedError");
+      expect(errors.makerWorkspace._tag).toBe("ServerAuthScopeNotGrantedError");
+      expect(errors.approverMutation._tag).toBe("ServerAuthScopeNotGrantedError");
+    }).pipe(
+      Effect.provide(
+        makeEnvironmentAuthLayer({ desktopBootstrapGrants: DESKTOP_BOOTSTRAP_GRANTS }),
+      ),
+    ),
   );
 
   it.effect("keeps user-issued administrative pairing links manageable", () =>
@@ -248,6 +390,7 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
         Effect.provide(
           makeEnvironmentAuthLayer({
             desktopBootstrapToken: "desktop-bootstrap-token",
+            desktopDevelopmentProfile: "root",
           }),
         ),
       ),

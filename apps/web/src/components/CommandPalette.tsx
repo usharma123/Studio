@@ -126,8 +126,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 import { ComposerHandleContext, useComposerHandleContext } from "../composerHandleContext";
 import type { ChatComposerHandle } from "./chat/ChatComposer";
 import { useEnterpriseModeStore } from "../enterpriseModeStore";
-import { DESKTOP_DEVELOPMENT_PROFILE } from "../branding";
-import { isQaApproverDesktopProfile } from "../qa/qaRole";
+import { useQaGlobalAccess } from "../qa/useQaGlobalAccess";
 import { QaProjectCreationDialog } from "./QaProjectCreationDialog";
 const EMPTY_BROWSE_ENTRIES: FilesystemBrowseResult["entries"] = [];
 function getLocalFileManagerName(platform: string): string {
@@ -383,11 +382,11 @@ export function CommandPalette({ children }: { children: ReactNode }) {
   });
   const setOpen = (open: boolean) => dispatch({ _tag: "SetOpen", open });
   const isQaMode = useEnterpriseModeStore((store) => store.mode === "qa");
-  const isQaApproverUi = isQaMode && isQaApproverDesktopProfile(DESKTOP_DEVELOPMENT_PROFILE);
+  const qaGlobalAccess = useQaGlobalAccess();
   const [qaProjectCreationOpen, setQaProjectCreationOpen] = useState(false);
   const openAddProject = () => {
-    if (isQaApproverUi) return;
     if (isQaMode) {
+      if (!qaGlobalAccess.canCreateProject) return;
       setQaProjectCreationOpen(true);
       return;
     }
@@ -429,7 +428,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
   return (
     <OpenAddProjectCommandPaletteProvider openAddProject={openAddProject}>
       <ComposerHandleContext value={composerHandleRef}>
-        {isQaMode && !isQaApproverUi ? (
+        {isQaMode && qaGlobalAccess.canCreateProject ? (
           <QaProjectCreationDialog
             open={qaProjectCreationOpen}
             onOpenChange={setQaProjectCreationOpen}
@@ -477,7 +476,7 @@ function useOpenCommandPaletteDialogContent(props: {
   const navigate = useNavigate();
   const { clearOpenIntent, openIntent, setOpen } = props;
   const isQaMode = useEnterpriseModeStore((store) => store.mode === "qa");
-  const isQaApproverUi = isQaMode && isQaApproverDesktopProfile(DESKTOP_DEVELOPMENT_PROFILE);
+  const qaGlobalAccess = useQaGlobalAccess();
   const composerHandleRef = useComposerHandleContext();
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
@@ -910,7 +909,7 @@ function useOpenCommandPaletteDialogContent(props: {
     return () => window.clearTimeout(task);
   }, [openIntent]);
   const actionItems: Array<CommandPaletteActionItem | CommandPaletteSubmenuItem> = [];
-  if (projects.length > 0 && !isQaApproverUi) {
+  if (projects.length > 0 && !isQaMode) {
     const activeProjectTitle = currentProjectId
       ? (projectTitleById.get(currentProjectId) ?? null)
       : null;
@@ -946,7 +945,7 @@ function useOpenCommandPaletteDialogContent(props: {
       groups: [{ value: "projects", label: "Projects", items: projectThreadItems }],
     });
   }
-  if (!isQaApproverUi)
+  if (!isQaMode || qaGlobalAccess.canCreateProject)
     actionItems.push({
       kind: "action",
       value: "action:add-project",
@@ -1006,7 +1005,10 @@ function useOpenCommandPaletteDialogContent(props: {
       await navigate({ to: "/settings" });
     },
   });
-  const rootGroups = buildRootGroups({ actionItems, recentThreadItems });
+  const rootGroups = buildRootGroups({
+    actionItems,
+    recentThreadItems: isQaMode ? [] : recentThreadItems,
+  });
   const sourceSelectionViewValue =
     addProjectEnvironmentId === null ? null : `sources:${addProjectEnvironmentId}`;
   const activeGroups =
@@ -1022,8 +1024,8 @@ function useOpenCommandPaletteDialogContent(props: {
     activeGroups,
     query: deferredQuery,
     isInSubmenu: currentView !== null,
-    projectSearchItems: projectSearchItems,
-    threadSearchItems: allThreadItems,
+    projectSearchItems: isQaMode ? [] : projectSearchItems,
+    threadSearchItems: isQaMode ? [] : allThreadItems,
   });
   const handleAddProjectForEnvironment = async (input: {
     readonly environmentId: EnvironmentId;

@@ -1,11 +1,13 @@
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { ProjectId, ThreadId } from "./baseSchemas.ts";
+import { EnvironmentId, ProjectId, ThreadId } from "./baseSchemas.ts";
 import {
   EnterpriseMode,
   QaAddReviewCommentInput,
   QaAgentRequirementProposal,
+  QaAgentGenerationClaimOwner,
+  QaAgentGenerationOwner,
   QaAgentSubmitScenariosInput,
   QaAgentSubmitScriptsInput,
   QaAgentSubmitStrategyInput,
@@ -13,12 +15,14 @@ import {
   QaDocumentKind,
   QaAssignedReleaseDashboard,
   QaCreateProjectInput,
+  QaEnsureReleaseConversationInput,
   QaGetReleaseAccessInput,
   QaInitializeReleaseInput,
   QaListAssignedReleasesInput,
   QaListReviewThreadsInput,
   QaMarkReviewReadInput,
   QaReleaseAccess,
+  QaReleaseId,
   QaReleaseSnapshot,
   QaReleaseStreamEvent,
   QaStageId,
@@ -35,6 +39,7 @@ import {
   QaScenarioPlan,
   QaScriptPlan,
   QaRunReviewCommentAiCheckInput,
+  QaStartStageGenerationInput,
   QaTestCasePlan,
   QaUpdateStrategySectionInput,
   QaUpdateScenarioInput,
@@ -51,6 +56,9 @@ const decodeQaAddReviewCommentInput = Schema.decodeUnknownSync(QaAddReviewCommen
 const decodeQaAssignedReleaseDashboard = Schema.decodeUnknownSync(QaAssignedReleaseDashboard);
 const decodeQaGetReleaseAccessInput = Schema.decodeUnknownSync(QaGetReleaseAccessInput);
 const decodeQaCreateProjectInput = Schema.decodeUnknownSync(QaCreateProjectInput);
+const decodeQaEnsureReleaseConversationInput = Schema.decodeUnknownSync(
+  QaEnsureReleaseConversationInput,
+);
 const decodeQaListAssignedReleasesInput = Schema.decodeUnknownSync(QaListAssignedReleasesInput);
 const decodeQaListReviewThreadsInput = Schema.decodeUnknownSync(QaListReviewThreadsInput);
 const decodeQaMarkReviewReadInput = Schema.decodeUnknownSync(QaMarkReviewReadInput);
@@ -63,6 +71,7 @@ const decodeQaReviewThread = Schema.decodeUnknownSync(QaReviewThread);
 const decodeQaRunReviewCommentAiCheckInput = Schema.decodeUnknownSync(
   QaRunReviewCommentAiCheckInput,
 );
+const decodeQaStartStageGenerationInput = Schema.decodeUnknownSync(QaStartStageGenerationInput);
 const decodeQaUploadDocumentInput = Schema.decodeUnknownSync(QaUploadDocumentInput);
 const decodeQaInitializeReleaseInput = Schema.decodeUnknownSync(QaInitializeReleaseInput);
 const decodeQaReleaseSnapshot = Schema.decodeUnknownSync(QaReleaseSnapshot);
@@ -71,6 +80,8 @@ const decodeQaStageId = Schema.decodeUnknownSync(QaStageId);
 const decodeQaStageState = Schema.decodeUnknownSync(QaStageState);
 const decodeQaDocumentKind = Schema.decodeUnknownSync(QaDocumentKind);
 const decodeQaAgentRequirementProposal = Schema.decodeUnknownSync(QaAgentRequirementProposal);
+const decodeQaAgentGenerationClaimOwner = Schema.decodeUnknownSync(QaAgentGenerationClaimOwner);
+const decodeQaAgentGenerationOwner = Schema.decodeUnknownSync(QaAgentGenerationOwner);
 const decodeQaAgentSubmitStrategyInput = Schema.decodeUnknownSync(QaAgentSubmitStrategyInput);
 const decodeQaTraceabilityEdge = Schema.decodeUnknownSync(QaTraceabilityEdge);
 const decodeQaUpdateRequirementInput = Schema.decodeUnknownSync(QaUpdateRequirementInput);
@@ -111,16 +122,35 @@ const stages = [
 ];
 
 describe("QA contracts", () => {
+  it("decodes claimed conversation and authenticated provider ownership", () => {
+    const claimOwner = decodeQaAgentGenerationClaimOwner({
+      environmentId: EnvironmentId.make("environment-qa-generation"),
+      conversationThreadId: ThreadId.make("conversation-qa-generation"),
+    });
+    const owner = decodeQaAgentGenerationOwner({
+      ...claimOwner,
+      providerSessionId: "provider-session-qa-generation",
+    });
+
+    expect(owner.environmentId).toBe(claimOwner.environmentId);
+    expect(owner.conversationThreadId).toBe(claimOwner.conversationThreadId);
+    expect(owner.providerSessionId).toBe("provider-session-qa-generation");
+    expect(() => decodeQaAgentGenerationOwner({ ...claimOwner, providerSessionId: "" })).toThrow();
+  });
+
   it("decodes server-owned QA project creation without a client workspace root", () => {
+    const releaseId = QaReleaseId.make("release-qa-create");
     const input = decodeQaCreateProjectInput({
       projectId: ProjectId.make("project-qa-create"),
-      threadId: ThreadId.make("thread-qa-create"),
+      releaseId,
       projectTitle: "Customer portal",
       releaseTitle: "2.4.0 regression",
     });
 
+    expect(input.releaseId).toBe(releaseId);
     expect(input.projectTitle).toBe("Customer portal");
     expect(input.releaseTitle).toBe("2.4.0 regression");
+    expect("threadId" in input).toBe(false);
     expect("workspaceRoot" in input).toBe(false);
   });
 
@@ -134,15 +164,40 @@ describe("QA contracts", () => {
     expect(input.releaseTitle).toBe("2.4.0 regression");
   });
 
+  it("keeps lazy local conversation and generation identifiers server-owned", () => {
+    const releaseId = QaReleaseId.make("release-qa-runtime");
+    expect(decodeQaEnsureReleaseConversationInput({ releaseId })).toEqual({ releaseId });
+    expect(decodeQaStartStageGenerationInput({ releaseId, expectedRevision: 7 })).toEqual({
+      releaseId,
+      expectedRevision: 7,
+    });
+    expect(
+      decodeQaEnsureReleaseConversationInput({
+        releaseId,
+        conversationThreadId: "client-controlled-thread",
+      }),
+    ).toEqual({ releaseId });
+    expect(
+      decodeQaStartStageGenerationInput({
+        releaseId,
+        expectedRevision: 7,
+        model: "client-controlled-model",
+      }),
+    ).toEqual({ releaseId, expectedRevision: 7 });
+  });
+
   it("keeps enterprise modes and RPC method names stable", () => {
     expect(decodeEnterpriseMode("qa")).toBe("qa");
     expect(decodeEnterpriseMode("developer")).toBe("developer");
     expect(decodeQaDocumentKind("HLD")).toBe("HLD");
     expect(decodeQaStageId("test_cases")).toBe("test_cases");
     expect(WS_METHODS.qaListAssignedReleases).toBe("qa.listAssignedReleases");
+    expect(WS_METHODS.qaSubscribeAssignedReleases).toBe("qa.subscribeAssignedReleases");
     expect(WS_METHODS.qaGetReleaseAccess).toBe("qa.getReleaseAccess");
     expect(WS_METHODS.qaGetSnapshot).toBe("qa.getSnapshot");
     expect(WS_METHODS.qaCreateProject).toBe("qa.createProject");
+    expect(WS_METHODS.qaEnsureReleaseConversation).toBe("qa.ensureReleaseConversation");
+    expect(WS_METHODS.qaStartStageGeneration).toBe("qa.startStageGeneration");
     expect(WS_METHODS.qaInitializeRelease).toBe("qa.initializeRelease");
     expect(WS_METHODS.qaUploadDocument).toBe("qa.uploadDocument");
     expect(WS_METHODS.qaStartIngestion).toBe("qa.startIngestion");
@@ -181,11 +236,13 @@ describe("QA contracts", () => {
 
   it("decodes principal-specific release access and the minimal assigned-release dashboard", () => {
     const threadId = ThreadId.make("thread-qa-review-contract");
+    const releaseId = QaReleaseId.make(threadId);
     const projectId = ProjectId.make("project-qa-review-contract");
     expect(decodeQaListAssignedReleasesInput({})).toEqual({});
     expect(decodeQaGetReleaseAccessInput({ threadId }).threadId).toBe(threadId);
 
     const access = decodeQaReleaseAccess({
+      releaseId,
       threadId,
       projectId,
       principalId: "principal-root",
@@ -200,6 +257,7 @@ describe("QA contracts", () => {
     const dashboard = decodeQaAssignedReleaseDashboard({
       releases: [
         {
+          releaseId,
           threadId,
           projectId,
           projectTitle: "Customer portal",
@@ -403,6 +461,7 @@ describe("QA contracts", () => {
     const snapshot = decodeQaReleaseSnapshot({
       mode: "qa",
       projectId: ProjectId.make("project-qa-contract"),
+      releaseId: QaReleaseId.make(upload.threadId),
       threadId: upload.threadId,
       revision: 1,
       releaseNumber: 1,
@@ -433,6 +492,7 @@ describe("QA contracts", () => {
 
     const event = decodeQaReleaseStreamEvent({
       type: "snapshot",
+      releaseId: snapshot.releaseId,
       threadId: snapshot.threadId,
       revision: snapshot.revision,
       snapshot,
@@ -443,6 +503,7 @@ describe("QA contracts", () => {
 
     const updated = decodeQaReleaseStreamEvent({
       type: "updated",
+      releaseId: snapshot.releaseId,
       threadId: snapshot.threadId,
       revision: 2,
       reason: "stage_advanced",
@@ -459,6 +520,7 @@ describe("QA contracts", () => {
       decodeQaReleaseSnapshot({
         mode: "qa",
         projectId: ProjectId.make("project-qa-contract"),
+        releaseId: QaReleaseId.make("release-qa-contract"),
         threadId: ThreadId.make("thread-qa-contract"),
         revision: 0,
         releaseNumber: 1,

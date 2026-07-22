@@ -16,6 +16,8 @@ it.effect("reports the scoped credential context when preview capability is unav
     providerSessionId: "provider-session-1",
     providerInstanceId: ProviderInstanceId.make("codex"),
     capabilities: new Set(),
+    principalSubject: "local:qa:maker",
+    workspaceAdministrator: false,
     issuedAt: 1,
     expiresAt: 2,
   };

@@ -6,6 +6,7 @@ import {
   PreviewAutomationInvalidSelectorError,
   PreviewAutomationMalformedResponseError,
   PreviewAutomationNoAvailableHostError,
+  PreviewAutomationUnavailableError,
   PreviewAutomationTargetNotEditableError,
   PreviewTabId,
   ProviderInstanceId,
@@ -21,8 +22,8 @@ import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
-
-const makeBroker = PreviewAutomationBroker.make.pipe(Effect.provide(NodeServices.layer));
+import type { PreviewAccessIdentity } from "../preview/Access.ts";
+import * as QaIam from "../qa/QaIam.ts";
 
 const scope = {
   environmentId: EnvironmentId.make("environment-1"),
@@ -30,9 +31,75 @@ const scope = {
   providerSessionId: "provider-session-1",
   providerInstanceId: ProviderInstanceId.make("codex"),
   capabilities: new Set(["preview"] as const),
+  principalSubject: "local:root",
+  workspaceAdministrator: true,
   issuedAt: 1,
   expiresAt: Number.MAX_SAFE_INTEGER,
 };
+
+const rootIdentity: PreviewAccessIdentity = {
+  subject: "local:root",
+  sessionId: "session-root",
+  environmentId: scope.environmentId,
+  workspaceAdministrator: true,
+};
+
+const qaConversationAccess = (
+  subject: string,
+  conversationThreadId: ThreadId,
+  environmentId: EnvironmentId,
+): QaIam.QaConversationAccess => ({
+  principal: { id: `principal:${subject}`, subject, displayName: subject },
+  organizationId: "organization-1",
+  projectId: "project-1",
+  projectName: "Project 1",
+  role: "qa:maker",
+  capabilities: QaIam.capabilitiesForQaProjectRole("qa:maker"),
+  releaseThreadId: "release-1",
+  conversation: {
+    releaseThreadId: "release-1",
+    conversationThreadId,
+    principalId: `principal:${subject}`,
+    environmentId,
+  },
+});
+
+type AuthorizeConversationInput = Parameters<QaIam.QaIam["Service"]["authorizeConversation"]>[0];
+
+const testQaIam = QaIam.QaIam.of({
+  authorizeConversation: (input: AuthorizeConversationInput) =>
+    input.subject === "local:qa:maker"
+      ? Effect.succeed(
+          qaConversationAccess(
+            input.subject,
+            ThreadId.make(input.conversationThreadId),
+            input.environmentId,
+          ),
+        )
+      : Effect.fail(
+          new QaIam.QaIamError({
+            code: "conversation_not_found",
+            message: "No release conversation is bound to this principal.",
+          }),
+        ),
+} as unknown as QaIam.QaIam["Service"]);
+
+const makeBrokerWithQaIam = (qaIam: QaIam.QaIam["Service"]) =>
+  PreviewAutomationBroker.make.pipe(
+    Effect.map((broker) => ({
+      ...broker,
+      connect: (host: PreviewAutomationHost, identity?: PreviewAccessIdentity) =>
+        broker.connect(host, identity ?? { ...rootIdentity, environmentId: host.environmentId }),
+      focusHost: (host: Parameters<typeof broker.focusHost>[0], identity?: PreviewAccessIdentity) =>
+        broker.focusHost(host, identity ?? { ...rootIdentity, environmentId: host.environmentId }),
+      respond: (response: Parameters<typeof broker.respond>[0], identity = rootIdentity) =>
+        broker.respond(response, identity),
+    })),
+    Effect.provideService(QaIam.QaIam, qaIam),
+    Effect.provide(NodeServices.layer),
+  );
+
+const makeBroker = makeBrokerWithQaIam(testQaIam);
 
 const makeHost = (overrides: Partial<PreviewAutomationHost> = {}): PreviewAutomationHost => ({
   clientId: "client-1",
@@ -569,6 +636,257 @@ it.effect("never routes a provider session to a host from another environment", 
       expect(yield* broker.invoke<string>({ scope, operation: "status", input: {} })).toBe(
         "matching",
       );
+    }),
+  ),
+);
+
+it.effect("routes QA automation only to a host owned by the invocation principal", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* makeBroker;
+      const makerIdentity: PreviewAccessIdentity = {
+        ...rootIdentity,
+        subject: "local:qa:maker",
+        sessionId: "session-maker",
+        workspaceAdministrator: false,
+      };
+      const approverIdentity: PreviewAccessIdentity = {
+        ...rootIdentity,
+        subject: "local:qa:approver",
+        sessionId: "session-approver",
+        workspaceAdministrator: false,
+      };
+      let approverRequests = 0;
+      const makerRequests = requestsFrom(
+        yield* broker.connect(makeHost({ clientId: "shared-client-id" }), makerIdentity),
+      );
+      const approverRequestsStream = requestsFrom(
+        yield* broker.connect(makeHost({ clientId: "shared-client-id" }), approverIdentity),
+      );
+      yield* Stream.runForEach(makerRequests, (request) =>
+        broker.respond(
+          {
+            clientId: "shared-client-id",
+            connectionId: request.connectionId,
+            requestId: request.requestId,
+            ok: true,
+            result: "maker",
+          },
+          makerIdentity,
+        ),
+      ).pipe(Effect.forkScoped);
+      yield* Stream.runForEach(approverRequestsStream, (request) => {
+        approverRequests += 1;
+        return broker.respond(
+          {
+            clientId: "shared-client-id",
+            connectionId: request.connectionId,
+            requestId: request.requestId,
+            ok: true,
+            result: "approver",
+          },
+          approverIdentity,
+        );
+      }).pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+
+      const result = yield* broker.invoke<string>({
+        scope: {
+          ...scope,
+          principalSubject: makerIdentity.subject,
+          workspaceAdministrator: false,
+          qaPrincipalSubject: makerIdentity.subject,
+          qaReleaseThreadId: ThreadId.make("release-1"),
+          providerSessionId: "provider-session-maker",
+        },
+        operation: "status",
+        input: {},
+      });
+
+      expect(result).toBe("maker");
+      expect(approverRequests).toBe(0);
+    }),
+  ),
+);
+
+it.effect("denies a generic non-administrator MCP principal instead of treating it as root", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* makeBroker;
+      yield* Stream.runDrain(yield* broker.connect(makeHost())).pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+
+      const result = yield* broker
+        .invoke<void>({
+          scope: {
+            ...scope,
+            principalSubject: "local:generic-user",
+            workspaceAdministrator: false,
+            providerSessionId: "provider-session-generic-user",
+          },
+          operation: "status",
+          input: {},
+        })
+        .pipe(Effect.result);
+
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toBeInstanceOf(PreviewAutomationUnavailableError);
+      }
+    }),
+  ),
+);
+
+it.effect("rechecks live QA release access on every automation invocation", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const makerIdentity: PreviewAccessIdentity = {
+        ...rootIdentity,
+        subject: "local:qa:maker",
+        sessionId: "session-maker-live-authorization",
+        workspaceAdministrator: false,
+      };
+      let releaseAccessActive = true;
+      const liveQaIam = QaIam.QaIam.of({
+        authorizeConversation: (input: AuthorizeConversationInput) =>
+          Effect.suspend(() =>
+            releaseAccessActive
+              ? Effect.succeed(
+                  qaConversationAccess(
+                    input.subject,
+                    ThreadId.make(input.conversationThreadId),
+                    input.environmentId,
+                  ),
+                )
+              : Effect.fail(
+                  new QaIam.QaIamError({
+                    code: "project_access_denied",
+                    message: "The principal is no longer assigned to this QA project.",
+                  }),
+                ),
+          ),
+      } as unknown as QaIam.QaIam["Service"]);
+      const broker = yield* makeBrokerWithQaIam(liveQaIam);
+      const requests = requestsFrom(yield* broker.connect(makeHost(), makerIdentity));
+      let routedRequests = 0;
+      yield* Stream.runForEach(requests, (request) => {
+        routedRequests += 1;
+        return broker.respond(
+          {
+            clientId: "client-1",
+            connectionId: request.connectionId,
+            requestId: request.requestId,
+            ok: true,
+            result: "authorized",
+          },
+          makerIdentity,
+        );
+      }).pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+
+      const qaScope = {
+        ...scope,
+        principalSubject: makerIdentity.subject,
+        workspaceAdministrator: false,
+        qaPrincipalSubject: makerIdentity.subject,
+        qaReleaseThreadId: ThreadId.make("release-1"),
+        providerSessionId: "provider-session-live-authorization",
+      };
+      expect(yield* broker.invoke<string>({ scope: qaScope, operation: "status", input: {} })).toBe(
+        "authorized",
+      );
+
+      releaseAccessActive = false;
+      const result = yield* broker
+        .invoke<void>({ scope: qaScope, operation: "status", input: {} })
+        .pipe(Effect.result);
+
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toBeInstanceOf(PreviewAutomationUnavailableError);
+      }
+      expect(routedRequests).toBe(1);
+    }),
+  ),
+);
+
+it.effect("rejects stale QA release bindings before routing automation", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* makeBroker;
+      const makerIdentity: PreviewAccessIdentity = {
+        ...rootIdentity,
+        subject: "local:qa:maker",
+        sessionId: "session-maker-stale-binding",
+        workspaceAdministrator: false,
+      };
+      let routedRequests = 0;
+      const requests = requestsFrom(yield* broker.connect(makeHost(), makerIdentity));
+      yield* Stream.runForEach(requests, () => {
+        routedRequests += 1;
+        return Effect.void;
+      }).pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+
+      const result = yield* broker
+        .invoke<void>({
+          scope: {
+            ...scope,
+            principalSubject: makerIdentity.subject,
+            workspaceAdministrator: false,
+            qaPrincipalSubject: makerIdentity.subject,
+            qaReleaseThreadId: ThreadId.make("release-stale"),
+            providerSessionId: "provider-session-stale-binding",
+          },
+          operation: "status",
+          input: {},
+        })
+        .pipe(Effect.result);
+
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toBeInstanceOf(PreviewAutomationUnavailableError);
+      }
+      expect(routedRequests).toBe(0);
+    }),
+  ),
+);
+
+it.effect("ignores automation responses from a different authenticated session", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* makeBroker;
+      const events = requestsFrom(yield* broker.connect(makeHost(), rootIdentity));
+      yield* Stream.runForEach(events, (request) =>
+        broker
+          .respond(
+            {
+              clientId: "client-1",
+              connectionId: request.connectionId,
+              requestId: request.requestId,
+              ok: true,
+              result: "forged",
+            },
+            { ...rootIdentity, sessionId: "session-foreign" },
+          )
+          .pipe(
+            Effect.andThen(
+              broker.respond(
+                {
+                  clientId: "client-1",
+                  connectionId: request.connectionId,
+                  requestId: request.requestId,
+                  ok: true,
+                  result: "owner",
+                },
+                rootIdentity,
+              ),
+            ),
+          ),
+      ).pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+
+      expect(yield* broker.invoke<string>({ scope, operation: "status", input: {} })).toBe("owner");
     }),
   ),
 );

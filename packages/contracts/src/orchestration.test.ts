@@ -5,6 +5,7 @@ import * as Schema from "effect/Schema";
 import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
+  ClientOrchestrationCommand,
   ModelSelection,
   OrchestrationCommand,
   OrchestrationEvent,
@@ -47,6 +48,7 @@ function getOptionValue(
 }
 const decodeThreadCreatedPayload = Schema.decodeUnknownEffect(ThreadCreatedPayload);
 const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationCommand);
+const decodeClientOrchestrationCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(ThreadMetaUpdatedPayload);
 
@@ -214,11 +216,34 @@ it.effect("decodes thread.turn.start defaults for provider and runtime mode", ()
         text: "hello",
         attachments: [],
       },
+      initiatingSessionId: "session-root",
       createdAt: "2026-01-01T00:00:00.000Z",
     });
     assert.strictEqual(parsed.modelSelection, undefined);
     assert.strictEqual(parsed.runtimeMode, DEFAULT_RUNTIME_MODE);
     assert.strictEqual(parsed.interactionMode, DEFAULT_PROVIDER_INTERACTION_MODE);
+  }),
+);
+
+it.effect("strips client-supplied authenticated session provenance from turn starts", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decodeClientOrchestrationCommand({
+      type: "thread.turn.start",
+      commandId: "cmd-client-provenance",
+      threadId: "thread-1",
+      message: {
+        messageId: "msg-client-provenance",
+        role: "user",
+        text: "hello",
+        attachments: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      initiatingSessionId: "attacker-selected-session",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    assert.strictEqual("initiatingSessionId" in parsed, false);
   }),
 );
 
@@ -239,6 +264,7 @@ it.effect("preserves explicit provider and runtime mode in thread.turn.start", (
         model: "gpt-5.4",
       },
       runtimeMode: "full-access",
+      initiatingSessionId: "session-root",
       createdAt: "2026-01-01T00:00:00.000Z",
     });
     assert.strictEqual(parsed.modelSelection?.instanceId, "codex");
@@ -281,6 +307,7 @@ it.effect("accepts bootstrap metadata in thread.turn.start", () =>
         },
         runSetupScript: true,
       },
+      initiatingSessionId: "session-root",
       createdAt: "2026-01-01T00:00:00.000Z",
     });
     assert.strictEqual(parsed.bootstrap?.createThread?.projectId, "project-1");
@@ -408,6 +435,7 @@ it.effect("accepts provider-scoped model options in thread.turn.start", () =>
           { id: "fastMode", value: true },
         ],
       },
+      initiatingSessionId: "session-root",
       createdAt: "2026-01-01T00:00:00.000Z",
     });
     assert.strictEqual(parsed.modelSelection?.instanceId, "codex");
@@ -507,6 +535,7 @@ it.effect("accepts a title seed in thread.turn.start", () =>
         attachments: [],
       },
       titleSeed: "Investigate reconnect failures",
+      initiatingSessionId: "session-root",
       createdAt: "2026-01-01T00:00:00.000Z",
     });
     assert.strictEqual(parsed.titleSeed, "Investigate reconnect failures");
@@ -529,6 +558,7 @@ it.effect("accepts a source proposed plan reference in thread.turn.start", () =>
         threadId: "thread-1",
         planId: "plan-1",
       },
+      initiatingSessionId: "session-root",
       createdAt: "2026-01-01T00:00:00.000Z",
     });
     assert.deepStrictEqual(parsed.sourceProposedPlan, {

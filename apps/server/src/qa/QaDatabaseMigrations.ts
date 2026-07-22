@@ -1,9 +1,11 @@
 import * as Effect from "effect/Effect";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 
-import { migrateQaIamDatabase } from "./QaIamMigrations.ts";
+import { migrateQaIamDatabaseUnderLock } from "./QaIamMigrations.ts";
 
-export const migrateQaDatabase = Effect.fn("QaDatabase.migrate")(function* (
+export const QA_POSTGRES_MIGRATION_LOCK_KEY = 1_940_718_351;
+
+const migrateQaDatabaseUnderLock = Effect.fn("QaDatabase.migrateUnderLock")(function* (
   sql: SqlClient.SqlClient,
 ) {
   yield* sql`CREATE SCHEMA IF NOT EXISTS t3_qa`;
@@ -56,12 +58,18 @@ export const migrateQaDatabase = Effect.fn("QaDatabase.migrate")(function* (
       )),
       progress INTEGER NOT NULL CHECK (progress BETWEEN 0 AND 100),
       active_job_id TEXT,
+      active_environment_id TEXT,
+      active_conversation_thread_id TEXT,
+      active_provider_session_id TEXT,
       blocked_reason TEXT,
       updated_at TEXT NOT NULL,
       PRIMARY KEY (thread_id, stage),
       UNIQUE (thread_id, ordinal)
     )
   `;
+  yield* sql`ALTER TABLE qa_stage_states ADD COLUMN IF NOT EXISTS active_environment_id TEXT`;
+  yield* sql`ALTER TABLE qa_stage_states ADD COLUMN IF NOT EXISTS active_conversation_thread_id TEXT`;
+  yield* sql`ALTER TABLE qa_stage_states ADD COLUMN IF NOT EXISTS active_provider_session_id TEXT`;
   yield* sql`
     CREATE TABLE IF NOT EXISTS qa_requirements (
       id TEXT PRIMARY KEY,
@@ -218,7 +226,19 @@ export const migrateQaDatabase = Effect.fn("QaDatabase.migrate")(function* (
   yield* createApprovalReviewTables(sql);
   yield* backfillTraceabilityParentEdges(sql);
   yield* createIndexes(sql);
-  yield* migrateQaIamDatabase(sql);
+  yield* migrateQaIamDatabaseUnderLock(sql);
+});
+
+/** Serializes and atomically applies the complete PostgreSQL QA schema pipeline. */
+export const migrateQaDatabase = Effect.fn("QaDatabase.migrate")(function* (
+  sql: SqlClient.SqlClient,
+) {
+  yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* sql`SELECT pg_advisory_xact_lock(${QA_POSTGRES_MIGRATION_LOCK_KEY})`;
+      yield* migrateQaDatabaseUnderLock(sql);
+    }),
+  );
 });
 
 const backfillTraceabilityParentEdges = Effect.fn("QaDatabase.backfillTraceabilityParentEdges")(

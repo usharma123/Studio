@@ -1,10 +1,44 @@
 import { it } from "@effect/vitest";
-import { type PreviewEvent, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, type PreviewEvent, ThreadId } from "@t3tools/contracts";
 import { PreviewUrlNormalizationError } from "@t3tools/shared/preview";
 import { Effect, PubSub } from "effect";
 import { expect } from "vite-plus/test";
 
-import * as PreviewManager from "./Manager.ts";
+import * as RawPreviewManager from "./Manager.ts";
+import type { PreviewAccessGrant } from "./Access.ts";
+
+const testAccess = (threadId: string): PreviewAccessGrant => ({
+  identity: {
+    subject: "local:root",
+    sessionId: "preview-manager-test",
+    environmentId: EnvironmentId.make("preview-manager-test"),
+    workspaceAdministrator: true,
+  },
+  descriptor: { kind: "workspace", ownerSubject: `test:${threadId}` },
+});
+
+const PreviewManager = {
+  ...RawPreviewManager,
+  PreviewManager: RawPreviewManager.PreviewManager.pipe(
+    Effect.map((manager) => ({
+      ...manager,
+      open: (input: Parameters<typeof manager.open>[0]) =>
+        manager.open(input, testAccess(input.threadId)),
+      navigate: (input: Parameters<typeof manager.navigate>[0]) =>
+        manager.navigate(input, testAccess(input.threadId)),
+      reportStatus: (input: Parameters<typeof manager.reportStatus>[0]) =>
+        manager.reportStatus(input, testAccess(input.threadId)),
+      resize: (input: Parameters<typeof manager.resize>[0]) =>
+        manager.resize(input, testAccess(input.threadId)),
+      refresh: (input: Parameters<typeof manager.refresh>[0]) =>
+        manager.refresh(input, testAccess(input.threadId)),
+      close: (input: Parameters<typeof manager.close>[0]) =>
+        manager.close(input, testAccess(input.threadId)),
+      list: (input: Parameters<typeof manager.list>[0]) =>
+        manager.list(input, testAccess(input.threadId)),
+    })),
+  ),
+};
 
 const DRAIN_LIMIT = 100;
 
@@ -30,7 +64,9 @@ const collectEvents = Effect.gen(function* () {
   const manager = yield* PreviewManager.PreviewManager;
   const subscription = yield* manager.subscribeEvents;
   const collector: EventCollector = {
-    drain: PubSub.takeUpTo(subscription, DRAIN_LIMIT),
+    drain: PubSub.takeUpTo(subscription, DRAIN_LIMIT).pipe(
+      Effect.map((envelopes) => envelopes.map((envelope) => envelope.event)),
+    ),
   };
   return collector;
 }).pipe(Effect.withSpan("preview.test.collectEvents"));
@@ -334,8 +370,42 @@ it.layer(PreviewManager.layer)("PreviewManager", (it) => {
 
       const aEvents = yield* PubSub.takeUpTo(aSub, DRAIN_LIMIT);
       const bEvents = yield* PubSub.takeUpTo(bSub, DRAIN_LIMIT);
-      expect(aEvents.map((e) => e.type)).toEqual(["opened", "opened"]);
-      expect(bEvents.map((e) => e.type)).toEqual(["opened", "opened"]);
+      expect(aEvents.map((e) => e.event.type)).toEqual(["opened", "opened"]);
+      expect(bEvents.map((e) => e.event.type)).toEqual(["opened", "opened"]);
+    }),
+  );
+
+  it.effect("keeps foreign principals from listing or mutating an owned preview", () =>
+    Effect.gen(function* () {
+      const manager = yield* RawPreviewManager.PreviewManager;
+      const threadId = freshThreadId();
+      const owner: PreviewAccessGrant = {
+        identity: {
+          subject: "local:qa:maker",
+          sessionId: "session-maker",
+          environmentId: EnvironmentId.make("preview-manager-test"),
+          workspaceAdministrator: false,
+        },
+        descriptor: { kind: "workspace", ownerSubject: "local:qa:maker" },
+      };
+      const foreign: PreviewAccessGrant = {
+        identity: {
+          ...owner.identity,
+          subject: "local:qa:approver",
+          sessionId: "session-approver",
+        },
+        descriptor: { kind: "workspace", ownerSubject: "local:qa:approver" },
+      };
+      const opened = yield* manager.open({ threadId, url: "http://localhost:5173" }, owner);
+
+      expect((yield* manager.list({ threadId }, foreign)).sessions).toEqual([]);
+      const error = yield* manager
+        .navigate({ threadId, tabId: opened.tabId, url: "http://localhost:5173/foreign" }, foreign)
+        .pipe(Effect.flip);
+      expect(error._tag).toBe("EnvironmentAuthorizationError");
+
+      const listed = yield* manager.list({ threadId }, owner);
+      expect(listed.sessions[0]?.navStatus).toEqual(opened.navStatus);
     }),
   );
 });

@@ -152,6 +152,43 @@ let bootstrapPromise: Promise<ServerAuthGateState> | null = null;
 let resolvedAuthenticatedGateState: ServerAuthGateState | null = null;
 const AUTH_SESSION_ESTABLISH_TIMEOUT_MS = 2_000;
 const AUTH_SESSION_ESTABLISH_STEP_MS = 100;
+const AUTHENTICATED_SUBJECT_STORAGE_KEY = "t3code:authenticated-subject:v1";
+const CONNECTION_RUNTIME_DATABASE_NAME = "t3code:connection-runtime";
+
+function deleteConnectionRuntimeDatabase(): Promise<void> {
+  if (typeof indexedDB === "undefined") {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.deleteDatabase(CONNECTION_RUNTIME_DATABASE_NAME);
+    request.addEventListener("success", () => resolve(), { once: true });
+    request.addEventListener(
+      "error",
+      () => reject(request.error ?? new Error("Failed to clear the connection runtime cache.")),
+      { once: true },
+    );
+    request.addEventListener(
+      "blocked",
+      () => reject(new Error("The connection runtime cache is still open.")),
+      { once: true },
+    );
+  });
+}
+
+async function synchronizeAuthenticatedSubject(subject: string | undefined): Promise<void> {
+  if (subject === undefined || typeof window === "undefined" || !window.localStorage) {
+    return;
+  }
+
+  const previousSubject = window.localStorage.getItem(AUTHENTICATED_SUBJECT_STORAGE_KEY);
+  if (previousSubject !== null && previousSubject !== subject) {
+    window.localStorage.clear();
+    window.sessionStorage?.clear();
+    await deleteConnectionRuntimeDatabase();
+  }
+  window.localStorage.setItem(AUTHENTICATED_SUBJECT_STORAGE_KEY, subject);
+}
 
 export function peekPairingTokenFromUrl(): string | null {
   return getPairingTokenFromUrl(new URL(window.location.href));
@@ -320,7 +357,8 @@ function isTransientBootstrapError(error: unknown): boolean {
 async function bootstrapServerAuth(): Promise<ServerAuthGateState> {
   const bootstrapCredential = getDesktopBootstrapCredential();
   const currentSession = await fetchSessionState();
-  if (currentSession.authenticated) {
+  if (currentSession.authenticated && !bootstrapCredential) {
+    await synchronizeAuthenticatedSubject(currentSession.subject);
     return { status: "authenticated" };
   }
 
@@ -332,8 +370,9 @@ async function bootstrapServerAuth(): Promise<ServerAuthGateState> {
   }
 
   try {
-    await exchangeBootstrapCredential(bootstrapCredential);
-    await waitForAuthenticatedSessionAfterBootstrap();
+    const exchanged = await exchangeBootstrapCredential(bootstrapCredential);
+    const session = await waitForAuthenticatedSessionAfterBootstrap();
+    await synchronizeAuthenticatedSubject(session.subject ?? exchanged.subject);
     return { status: "authenticated" };
   } catch (error) {
     return {
@@ -353,7 +392,8 @@ export async function submitServerAuthCredential(credential: string): Promise<vo
   }
 
   resolvedAuthenticatedGateState = null;
-  await exchangeBootstrapCredential(trimmedCredential);
+  const exchanged = await exchangeBootstrapCredential(trimmedCredential);
+  await synchronizeAuthenticatedSubject(exchanged.subject);
   bootstrapPromise = null;
   stripPairingTokenFromUrl();
 }

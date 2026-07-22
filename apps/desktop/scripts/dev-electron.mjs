@@ -1,10 +1,15 @@
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
-import * as NodePath from "node:path";
 
 import {
+  cleanupStaleDevelopmentApps,
+  resolveDevelopmentProcessIdentity,
+} from "./dev-electron-process.mjs";
+import {
   desktopDir,
+  resolveDevelopmentArtifactPaths,
+  resolveDevelopmentWatchTargets,
   resolveDevelopmentUserDataPath,
   resolveDevProtocolClient,
   resolveElectronLaunchCommand,
@@ -22,26 +27,31 @@ if (!Number.isInteger(port) || port <= 0) {
   throw new Error(`VITE_DEV_SERVER_URL must include an explicit port: ${devServerUrl}`);
 }
 
+const artifactPaths = resolveDevelopmentArtifactPaths();
 const requiredFiles = [
-  "dist-electron/main.cjs",
-  "dist-electron/preload.cjs",
-  "../server/dist/bin.mjs",
+  artifactPaths.mainEntryPath,
+  artifactPaths.preloadPath,
+  artifactPaths.backendEntryPath,
 ];
-const watchedDirectories = [
-  { directory: "dist-electron", files: new Set(["main.cjs", "preload.cjs"]) },
-  { directory: "../server/dist", files: new Set(["bin.mjs"]) },
-];
+const watchedDirectories = resolveDevelopmentWatchTargets(artifactPaths);
 const forcedShutdownTimeoutMs = 1_500;
 const restartDebounceMs = 120;
 const childTreeGracePeriodMs = 1_200;
 const remoteDebuggingPort = process.env.T3CODE_DESKTOP_REMOTE_DEBUGGING_PORT?.trim();
 const devProfile = process.env.T3CODE_DEV_PROFILE?.trim();
+const devInstance = process.env.T3CODE_DEV_INSTANCE?.trim() || undefined;
 const allowedDevProfiles = new Set(["root", "qa:maker", "qa:approver"]);
 if (devProfile !== undefined && !allowedDevProfiles.has(devProfile)) {
   throw new Error(`Invalid T3CODE_DEV_PROFILE: ${devProfile}`);
 }
 // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone dev script has no Effect runtime.
 const hostPlatform = NodeOS.platform();
+const processIdentity = resolveDevelopmentProcessIdentity({
+  desktopRoot: desktopDir,
+  userDataPath: resolveDevelopmentUserDataPath(),
+  developmentProfile: devProfile,
+  developmentInstance: devInstance,
+});
 
 await waitForResources({
   baseDir: desktopDir,
@@ -74,18 +84,7 @@ function killChildTreeByPid(pid, signal) {
 }
 
 function cleanupStaleDevApps() {
-  if (hostPlatform === "win32") {
-    return;
-  }
-
-  const profileMarker = devProfile ? `.*--t3code-dev-profile=${devProfile}` : "";
-  NodeChildProcess.spawnSync(
-    "pkill",
-    ["-f", "--", `--t3code-dev-root=${desktopDir}${profileMarker}`],
-    {
-      stdio: "ignore",
-    },
-  );
+  cleanupStaleDevelopmentApps({ hostPlatform, processIdentity });
 }
 
 function startApp() {
@@ -96,16 +95,18 @@ function startApp() {
   const electronArgs = remoteDebuggingPort
     ? [`--remote-debugging-port=${remoteDebuggingPort}`]
     : [];
-  const userDataArg = `--user-data-dir=${resolveDevelopmentUserDataPath()}`;
-  const profileArgs = devProfile ? [`--t3code-dev-profile=${devProfile}`] : [];
+  const launchIdentityArgs = [
+    ...processIdentity.profileArguments,
+    processIdentity.instanceArgument,
+  ];
   const launchArgs = devProtocolClient
-    ? [...electronArgs, ...profileArgs]
+    ? [...electronArgs, ...launchIdentityArgs]
     : [
         ...electronArgs,
-        userDataArg,
-        `--t3code-dev-root=${desktopDir}`,
-        ...profileArgs,
-        "dist-electron/main.cjs",
+        processIdentity.userDataArgument,
+        processIdentity.desktopRootArgument,
+        ...launchIdentityArgs,
+        artifactPaths.mainEntryPath,
       ];
   const electronCommand = resolveElectronLaunchCommand(launchArgs);
   const app = NodeChildProcess.spawn(electronCommand.electronPath, electronCommand.args, {
@@ -201,17 +202,13 @@ function scheduleRestart() {
 
 function startWatchers() {
   for (const { directory, files } of watchedDirectories) {
-    const watcher = NodeFS.watch(
-      NodePath.join(desktopDir, directory),
-      { persistent: true },
-      (_eventType, filename) => {
-        if (typeof filename !== "string" || !files.has(filename)) {
-          return;
-        }
+    const watcher = NodeFS.watch(directory, { persistent: true }, (_eventType, filename) => {
+      if (typeof filename !== "string" || !files.has(filename)) {
+        return;
+      }
 
-        scheduleRestart();
-      },
-    );
+      scheduleRestart();
+    });
 
     watchers.push(watcher);
   }

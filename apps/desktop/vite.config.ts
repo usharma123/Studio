@@ -1,9 +1,15 @@
+// @effect-diagnostics nodeBuiltinImport:off - Vite resolves the configured pack output before an Effect runtime exists.
 import { defineConfig } from "vite-plus";
+import * as NodePath from "node:path";
 
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
 
 const repoEnv = loadRepoEnv();
 const shouldLaunchElectronAfterPack = process.env.T3CODE_DESKTOP_DEV === "1";
+const desktopOutputDir = NodePath.resolve(
+  import.meta.dirname,
+  process.env.T3CODE_DESKTOP_OUTPUT_DIR?.trim() || "dist-electron",
+);
 const publicConfigDefine = {
   __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: JSON.stringify(
     repoEnv.T3CODE_CLERK_PUBLISHABLE_KEY?.trim() ?? "",
@@ -21,16 +27,20 @@ export default defineConfig({
       dev: {
         command:
           "node scripts/build-preview-annotation-css.mjs && cross-env T3CODE_DESKTOP_DEV=1 vp pack --watch",
-        dependsOn: ["t3#build"],
+        dependsOn: ["t3#build:desktop-dev"],
         cache: false,
       },
       "dev:bundle": {
         command: "node scripts/build-preview-annotation-css.mjs && vp pack --watch",
         cache: false,
       },
+      "dev:desktop-shared": {
+        command: "node scripts/build-preview-annotation-css.mjs && vp pack --watch",
+        cache: false,
+      },
       "dev:electron": {
         command: "node scripts/dev-electron.mjs",
-        dependsOn: ["t3#build"],
+        dependsOn: ["t3#build:desktop-dev"],
         cache: false,
       },
     },
@@ -38,7 +48,7 @@ export default defineConfig({
   pack: [
     {
       format: "cjs",
-      outDir: "dist-electron",
+      outDir: desktopOutputDir,
       sourcemap: true,
       outExtensions: () => ({ js: ".cjs" }),
       define: publicConfigDefine,
@@ -51,7 +61,7 @@ export default defineConfig({
     },
     {
       format: "cjs",
-      outDir: "dist-electron",
+      outDir: desktopOutputDir,
       sourcemap: true,
       outExtensions: () => ({ js: ".cjs" }),
       define: publicConfigDefine,
@@ -65,7 +75,7 @@ export default defineConfig({
     },
     {
       format: "cjs",
-      outDir: "dist-electron",
+      outDir: desktopOutputDir,
       sourcemap: true,
       outExtensions: () => ({ js: ".cjs" }),
       entry: ["src/preview-pick-preload.ts"],

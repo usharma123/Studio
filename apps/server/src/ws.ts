@@ -4,15 +4,15 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
-import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import {
+  DEFAULT_MODEL,
+  DEFAULT_RUNTIME_MODE,
   DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -26,14 +26,13 @@ import {
   AuthTerminalOperateScope,
   AuthAccessReadScope,
   AuthAccessStreamError,
-  DEFAULT_MODEL,
-  DEFAULT_RUNTIME_MODE,
   type AuthAccessStreamEvent,
   type AuthEnvironmentScope,
   AuthSessionId,
   CommandId,
   type DiscoveredLocalServerList,
   EventId,
+  MessageId,
   type OrchestrationCommand,
   type GitActionProgressEvent,
   type GitManagerServiceError,
@@ -44,7 +43,7 @@ import {
   type OrchestrationThreadStreamItem,
   QaOperationError,
   ProjectId,
-  ProviderInstanceId,
+  QaReleaseId,
   type QaReviewActor,
   type QaReleaseSnapshot,
   OrchestrationGetFullThreadDiffError,
@@ -58,6 +57,7 @@ import {
   ProjectReadFileError,
   ProjectSearchEntriesError,
   ProjectWriteFileError,
+  ProviderInstanceId,
   RelayClientInstallFailedError,
   type RelayClientInstallProgressEvent,
   OrchestrationReplayEventsError,
@@ -75,7 +75,12 @@ import {
   WsRpcGroup,
 } from "@t3tools/contracts";
 import { clamp } from "effect/Number";
-import { HttpRouter, HttpServerRequest, HttpServerRespondable } from "effect/unstable/http";
+import {
+  HttpRouter,
+  HttpServerRequest,
+  HttpServerRespondable,
+  HttpServerResponse,
+} from "effect/unstable/http";
 import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
 
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
@@ -98,6 +103,8 @@ import * as ServerSettings from "./serverSettings.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as PreviewManager from "./preview/Manager.ts";
+import { makePreviewAuthorization } from "./preview/Authorization.ts";
+import type { PreviewAccessIdentity } from "./preview/Access.ts";
 import { issueAssetUrl } from "./assets/AssetAccess.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
@@ -127,30 +134,23 @@ import * as VcsProjectConfig from "./vcs/VcsProjectConfig.ts";
 import * as VcsProcess from "./vcs/VcsProcess.ts";
 import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
 import * as SessionStore from "./auth/SessionStore.ts";
+import { reauthorizeStreamItems } from "./auth/LiveAuthorization.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
+import { buildQaStageKickoffPrompt } from "@t3tools/shared/qaOrchestration";
 import * as QaWorkflow from "./qa/QaWorkflow.ts";
 import * as QaDashboardQuery from "./qa/QaDashboardQuery.ts";
 import * as QaIam from "./qa/QaIam.ts";
 import * as QaDatabase from "./qa/QaDatabase.ts";
 import * as QaReleaseEventBus from "./qa/QaReleaseEventBus.ts";
+import { subscribeAssignedReleaseDashboard } from "./qa/QaAssignedReleaseDashboardStream.ts";
 import * as QaReviewService from "./qa/QaReviewService.ts";
-import { buildQaProjectWorkspaceRoot } from "./qa/QaProjectWorkspace.ts";
+import * as QaLocalRuntime from "./qa/QaLocalRuntime.ts";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 const isEnvironmentAuthorizationError = Schema.is(EnvironmentAuthorizationError);
 const isQaOperationError = Schema.is(QaOperationError);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
-
-function isPathWithin(path: Path.Path, parent: string, child: string): boolean {
-  const relative = path.relative(parent, child);
-  return (
-    relative.length > 0 &&
-    relative !== ".." &&
-    !relative.startsWith(`..${path.sep}`) &&
-    !path.isAbsolute(relative)
-  );
-}
 
 function unexpectedCompatibilityError(error: never): never {
   throw new Error(`Unhandled compatibility error: ${String(error)}`);
@@ -355,9 +355,12 @@ const RPC_REQUIRED_SCOPE = new Map<string, RpcRequiredScope>([
   [WS_METHODS.sourceControlCloneRepository, AuthOrchestrationOperateScope],
   [WS_METHODS.sourceControlPublishRepository, AuthOrchestrationOperateScope],
   [WS_METHODS.qaListAssignedReleases, AuthQaReadScope],
+  [WS_METHODS.qaSubscribeAssignedReleases, AuthQaReadScope],
   [WS_METHODS.qaGetReleaseAccess, AuthQaReadScope],
   [WS_METHODS.qaGetSnapshot, AuthQaReadScope],
   [WS_METHODS.qaCreateProject, AuthQaMakeScope],
+  [WS_METHODS.qaEnsureReleaseConversation, AuthQaChatScope],
+  [WS_METHODS.qaStartStageGeneration, AuthQaMakeScope],
   [WS_METHODS.qaInitializeRelease, AuthQaMakeScope],
   [WS_METHODS.qaUploadDocument, AuthQaMakeScope],
   [WS_METHODS.qaStartIngestion, AuthQaMakeScope],
@@ -432,10 +435,7 @@ const RPC_REQUIRED_SCOPE = new Map<string, RpcRequiredScope>([
   [WS_METHODS.previewAutomationRespond, AuthPreviewOperateScope],
   [WS_METHODS.previewAutomationFocusHost, AuthPreviewOperateScope],
   [WS_METHODS.subscribePreviewEvents, AuthPreviewOperateScope],
-  [
-    WS_METHODS.subscribeDiscoveredLocalServers,
-    [AuthOrchestrationReadScope, AuthPreviewOperateScope],
-  ],
+  [WS_METHODS.subscribeDiscoveredLocalServers, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeServerConfig, [AuthOrchestrationReadScope, AuthQaReadScope]],
   [WS_METHODS.subscribeServerLifecycle, [AuthOrchestrationReadScope, AuthQaReadScope]],
   [WS_METHODS.subscribeAuthAccess, AuthAccessReadScope],
@@ -448,6 +448,12 @@ export const requiredScopesForRpcMethod = (method: string): ReadonlyArray<AuthEn
   }
   return typeof requiredScope === "string" ? [requiredScope] : requiredScope;
 };
+
+export const redactServerConfigPathForScopes = (
+  scopes: ReadonlyArray<AuthEnvironmentScope>,
+  path: string,
+  redactedLabel: "workspace" | "settings" | "logs",
+): string => (scopes.includes(AuthOrchestrationReadScope) ? path : redactedLabel);
 
 function toAuthAccessStreamEvent(
   change: PairingGrantStore.BootstrapCredentialChange | SessionStore.SessionCredentialChange,
@@ -498,9 +504,6 @@ const makeWsRpcLayer = (
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
       const crypto = yield* Crypto.Crypto;
-      const fileSystem = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
       const checkpointDiffQuery = yield* CheckpointDiffQuery.CheckpointDiffQuery;
@@ -525,6 +528,7 @@ const makeWsRpcLayer = (
       const repositoryIdentityResolver =
         yield* RepositoryIdentityResolver.RepositoryIdentityResolver;
       const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
+      const environmentId = yield* serverEnvironment.getEnvironmentId;
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
       const sourceControlDiscovery = yield* SourceControlDiscovery.SourceControlDiscovery;
       const automaticGitFetchInterval = serverSettings.getSettings.pipe(
@@ -547,6 +551,22 @@ const makeWsRpcLayer = (
       const qaReviewService = yield* QaReviewService.QaReviewService;
       const qaIam = yield* QaIam.QaIam;
       const qaDatabase = yield* QaDatabase.QaDatabase;
+      const previewIdentity: PreviewAccessIdentity = {
+        subject: currentSession.subject,
+        sessionId: currentSession.sessionId,
+        environmentId,
+        workspaceAdministrator: currentSession.subject === "local:root",
+      };
+      const previewAuthorization = makePreviewAuthorization({
+        identity: previewIdentity,
+        iam: qaIam,
+        manager: previewManager,
+      });
+      const qaLocalRuntime = yield* QaLocalRuntime.QaLocalRuntime;
+      const qaAgentModelSelection = {
+        instanceId: ProviderInstanceId.make("codex"),
+        model: DEFAULT_MODEL,
+      } as const;
       const publishQaSnapshot = (
         reason:
           | "stage_started"
@@ -561,6 +581,7 @@ const makeWsRpcLayer = (
           Effect.flatMap((at) =>
             qaReleaseEventBus.publish({
               type: "updated",
+              releaseId: snapshot.releaseId,
               threadId: snapshot.threadId,
               revision: snapshot.revision,
               reason,
@@ -583,6 +604,14 @@ const makeWsRpcLayer = (
                 ),
           ),
         );
+      const mapQaLocalRuntimeError = (cause: QaLocalRuntime.QaLocalRuntimeError) =>
+        new QaOperationError({
+          code:
+            cause.code === "identity_collision" || cause.code === "stale_runtime"
+              ? "invalid_workflow_state"
+              : "persistence_failed",
+          message: cause.message,
+        });
       const publishReviewMutation = <A, R>(
         threadId: ThreadId,
         effect: Effect.Effect<A, QaReviewService.QaReviewError, R>,
@@ -601,40 +630,79 @@ const makeWsRpcLayer = (
           message: `The authenticated token is missing required scope: ${requiredScope}.`,
           requiredScope,
         });
+      const inactiveSessionAuthorizationError = (requiredScope: AuthEnvironmentScope) =>
+        new EnvironmentAuthorizationError({
+          message: "The authenticated session is no longer active.",
+          requiredScope,
+        });
       const hasRequiredScope = (requiredScope: RpcRequiredScope) =>
         typeof requiredScope === "string"
           ? currentSession.scopes.includes(requiredScope)
           : requiredScope.some((scope) => currentSession.scopes.includes(scope));
       const firstRequiredScope = (requiredScope: RpcRequiredScope) =>
         typeof requiredScope === "string" ? requiredScope : requiredScope[0]!;
+      const assertCurrentSessionActive = (requiredScope: RpcRequiredScope) =>
+        sessions
+          .assertActive(currentSessionId)
+          .pipe(
+            Effect.mapError(() =>
+              inactiveSessionAuthorizationError(firstRequiredScope(requiredScope)),
+            ),
+          );
       const isQaChatOnlySession =
         currentSession.scopes.includes(AuthQaChatScope) &&
         !currentSession.scopes.includes(AuthOrchestrationOperateScope);
+      const requireQaConversationAccessIfBound = (threadId: ThreadId) =>
+        isQaChatOnlySession
+          ? qaIam
+              .authorizeConversation({
+                subject: currentSession.subject,
+                conversationThreadId: threadId,
+                environmentId,
+                capability: "qa:chat",
+              })
+              .pipe(Effect.as(true))
+          : qaIam
+              .resolveConversationContext({
+                conversationThreadId: threadId,
+                environmentId,
+              })
+              .pipe(
+                Effect.map(Option.some),
+                Effect.catch((cause) =>
+                  cause.code === "conversation_not_found"
+                    ? Effect.succeed(Option.none<QaIam.QaConversationAccess>())
+                    : Effect.fail(cause),
+                ),
+                Effect.flatMap(
+                  Option.match({
+                    onNone: () => Effect.succeed(false),
+                    onSome: () =>
+                      qaIam
+                        .authorizeConversation({
+                          subject: currentSession.subject,
+                          conversationThreadId: threadId,
+                          environmentId,
+                          capability: "qa:chat",
+                        })
+                        .pipe(Effect.as(true)),
+                  }),
+                ),
+              );
       const authorizeQaConversationThread = (threadId: ThreadId) =>
-        qaIam
-          .authorizeConversation({
-            subject: currentSession.subject,
-            conversationThreadId: threadId,
-            capability: "qa:chat",
-          })
-          .pipe(
-            Effect.mapError(
-              (cause) =>
-                new OrchestrationDispatchCommandError({
-                  message:
-                    "The authenticated QA principal cannot access this release conversation.",
-                  cause,
-                }),
-            ),
-          );
+        requireQaConversationAccessIfBound(threadId).pipe(
+          Effect.mapError(
+            (cause) =>
+              new OrchestrationDispatchCommandError({
+                message: "The authenticated QA principal cannot access this release conversation.",
+                cause,
+              }),
+          ),
+        );
       const authorizeQaConversationSubscription = (threadId: ThreadId) =>
-        qaIam
-          .authorizeConversation({
-            subject: currentSession.subject,
-            conversationThreadId: threadId,
-            capability: "qa:chat",
-          })
-          .pipe(Effect.mapError(() => authorizationError(AuthQaChatScope)));
+        requireQaConversationAccessIfBound(threadId).pipe(
+          Effect.mapError(() => authorizationError(AuthQaChatScope)),
+        );
       const mapQaProjectRegistrationError = (cause: QaIam.QaIamError) =>
         cause.code === "project_access_denied" || cause.code === "capability_denied"
           ? authorizationError(AuthQaMakeScope)
@@ -700,6 +768,30 @@ const makeWsRpcLayer = (
             ),
             Effect.flatMap(use),
           );
+      const ensureQaReleaseConversation = (
+        releaseId: QaReleaseId,
+        capability: QaIam.QaIamCapability,
+      ) => {
+        const releaseThreadId = ThreadId.make(releaseId);
+        return withQaReleaseAccess(releaseThreadId, capability, (access) =>
+          loadCurrentQaSnapshot(releaseThreadId).pipe(
+            Effect.flatMap((snapshot) =>
+              qaLocalRuntime
+                .ensureConversation({
+                  subject: currentSession.subject,
+                  releaseId,
+                  projectTitle: access.projectName,
+                  releaseTitle: snapshot.title,
+                  modelSelection: qaAgentModelSelection,
+                })
+                .pipe(
+                  Effect.mapError(mapQaLocalRuntimeError),
+                  Effect.map((conversation) => ({ access, conversation, snapshot })),
+                ),
+            ),
+          ),
+        );
+      };
       const reviewActor = (access: QaIam.QaReleaseAccess): QaReviewActor => ({
         principalId: access.principal.id,
         displayName: access.principal.displayName,
@@ -709,16 +801,26 @@ const makeWsRpcLayer = (
         requiredScope: RpcRequiredScope,
         effect: Effect.Effect<A, E, R>,
       ): Effect.Effect<A, E | EnvironmentAuthorizationError, R> =>
-        hasRequiredScope(requiredScope)
-          ? effect
-          : Effect.fail(authorizationError(firstRequiredScope(requiredScope)));
+        assertCurrentSessionActive(requiredScope).pipe(
+          Effect.flatMap(
+            (): Effect.Effect<A, E | EnvironmentAuthorizationError, R> =>
+              hasRequiredScope(requiredScope)
+                ? effect
+                : Effect.fail(authorizationError(firstRequiredScope(requiredScope))),
+          ),
+        );
       const authorizeStream = <A, E, R>(
         requiredScope: RpcRequiredScope,
         stream: Stream.Stream<A, E, R>,
       ): Stream.Stream<A, E | EnvironmentAuthorizationError, R> =>
-        hasRequiredScope(requiredScope)
-          ? stream
-          : Stream.fail(authorizationError(firstRequiredScope(requiredScope)));
+        Stream.unwrap(
+          authorizeEffect(
+            requiredScope,
+            Effect.succeed(
+              reauthorizeStreamItems(stream, () => assertCurrentSessionActive(requiredScope)),
+            ),
+          ),
+        );
       const requiredScopeForMethod = (method: string): RpcRequiredScope => {
         const requiredScopes = requiredScopesForRpcMethod(method);
         return requiredScopes.length === 1 ? requiredScopes[0]! : requiredScopes;
@@ -760,9 +862,40 @@ const makeWsRpcLayer = (
       ) =>
         observeRpcStream(
           method,
-          Stream.unwrap(authorizeQaReleaseEffect(threadId, capability, Effect.succeed(stream))),
+          Stream.unwrap(
+            authorizeQaReleaseEffect(
+              threadId,
+              capability,
+              Effect.succeed(
+                reauthorizeStreamItems(stream, () =>
+                  authorizeQaReleaseEffect(threadId, capability, Effect.void),
+                ),
+              ),
+            ),
+          ),
           { "rpc.aggregate": "qa" },
         );
+      const authorizeQaConversationStream = <A, E, R>(
+        threadId: ThreadId,
+        qaBound: boolean,
+        stream: Stream.Stream<A, E, R>,
+      ): Stream.Stream<A, E | EnvironmentAuthorizationError, R> =>
+        qaBound
+          ? reauthorizeStreamItems(stream, () => authorizeQaConversationSubscription(threadId))
+          : stream;
+      const withPreviewAccess = <A, E, R>(
+        threadId: ThreadId,
+        use: (access: import("./preview/Access.ts").PreviewAccessGrant) => Effect.Effect<A, E, R>,
+      ) => previewAuthorization.authorizeThread(threadId).pipe(Effect.flatMap(use));
+      const authorizedPreviewEvents = previewManager.events.pipe(
+        Stream.filterEffect((envelope) =>
+          previewAuthorization.authorizeDescriptor(envelope.access).pipe(
+            Effect.as(true),
+            Effect.orElseSucceed(() => false),
+          ),
+        ),
+        Stream.map((envelope) => envelope.event),
+      );
       const observeRpcStreamEffect = <A, StreamError, StreamContext, EffectError, EffectContext>(
         method: string,
         effect: Effect.Effect<
@@ -774,7 +907,13 @@ const makeWsRpcLayer = (
       ) =>
         instrumentRpcStreamEffect(
           method,
-          authorizeEffect(requiredScopeForMethod(method), effect),
+          authorizeEffect(requiredScopeForMethod(method), effect).pipe(
+            Effect.map((stream) =>
+              reauthorizeStreamItems(stream, () =>
+                assertCurrentSessionActive(requiredScopeForMethod(method)),
+              ),
+            ),
+          ),
           traceAttributes,
         );
       const toDispatchCommandError = (cause: unknown, fallbackMessage: string) =>
@@ -1167,11 +1306,20 @@ const makeWsRpcLayer = (
       const dispatchNormalizedCommand = (
         normalizedCommand: OrchestrationCommand,
       ): Effect.Effect<{ readonly sequence: number }, OrchestrationDispatchCommandError> => {
+        const authenticatedCommand: OrchestrationCommand =
+          normalizedCommand.type === "thread.turn.start"
+            ? {
+                ...normalizedCommand,
+                // Never preserve authorization provenance supplied by a normal
+                // RPC payload. Bind the command to this authenticated transport.
+                initiatingSessionId: currentSessionId,
+              }
+            : normalizedCommand;
         const dispatchEffect =
-          normalizedCommand.type === "thread.turn.start" && normalizedCommand.bootstrap
-            ? dispatchBootstrapTurnStart(normalizedCommand)
+          authenticatedCommand.type === "thread.turn.start" && authenticatedCommand.bootstrap
+            ? dispatchBootstrapTurnStart(authenticatedCommand)
             : orchestrationEngine
-                .dispatch(normalizedCommand)
+                .dispatch(authenticatedCommand)
                 .pipe(
                   Effect.mapError((cause) =>
                     toDispatchCommandError(cause, "Failed to dispatch orchestration command"),
@@ -1187,131 +1335,14 @@ const makeWsRpcLayer = (
           );
       };
 
-      const compensateQaProjectCreation = (input: {
-        readonly projectId: ProjectId;
-        readonly projectCreated: boolean;
-        readonly workspaceCreated: boolean;
-        readonly workspaceRoot: string | null;
-        readonly workspaceBoundary: string | null;
-      }) =>
-        Effect.gen(function* () {
-          let projectRemoved = !input.projectCreated;
-          if (input.projectCreated) {
-            const rollbackExit = yield* serverCommandId("qa-create-project-rollback").pipe(
-              Effect.flatMap((commandId) =>
-                dispatchNormalizedCommand({
-                  type: "project.delete",
-                  commandId,
-                  projectId: input.projectId,
-                  force: true,
-                }),
-              ),
-              Effect.tapCause(Effect.logError),
-              Effect.exit,
-            );
-            projectRemoved = Exit.isSuccess(rollbackExit);
-          }
-          if (
-            input.projectCreated &&
-            projectRemoved &&
-            input.workspaceCreated &&
-            input.workspaceRoot !== null &&
-            input.workspaceBoundary !== null &&
-            path.basename(input.workspaceBoundary) === ".t3-qa-projects" &&
-            isPathWithin(path, input.workspaceBoundary, input.workspaceRoot)
-          ) {
-            yield* fileSystem.readDirectory(input.workspaceRoot, { recursive: false }).pipe(
-              Effect.flatMap((entries) =>
-                entries.length === 0
-                  ? fileSystem.remove(input.workspaceRoot!, { recursive: true })
-                  : Effect.void,
-              ),
-              Effect.ignoreCause({ log: true }),
-            );
-          }
-        });
-
       const createQaProject = (input: {
         readonly projectId: ProjectId;
-        readonly threadId: ThreadId;
+        readonly releaseId: QaReleaseId;
         readonly projectTitle: string;
         readonly releaseTitle: string;
-      }) => {
-        let projectCreated = false;
-        let workspaceCreated = false;
-        let workspaceRoot: string | null = null;
-        let workspaceBoundary: string | null = null;
-
-        return Effect.gen(function* () {
-          const [createdAt, settings] = yield* Effect.all([
-            nowIso,
-            serverSettings.getSettings.pipe(
-              Effect.mapError(
-                () =>
-                  new QaOperationError({
-                    code: "persistence_failed",
-                    message: "The QA project workspace could not be prepared.",
-                  }),
-              ),
-            ),
-          ]);
-          const requestedWorkspaceRoot = buildQaProjectWorkspaceRoot({
-            baseDirectory: settings.addProjectBaseDirectory,
-            projectTitle: input.projectTitle,
-            projectId: input.projectId,
-            joinPath: path.join,
-          });
-          const workspaceState = yield* workspacePaths
-            .normalizeWorkspaceRoot(requestedWorkspaceRoot)
-            .pipe(
-              Effect.matchEffect({
-                onFailure: (cause) =>
-                  cause._tag === "WorkspaceRootNotExistsError"
-                    ? Effect.succeed({ exists: false, root: cause.normalizedWorkspaceRoot })
-                    : Effect.fail(
-                        new QaOperationError({
-                          code: "persistence_failed",
-                          message: "The QA project workspace could not be prepared.",
-                        }),
-                      ),
-                onSuccess: (root) => Effect.succeed({ exists: true, root }),
-              }),
-            );
-          workspaceCreated = !workspaceState.exists;
-          workspaceRoot = workspaceState.root;
-          workspaceBoundary = path.dirname(workspaceState.root);
-          const modelSelection = {
-            instanceId: ProviderInstanceId.make("codex"),
-            model: DEFAULT_MODEL,
-          } as const;
-          const projectCommand = yield* normalizeDispatchCommand({
-            type: "project.create",
-            commandId: yield* serverCommandId("qa-create-project"),
-            projectId: input.projectId,
-            title: input.projectTitle,
-            workspaceRoot: requestedWorkspaceRoot,
-            createWorkspaceRootIfMissing: true,
-            defaultModelSelection: modelSelection,
-            createdAt,
-          });
-
-          yield* dispatchNormalizedCommand(projectCommand);
-          projectCreated = true;
-          yield* dispatchNormalizedCommand({
-            type: "thread.create",
-            commandId: yield* serverCommandId("qa-create-release-thread"),
-            threadId: input.threadId,
-            projectId: input.projectId,
-            title: input.releaseTitle,
-            modelSelection,
-            runtimeMode: DEFAULT_RUNTIME_MODE,
-            interactionMode: "default",
-            branch: null,
-            worktreePath: null,
-            createdAt,
-          });
-
-          return yield* qaDatabase.withTransaction(
+      }) =>
+        qaDatabase
+          .withTransaction(
             qaIam
               .registerProject({
                 subject: currentSession.subject,
@@ -1323,33 +1354,126 @@ const makeWsRpcLayer = (
                 Effect.flatMap(() =>
                   qaWorkflow.initializeRelease({
                     projectId: input.projectId,
-                    threadId: input.threadId,
+                    // `thread_id` is the legacy QA database column name. This
+                    // value is a shared release id, never a local conversation id.
+                    threadId: ThreadId.make(input.releaseId),
                     releaseTitle: input.releaseTitle,
                   }),
                 ),
               ),
-          );
-        }).pipe(
-          Effect.onExit((exit) =>
-            Exit.isFailure(exit)
-              ? Effect.uninterruptible(
-                  compensateQaProjectCreation({
-                    projectId: input.projectId,
-                    projectCreated,
-                    workspaceCreated,
-                    workspaceRoot,
-                    workspaceBoundary,
+          )
+          // The QA SQL transaction is the only write boundary. Local
+          // orchestration projects and conversation threads are created lazily
+          // by the principal who chooses to open Chat for this release.
+          .pipe(
+            Effect.mapError((cause) =>
+              isEnvironmentAuthorizationError(cause) || isQaOperationError(cause)
+                ? cause
+                : new QaOperationError({
+                    code: "persistence_failed",
+                    message: "The QA project and first release could not be created.",
                   }),
+            ),
+          );
+
+      const startQaStageGeneration = (input: {
+        readonly releaseId: QaReleaseId;
+        readonly expectedRevision: number;
+      }) => {
+        const releaseThreadId = ThreadId.make(input.releaseId);
+        let claimedJobId: string | null = null;
+        let dispatchAccepted = false;
+        return Effect.gen(function* () {
+          const { access, conversation, snapshot } = yield* ensureQaReleaseConversation(
+            input.releaseId,
+            "qa:make",
+          );
+          const prompt = buildQaStageKickoffPrompt({
+            activeStage: snapshot.activeStage,
+            projectTitle: access.projectName,
+            releaseLabel: `Release ${snapshot.releaseNumber}: ${snapshot.title}`,
+          });
+          if (prompt === null) {
+            return yield* new QaOperationError({
+              code: "invalid_workflow_state",
+              message: `The ${snapshot.activeStage} stage does not support agent generation.`,
+            });
+          }
+
+          const jobUuid = yield* crypto.randomUUIDv4.pipe(
+            Effect.mapError(
+              () =>
+                new QaOperationError({
+                  code: "persistence_failed",
+                  message: "The stage generation job could not be created.",
+                }),
+            ),
+          );
+          const jobId = `qa-stage-generation:${jobUuid}`;
+          const claimed = yield* qaWorkflow.claimAgentStageGeneration(
+            releaseThreadId,
+            input.expectedRevision,
+            jobId,
+            {
+              environmentId,
+              conversationThreadId: conversation.conversationThreadId,
+            },
+          );
+          claimedJobId = jobId;
+          yield* publishQaSnapshot("stage_started", claimed);
+
+          const acceptedAt = yield* nowIso;
+          const messageId = MessageId.make(`${jobId}:message`);
+          yield* dispatchNormalizedCommand({
+            type: "thread.turn.start",
+            commandId: yield* serverCommandId("qa-stage-generation"),
+            threadId: conversation.conversationThreadId,
+            message: {
+              messageId,
+              role: "user",
+              text: prompt,
+              attachments: [],
+            },
+            modelSelection: qaAgentModelSelection,
+            titleSeed: `${snapshot.title} · ${snapshot.activeStage.replaceAll("_", " ")}`,
+            runtimeMode: DEFAULT_RUNTIME_MODE,
+            interactionMode: "default",
+            createdAt: acceptedAt,
+          }).pipe(
+            Effect.mapError(
+              () =>
+                new QaOperationError({
+                  code: "persistence_failed",
+                  message: "The release agent could not start this stage in the background.",
+                }),
+            ),
+          );
+          dispatchAccepted = true;
+          return {
+            releaseId: input.releaseId,
+            conversationThreadId: conversation.conversationThreadId,
+            stage: snapshot.activeStage,
+            revision: claimed.revision,
+            acceptedAt,
+          } as const;
+        }).pipe(
+          Effect.mapError((cause) =>
+            isOrchestrationDispatchCommandError(cause)
+              ? new QaOperationError({
+                  code: "persistence_failed",
+                  message: "The release agent could not start this stage in the background.",
+                })
+              : cause,
+          ),
+          Effect.onExit((exit) =>
+            Exit.isFailure(exit) && claimedJobId !== null && !dispatchAccepted
+              ? Effect.uninterruptible(
+                  qaWorkflow.releaseAgentStageGeneration(releaseThreadId, claimedJobId).pipe(
+                    Effect.flatMap((released) => publishQaSnapshot("stage_blocked", released)),
+                    Effect.ignore,
+                  ),
                 )
               : Effect.void,
-          ),
-          Effect.mapError((cause) =>
-            isEnvironmentAuthorizationError(cause) || isQaOperationError(cause)
-              ? cause
-              : new QaOperationError({
-                  code: "persistence_failed",
-                  message: "The QA project and first release could not be created.",
-                }),
           ),
         );
       };
@@ -1366,14 +1490,22 @@ const makeWsRpcLayer = (
         return {
           environment,
           auth,
-          cwd: config.cwd,
-          keybindingsConfigPath: config.keybindingsConfigPath,
+          cwd: redactServerConfigPathForScopes(currentSession.scopes, config.cwd, "workspace"),
+          keybindingsConfigPath: redactServerConfigPathForScopes(
+            currentSession.scopes,
+            config.keybindingsConfigPath,
+            "settings",
+          ),
           keybindings: keybindingsConfig.keybindings,
           issues: keybindingsConfig.issues,
           providers,
           availableEditors: yield* externalLauncher.resolveAvailableEditors(),
           observability: {
-            logsDirectoryPath: config.logsDir,
+            logsDirectoryPath: redactServerConfigPathForScopes(
+              currentSession.scopes,
+              config.logsDir,
+              "logs",
+            ),
             localTracingEnabled: true,
             ...(config.otlpTracesUrl !== undefined ? { otlpTracesUrl: config.otlpTracesUrl } : {}),
             otlpTracesEnabled: config.otlpTracesUrl !== undefined,
@@ -1403,11 +1535,26 @@ const makeWsRpcLayer = (
               .pipe(Effect.mapError(mapQaReviewError)),
             { "rpc.aggregate": "qa" },
           ),
+        [WS_METHODS.qaSubscribeAssignedReleases]: (input) =>
+          observeRpcStream(
+            WS_METHODS.qaSubscribeAssignedReleases,
+            subscribeAssignedReleaseDashboard({
+              subject: currentSession.subject,
+              ...(input.completedSince === undefined
+                ? {}
+                : { completedSince: input.completedSince }),
+              dashboardQuery: qaDashboardQuery,
+              iam: qaIam,
+              eventBus: qaReleaseEventBus,
+            }).pipe(Stream.mapError(mapQaReviewError)),
+            { "rpc.aggregate": "qa" },
+          ),
         [WS_METHODS.qaGetReleaseAccess]: (input) =>
           observeRpcEffect(
             WS_METHODS.qaGetReleaseAccess,
             withQaReleaseAccess(input.threadId, "qa:read", (access) =>
               Effect.succeed({
+                releaseId: QaReleaseId.make(input.threadId),
                 threadId: input.threadId,
                 projectId: ProjectId.make(access.projectId),
                 principalId: access.principal.id,
@@ -1509,6 +1656,22 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "qa" },
           ),
+        [WS_METHODS.qaEnsureReleaseConversation]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.qaEnsureReleaseConversation,
+            ensureQaReleaseConversation(input.releaseId, "qa:chat").pipe(
+              Effect.map(({ conversation }) => ({
+                releaseId: input.releaseId,
+                runtimeProjectId: conversation.projectId,
+                conversationThreadId: conversation.conversationThreadId,
+              })),
+            ),
+            { "rpc.aggregate": "qa" },
+          ),
+        [WS_METHODS.qaStartStageGeneration]: (input) =>
+          observeRpcEffect(WS_METHODS.qaStartStageGeneration, startQaStageGeneration(input), {
+            "rpc.aggregate": "qa",
+          }),
         [WS_METHODS.qaInitializeRelease]: (input) =>
           observeRpcEffect(
             WS_METHODS.qaInitializeRelease,
@@ -1572,6 +1735,7 @@ const makeWsRpcLayer = (
                       ? nowIso.pipe(
                           Effect.map((at) => ({
                             type: "snapshot" as const,
+                            releaseId: snapshot.releaseId,
                             threadId: snapshot.threadId,
                             revision: snapshot.revision,
                             snapshot,
@@ -1589,6 +1753,28 @@ const makeWsRpcLayer = (
               ),
               qaReleaseEventBus.events.pipe(
                 Stream.filter((event) => event.threadId === input.threadId),
+                Stream.mapEffect((event) =>
+                  qaWorkflow.getSnapshot(input).pipe(
+                    Effect.flatMap((snapshot) =>
+                      snapshot
+                        ? Effect.succeed({
+                            type: "updated" as const,
+                            releaseId: snapshot.releaseId,
+                            threadId: snapshot.threadId,
+                            revision: snapshot.revision,
+                            reason: event.reason,
+                            snapshot,
+                            at: event.at,
+                          })
+                        : Effect.fail(
+                            new QaOperationError({
+                              code: "release_not_found",
+                              message: "The QA release was removed.",
+                            }),
+                          ),
+                    ),
+                  ),
+                ),
               ),
             ),
           ),
@@ -1895,6 +2081,8 @@ const makeWsRpcLayer = (
                       "QA chat sessions may only send, interrupt, answer, or stop turns in their bound release conversation.",
                   });
                 }
+              }
+              if ("threadId" in normalizedCommand) {
                 yield* authorizeQaConversationThread(normalizedCommand.threadId);
               }
               const shouldStopSessionAfterArchive =
@@ -1961,13 +2149,17 @@ const makeWsRpcLayer = (
         [ORCHESTRATION_WS_METHODS.getTurnDiff]: (input) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.getTurnDiff,
-            checkpointDiffQuery.getTurnDiff(input).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new OrchestrationGetTurnDiffError({
-                    message: "Failed to load turn diff",
-                    cause,
-                  }),
+            authorizeQaConversationSubscription(input.threadId).pipe(
+              Effect.andThen(
+                checkpointDiffQuery.getTurnDiff(input).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new OrchestrationGetTurnDiffError({
+                        message: "Failed to load turn diff",
+                        cause,
+                      }),
+                  ),
+                ),
               ),
             ),
             { "rpc.aggregate": "orchestration" },
@@ -1975,13 +2167,17 @@ const makeWsRpcLayer = (
         [ORCHESTRATION_WS_METHODS.getFullThreadDiff]: (input) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.getFullThreadDiff,
-            checkpointDiffQuery.getFullThreadDiff(input).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new OrchestrationGetFullThreadDiffError({
-                    message: "Failed to load full thread diff",
-                    cause,
-                  }),
+            authorizeQaConversationSubscription(input.threadId).pipe(
+              Effect.andThen(
+                checkpointDiffQuery.getFullThreadDiff(input).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new OrchestrationGetFullThreadDiffError({
+                        message: "Failed to load full thread diff",
+                        cause,
+                      }),
+                  ),
+                ),
               ),
             ),
             { "rpc.aggregate": "orchestration" },
@@ -2101,9 +2297,7 @@ const makeWsRpcLayer = (
           observeRpcStreamEffect(
             ORCHESTRATION_WS_METHODS.subscribeThread,
             Effect.gen(function* () {
-              if (isQaChatOnlySession) {
-                yield* authorizeQaConversationSubscription(input.threadId);
-              }
+              const qaBound = yield* authorizeQaConversationSubscription(input.threadId);
               const isThisThreadDetailEvent = (event: OrchestrationEvent) =>
                 event.aggregateKind === "thread" &&
                 event.aggregateId === input.threadId &&
@@ -2136,27 +2330,31 @@ const makeWsRpcLayer = (
               // so a global cap could otherwise omit this thread's events.
               if (input.afterSequence !== undefined) {
                 const afterSequence = input.afterSequence;
-                return Stream.unwrap(
-                  Effect.gen(function* () {
-                    const liveBuffer = yield* Queue.unbounded<OrchestrationThreadStreamItem>();
-                    yield* Effect.forkScoped(
-                      liveStream.pipe(Stream.runForEach((item) => Queue.offer(liveBuffer, item))),
-                    );
-                    const catchUpStream = orchestrationEngine
-                      .readEvents(afterSequence, Number.MAX_SAFE_INTEGER)
-                      .pipe(
-                        Stream.filter(isThisThreadDetailEvent),
-                        Stream.map((event) => ({ kind: "event" as const, event })),
-                        Stream.mapError(
-                          (cause) =>
-                            new OrchestrationGetSnapshotError({
-                              message: `Failed to replay thread ${input.threadId} events`,
-                              cause,
-                            }),
-                        ),
+                return authorizeQaConversationStream(
+                  input.threadId,
+                  qaBound,
+                  Stream.unwrap(
+                    Effect.gen(function* () {
+                      const liveBuffer = yield* Queue.unbounded<OrchestrationThreadStreamItem>();
+                      yield* Effect.forkScoped(
+                        liveStream.pipe(Stream.runForEach((item) => Queue.offer(liveBuffer, item))),
                       );
-                    return Stream.concat(catchUpStream, Stream.fromQueue(liveBuffer));
-                  }),
+                      const catchUpStream = orchestrationEngine
+                        .readEvents(afterSequence, Number.MAX_SAFE_INTEGER)
+                        .pipe(
+                          Stream.filter(isThisThreadDetailEvent),
+                          Stream.map((event) => ({ kind: "event" as const, event })),
+                          Stream.mapError(
+                            (cause) =>
+                              new OrchestrationGetSnapshotError({
+                                message: `Failed to replay thread ${input.threadId} events`,
+                                cause,
+                              }),
+                          ),
+                        );
+                      return Stream.concat(catchUpStream, Stream.fromQueue(liveBuffer));
+                    }),
+                  ),
                 );
               }
 
@@ -2179,12 +2377,16 @@ const makeWsRpcLayer = (
                 });
               }
 
-              return Stream.concat(
-                Stream.make({
-                  kind: "snapshot" as const,
-                  snapshot: snapshot.value,
-                }),
-                liveStream,
+              return authorizeQaConversationStream(
+                input.threadId,
+                qaBound,
+                Stream.concat(
+                  Stream.make({
+                    kind: "snapshot" as const,
+                    snapshot: snapshot.value,
+                  }),
+                  liveStream,
+                ),
               );
             }),
             { "rpc.aggregate": "orchestration" },
@@ -2637,53 +2839,83 @@ const makeWsRpcLayer = (
             { "rpc.aggregate": "terminal" },
           ),
         [WS_METHODS.previewOpen]: (input) =>
-          observeRpcEffect(WS_METHODS.previewOpen, previewManager.open(input), {
-            "rpc.aggregate": "preview",
-          }),
+          observeRpcEffect(
+            WS_METHODS.previewOpen,
+            withPreviewAccess(input.threadId, (access) => previewManager.open(input, access)),
+            {
+              "rpc.aggregate": "preview",
+            },
+          ),
         [WS_METHODS.previewNavigate]: (input) =>
-          observeRpcEffect(WS_METHODS.previewNavigate, previewManager.navigate(input), {
-            "rpc.aggregate": "preview",
-          }),
+          observeRpcEffect(
+            WS_METHODS.previewNavigate,
+            withPreviewAccess(input.threadId, (access) => previewManager.navigate(input, access)),
+            {
+              "rpc.aggregate": "preview",
+            },
+          ),
         [WS_METHODS.previewResize]: (input) =>
-          observeRpcEffect(WS_METHODS.previewResize, previewManager.resize(input), {
-            "rpc.aggregate": "preview",
-          }),
+          observeRpcEffect(
+            WS_METHODS.previewResize,
+            withPreviewAccess(input.threadId, (access) => previewManager.resize(input, access)),
+            {
+              "rpc.aggregate": "preview",
+            },
+          ),
         [WS_METHODS.previewRefresh]: (input) =>
-          observeRpcEffect(WS_METHODS.previewRefresh, previewManager.refresh(input), {
-            "rpc.aggregate": "preview",
-          }),
+          observeRpcEffect(
+            WS_METHODS.previewRefresh,
+            withPreviewAccess(input.threadId, (access) => previewManager.refresh(input, access)),
+            {
+              "rpc.aggregate": "preview",
+            },
+          ),
         [WS_METHODS.previewClose]: (input) =>
-          observeRpcEffect(WS_METHODS.previewClose, previewManager.close(input), {
-            "rpc.aggregate": "preview",
-          }),
+          observeRpcEffect(
+            WS_METHODS.previewClose,
+            withPreviewAccess(input.threadId, (access) => previewManager.close(input, access)),
+            {
+              "rpc.aggregate": "preview",
+            },
+          ),
         [WS_METHODS.previewList]: (input) =>
-          observeRpcEffect(WS_METHODS.previewList, previewManager.list(input), {
-            "rpc.aggregate": "preview",
-          }),
+          observeRpcEffect(
+            WS_METHODS.previewList,
+            withPreviewAccess(input.threadId, (access) => previewManager.list(input, access)),
+            {
+              "rpc.aggregate": "preview",
+            },
+          ),
         [WS_METHODS.previewReportStatus]: (input) =>
-          observeRpcEffect(WS_METHODS.previewReportStatus, previewManager.reportStatus(input), {
-            "rpc.aggregate": "preview",
-          }),
+          observeRpcEffect(
+            WS_METHODS.previewReportStatus,
+            withPreviewAccess(input.threadId, (access) =>
+              previewManager.reportStatus(input, access),
+            ),
+            {
+              "rpc.aggregate": "preview",
+            },
+          ),
         [WS_METHODS.previewAutomationConnect]: (input) =>
           observeRpcStreamEffect(
             WS_METHODS.previewAutomationConnect,
-            previewAutomationBroker.connect(input),
+            previewAutomationBroker.connect(input, previewIdentity),
             { "rpc.aggregate": "preview-automation" },
           ),
         [WS_METHODS.previewAutomationRespond]: (input) =>
           observeRpcEffect(
             WS_METHODS.previewAutomationRespond,
-            previewAutomationBroker.respond(input),
+            previewAutomationBroker.respond(input, previewIdentity),
             { "rpc.aggregate": "preview-automation" },
           ),
         [WS_METHODS.previewAutomationFocusHost]: (input) =>
           observeRpcEffect(
             WS_METHODS.previewAutomationFocusHost,
-            previewAutomationBroker.focusHost(input),
+            previewAutomationBroker.focusHost(input, previewIdentity),
             { "rpc.aggregate": "preview-automation" },
           ),
         [WS_METHODS.subscribePreviewEvents]: (_input) =>
-          observeRpcStream(WS_METHODS.subscribePreviewEvents, previewManager.events, {
+          observeRpcStream(WS_METHODS.subscribePreviewEvents, authorizedPreviewEvents, {
             "rpc.aggregate": "preview",
           }),
         [WS_METHODS.subscribeDiscoveredLocalServers]: (_input) =>
@@ -2834,7 +3066,6 @@ export const websocketRpcRouteLayer = Layer.unwrap(
         }).pipe(
           Effect.provide(
             makeWsRpcLayer(session, previewAutomationBroker, qaReleaseEventBus).pipe(
-              Layer.provide(QaIam.layer),
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(ProviderMaintenanceRunner.layer),
               Layer.provide(
@@ -2863,7 +3094,13 @@ export const websocketRpcRouteLayer = Layer.unwrap(
         );
         return yield* Effect.acquireUseRelease(
           sessions.markConnected(session.sessionId),
-          () => rpcWebSocketHttpEffect,
+          () =>
+            Effect.raceFirst(
+              rpcWebSocketHttpEffect,
+              sessions
+                .awaitInvalidation(session.sessionId)
+                .pipe(Effect.as(HttpServerResponse.empty())),
+            ),
           () => sessions.markDisconnected(session.sessionId),
         );
       }).pipe(

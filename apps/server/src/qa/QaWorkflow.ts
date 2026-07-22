@@ -3,6 +3,8 @@ import * as NodeCrypto from "node:crypto";
 import {
   type QaAddStrategyCommentInput,
   QaAuthoredFlowLeg,
+  type QaAgentGenerationClaimOwner,
+  type QaAgentGenerationOwner,
   type QaAgentStageProgressInput,
   type QaAgentSubmitStrategyInput,
   type QaAgentSubmitScenariosInput,
@@ -55,16 +57,14 @@ import {
   type QaTestCasePlanApprovalResult,
   type QaTestCasePlanMutationResult,
   type QaUploadDocumentInput,
+  ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
-import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
-import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
-import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { QaDatabase } from "./QaDatabase.ts";
 import { QaIngestionGateway } from "./QaIngestionGateway.ts";
@@ -76,6 +76,11 @@ import {
 
 const MAX_DOCUMENT_BYTES = 20 * 1024 * 1024;
 const REQUIREMENTS_GATE_KIND = "requirements_review" as const;
+
+export interface QaAgentStageGenerationReleaseResult {
+  readonly released: boolean;
+  readonly snapshot: QaReleaseSnapshot;
+}
 
 type QaWorkflowShape = {
   readonly getSnapshot: (
@@ -91,16 +96,37 @@ type QaWorkflowShape = {
     input: QaStartIngestionInput,
   ) => Effect.Effect<QaReleaseSnapshot, QaOperationError>;
   readonly review: (input: QaReviewInput) => Effect.Effect<QaReleaseSnapshot, QaOperationError>;
+  readonly claimAgentStageGeneration: (
+    threadId: QaGetSnapshotInput["threadId"],
+    expectedRevision: number,
+    jobId: string,
+    owner: QaAgentGenerationClaimOwner,
+  ) => Effect.Effect<QaReleaseSnapshot, QaOperationError>;
+  readonly releaseAgentStageGeneration: (
+    threadId: QaGetSnapshotInput["threadId"],
+    jobId: string,
+  ) => Effect.Effect<QaReleaseSnapshot, QaOperationError>;
+  readonly releaseAgentStageGenerationForOwner: (
+    threadId: QaGetSnapshotInput["threadId"],
+    owner: QaAgentGenerationOwner,
+  ) => Effect.Effect<QaAgentStageGenerationReleaseResult, QaOperationError>;
+  readonly recoverStaleAgentStageGenerations: (input: {
+    readonly environmentId: QaAgentGenerationClaimOwner["environmentId"];
+    readonly updatedBefore: string;
+  }) => Effect.Effect<ReadonlyArray<QaReleaseSnapshot>, QaOperationError>;
   readonly reportAgentStageProgress: (
     threadId: QaGetSnapshotInput["threadId"],
+    owner: QaAgentGenerationOwner,
     input: QaAgentStageProgressInput,
   ) => Effect.Effect<QaReleaseSnapshot, QaOperationError>;
   readonly submitAgentRequirements: (
     threadId: QaGetSnapshotInput["threadId"],
+    owner: QaAgentGenerationOwner,
     input: QaAgentSubmitRequirementsInput,
   ) => Effect.Effect<QaReleaseSnapshot, QaOperationError>;
   readonly submitAgentStrategy: (
     threadId: QaGetSnapshotInput["threadId"],
+    owner: QaAgentGenerationOwner,
     input: QaAgentSubmitStrategyInput,
   ) => Effect.Effect<QaReleaseSnapshot, QaOperationError>;
   readonly updateRequirement: (
@@ -146,6 +172,7 @@ type QaWorkflowShape = {
   ) => Effect.Effect<QaScenarioPlanApprovalResult, QaOperationError>;
   readonly submitAgentScenarios: (
     threadId: QaGetSnapshotInput["threadId"],
+    owner: QaAgentGenerationOwner,
     input: QaAgentSubmitScenariosInput,
   ) => Effect.Effect<QaReleaseSnapshot, QaOperationError>;
   readonly getTestCasePlan: (
@@ -162,6 +189,7 @@ type QaWorkflowShape = {
   ) => Effect.Effect<QaTestCasePlanApprovalResult, QaOperationError>;
   readonly submitAgentTestCases: (
     threadId: QaGetSnapshotInput["threadId"],
+    owner: QaAgentGenerationOwner,
     input: QaAgentSubmitTestCasesInput,
   ) => Effect.Effect<QaReleaseSnapshot, QaOperationError>;
   readonly getScriptPlan: (
@@ -178,6 +206,7 @@ type QaWorkflowShape = {
   ) => Effect.Effect<QaScriptPlanApprovalResult, QaOperationError>;
   readonly submitAgentScripts: (
     threadId: QaGetSnapshotInput["threadId"],
+    owner: QaAgentGenerationOwner,
     input: QaAgentSubmitScriptsInput,
   ) => Effect.Effect<QaReleaseSnapshot, QaOperationError>;
   readonly getReadiness: (
@@ -671,12 +700,9 @@ function parseAuthoredFlowLegs(value: string) {
 
 const make = Effect.gen(function* () {
   const sql = yield* QaDatabase;
-  const orchestrationSql = yield* SqlClient.SqlClient;
   const ingestionGateway = yield* QaIngestionGateway;
   const encodeJson = Schema.encodeEffect(Schema.UnknownFromJsonString);
   const crypto = yield* Crypto.Crypto;
-  const fs = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
 
   const loadStrategy = Effect.fn("QaWorkflow.loadStrategy")(function* (
     threadId: QaGetSnapshotInput["threadId"],
@@ -1278,6 +1304,7 @@ const make = Effect.gen(function* () {
 
         return yield* decodeSnapshot({
           ...release,
+          releaseId: release.threadId,
           documents,
           requirements,
           authoredFlows,
@@ -1437,7 +1464,7 @@ const make = Effect.gen(function* () {
     mapQaFailure(
       "uploadDocument",
       Effect.gen(function* () {
-        const release = yield* requireSnapshot(input.threadId);
+        yield* requireSnapshot(input.threadId);
         const safeName = safeDocumentName(input.fileName);
         if (safeName === null) {
           return yield* operationError(
@@ -1462,54 +1489,25 @@ const make = Effect.gen(function* () {
           );
         }
 
-        const workspaceRows = yield* orchestrationSql<{ readonly workspaceRoot: string }>`
-          SELECT workspace_root AS "workspaceRoot"
-          FROM projection_projects
-          WHERE project_id = ${release.projectId} AND deleted_at IS NULL
-        `;
-        const workspaceRoot = workspaceRows[0]?.workspaceRoot;
-        if (workspaceRoot === undefined) {
-          return yield* operationError(
-            "release_not_found",
-            "The project workspace for this QA release is not available.",
-          );
-        }
-
         const documentId = yield* crypto.randomUUIDv4.pipe(
           Effect.mapError(() => persistenceError("generateDocumentId")),
         );
-        const storagePath = `.qa/releases/release-${release.releaseNumber}/documents/${documentId}-${safeName}`;
-        const absolutePath = path.join(workspaceRoot, ...storagePath.split("/"));
-        const replacedStoragePaths = release.documents
-          .filter((document) => document.fileName === input.fileName.trim())
-          .map((document) => path.join(workspaceRoot, ...document.storagePath.split("/")));
+        // The document bytes are canonical in Postgres (`content_blob`). This
+        // logical key is stable metadata, not a path in any principal's local
+        // orchestration workspace.
+        const storagePath = `qa-db/releases/${input.threadId}/documents/${documentId}/${safeName}`;
         const timestamp = yield* nowIso;
         const sha256 = NodeCrypto.createHash("sha256").update(input.bytes).digest("hex");
         const documentKind = classifyDocumentKind(input.fileName);
         const documentVersion = inferDocumentVersion(input.fileName);
 
-        yield* Effect.scoped(
+        yield* sql.withTransaction(
           Effect.gen(function* () {
-            const targetDirectory = path.dirname(absolutePath);
-            yield* fs.makeDirectory(targetDirectory, { recursive: true });
-            const tempDirectory = yield* fs.makeTempDirectoryScoped({
-              directory: targetDirectory,
-              prefix: `${documentId}.`,
-            });
-            const tempPath = path.join(tempDirectory, "upload.tmp");
-            yield* fs.writeFile(tempPath, input.bytes);
-            yield* fs.rename(tempPath, absolutePath);
-          }),
-        );
-
-        yield* sql
-          .withTransaction(
-            Effect.gen(function* () {
-              yield* sql`
+            yield* sql`
                 DELETE FROM qa_documents
                 WHERE thread_id = ${input.threadId} AND file_name = ${input.fileName.trim()}
               `;
-              yield* sql`
+            yield* sql`
                 INSERT INTO qa_documents (
                   id, thread_id, file_name, kind, version, media_type, storage_path, byte_size, sha256,
                   content_blob, status, created_at, updated_at
@@ -1520,32 +1518,34 @@ const make = Effect.gen(function* () {
                   ${timestamp}, ${timestamp}
                 )
               `;
-              yield* sql`
+            yield* sql`
                 DELETE FROM qa_requirements WHERE thread_id = ${input.threadId}
               `;
-              yield* sql`
+            yield* sql`
                 DELETE FROM qa_traceability_nodes
                 WHERE thread_id = ${input.threadId} AND kind != 'document'
               `;
-              yield* sql`
+            yield* sql`
                 UPDATE qa_approval_gates
                 SET status = 'pending', decision_note = NULL, updated_at = ${timestamp}
                 WHERE thread_id = ${input.threadId} AND kind = ${REQUIREMENTS_GATE_KIND}
               `;
-              yield* sql`
+            yield* sql`
                 UPDATE qa_releases
                 SET phase = 'documents', ingestion_status = 'idle', ingestion_progress = 0,
                     active_stage = 'intake', revision = revision + 1, updated_at = ${timestamp}
                 WHERE thread_id = ${input.threadId}
               `;
-              yield* sql`
+            yield* sql`
                 UPDATE qa_stage_states
                 SET status = CASE WHEN stage = 'intake' THEN 'ready' ELSE 'locked' END,
-                    progress = 0, active_job_id = NULL, blocked_reason = NULL,
+                    progress = 0, active_job_id = NULL, active_environment_id = NULL,
+                    active_conversation_thread_id = NULL, active_provider_session_id = NULL,
+                    blocked_reason = NULL,
                     updated_at = ${timestamp}
                 WHERE thread_id = ${input.threadId}
               `;
-              yield* sql`
+            yield* sql`
                 INSERT INTO qa_traceability_nodes (
                   id, thread_id, kind, label, document_id, requirement_id, created_at, updated_at
                 ) VALUES (
@@ -1553,22 +1553,8 @@ const make = Effect.gen(function* () {
                   ${input.fileName.trim()}, ${documentId}, NULL, ${timestamp}, ${timestamp}
                 )
               `;
-            }),
-          )
-          .pipe(
-            Effect.catch(() =>
-              fs
-                .remove(absolutePath, { force: true })
-                .pipe(
-                  Effect.ignore,
-                  Effect.andThen(Effect.fail(persistenceError("uploadDocument"))),
-                ),
-            ),
-          );
-
-        for (const replacedStoragePath of replacedStoragePaths) {
-          yield* fs.remove(replacedStoragePath, { force: true }).pipe(Effect.ignore);
-        }
+          }),
+        );
 
         return yield* requireSnapshot(input.threadId);
       }),
@@ -1618,6 +1604,8 @@ const make = Effect.gen(function* () {
             yield* sql`
               UPDATE qa_stage_states
               SET status = 'running', progress = 10, active_job_id = ${jobId},
+                  active_environment_id = NULL, active_conversation_thread_id = NULL,
+                  active_provider_session_id = NULL,
                   blocked_reason = NULL, updated_at = ${startedAt}
               WHERE thread_id = ${input.threadId} AND stage = 'intake'
             `;
@@ -1662,6 +1650,8 @@ const make = Effect.gen(function* () {
                     yield* sql`
                       UPDATE qa_stage_states
                       SET status = 'blocked', progress = 100, active_job_id = ${jobId},
+                          active_environment_id = NULL, active_conversation_thread_id = NULL,
+                          active_provider_session_id = NULL,
                           blocked_reason = ${error.message}, updated_at = ${failedAt}
                       WHERE thread_id = ${input.threadId} AND stage = 'intake'
                     `;
@@ -1909,12 +1899,16 @@ const make = Effect.gen(function* () {
             yield* sql`
               UPDATE qa_stage_states
               SET status = 'complete', progress = 100, active_job_id = ${jobId},
+                  active_environment_id = NULL, active_conversation_thread_id = NULL,
+                  active_provider_session_id = NULL,
                   blocked_reason = NULL, updated_at = ${completedAt}
               WHERE thread_id = ${input.threadId} AND stage = 'intake'
             `;
             yield* sql`
               UPDATE qa_stage_states
               SET status = 'awaiting_review', progress = 0, active_job_id = NULL,
+                  active_environment_id = NULL, active_conversation_thread_id = NULL,
+                  active_provider_session_id = NULL,
                   blocked_reason = NULL, updated_at = ${completedAt}
               WHERE thread_id = ${input.threadId} AND stage = 'requirements'
             `;
@@ -2056,13 +2050,17 @@ const make = Effect.gen(function* () {
             UPDATE qa_stage_states
             SET status = ${requirementsComplete ? "complete" : "awaiting_review"},
                 progress = ${requirementsProgress},
-                active_job_id = NULL, blocked_reason = NULL, updated_at = ${timestamp}
+                active_job_id = NULL, active_environment_id = NULL,
+                active_conversation_thread_id = NULL, active_provider_session_id = NULL,
+                blocked_reason = NULL, updated_at = ${timestamp}
             WHERE thread_id = ${input.threadId} AND stage = 'requirements'
           `;
           if (requirementsComplete) {
             yield* sql`
               UPDATE qa_stage_states
               SET status = 'ready', progress = 0, active_job_id = NULL,
+                  active_environment_id = NULL, active_conversation_thread_id = NULL,
+                  active_provider_session_id = NULL,
                   blocked_reason = NULL, updated_at = ${timestamp}
               WHERE thread_id = ${input.threadId} AND stage = 'strategy'
             `;
@@ -2072,8 +2070,41 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const requireAgentStageOwnership = Effect.fn("QaWorkflow.requireAgentStageOwnership")(function* (
+    threadId: QaGetSnapshotInput["threadId"],
+    stage: QaAgentStageProgressInput["stage"],
+    owner: QaAgentGenerationOwner,
+  ) {
+    const owned = yield* sql<{ readonly activeJobId: string }>`
+        UPDATE qa_stage_states
+        SET active_provider_session_id = COALESCE(
+          active_provider_session_id,
+          ${owner.providerSessionId}
+        )
+        WHERE thread_id = ${threadId}
+          AND stage = ${stage}
+          AND status IN ('queued', 'running')
+          AND active_job_id IS NOT NULL
+          AND active_environment_id = ${owner.environmentId}
+          AND active_conversation_thread_id = ${owner.conversationThreadId}
+          AND (
+            active_provider_session_id IS NULL
+            OR active_provider_session_id = ${owner.providerSessionId}
+          )
+        RETURNING active_job_id AS "activeJobId"
+      `;
+    if (owned.length === 0) {
+      return yield* operationError(
+        "invalid_workflow_state",
+        `The ${stage} generation job is not active for this agent session.`,
+      );
+    }
+    return owned[0]!.activeJobId;
+  });
+
   const reportAgentStageProgress = (
     threadId: QaGetSnapshotInput["threadId"],
+    owner: QaAgentGenerationOwner,
     input: QaAgentStageProgressInput,
   ) =>
     mapQaFailure(
@@ -2087,6 +2118,7 @@ const make = Effect.gen(function* () {
               `The active QA stage is ${snapshot.activeStage}, not ${input.stage}.`,
             );
           }
+          yield* requireAgentStageOwnership(threadId, input.stage, owner);
           const timestamp = yield* nowIso;
           yield* sql`
             UPDATE qa_stage_states
@@ -2140,8 +2172,178 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const claimAgentStageGeneration = (
+    threadId: QaGetSnapshotInput["threadId"],
+    expectedRevision: number,
+    jobId: string,
+    owner: QaAgentGenerationClaimOwner,
+  ) =>
+    mapQaFailure(
+      "claimAgentStageGeneration",
+      sql.withTransaction(
+        Effect.gen(function* () {
+          const snapshot = yield* requireSnapshot(threadId);
+          yield* requireExpectedRevision(snapshot, expectedRevision);
+          const stage = snapshot.activeStage;
+          if (
+            stage !== "strategy" &&
+            stage !== "scenarios" &&
+            stage !== "test_cases" &&
+            stage !== "scripts"
+          ) {
+            return yield* operationError(
+              "invalid_workflow_state",
+              `The ${stage} stage is not generated by the release agent.`,
+            );
+          }
+          const artifactExists =
+            (stage === "strategy" && snapshot.strategy !== null) ||
+            (stage === "scenarios" && snapshot.scenarioPlan !== null) ||
+            (stage === "test_cases" && snapshot.testCasePlan !== null) ||
+            (stage === "scripts" && snapshot.scriptPlan !== null);
+          if (artifactExists) {
+            return yield* operationError(
+              "invalid_workflow_state",
+              `The ${stage} artifact already exists and must be revised in place.`,
+            );
+          }
+
+          const timestamp = yield* nowIso;
+          const claimed = yield* sql<{ readonly threadId: string }>`
+            UPDATE qa_stage_states
+            SET status = 'queued', progress = 0, active_job_id = ${jobId},
+                active_environment_id = ${owner.environmentId},
+                active_conversation_thread_id = ${owner.conversationThreadId},
+                active_provider_session_id = NULL,
+                blocked_reason = NULL, updated_at = ${timestamp}
+            WHERE thread_id = ${threadId}
+              AND stage = ${stage}
+              AND status = 'ready'
+              AND active_job_id IS NULL
+            RETURNING thread_id AS "threadId"
+          `;
+          if (claimed.length === 0) {
+            return yield* operationError(
+              "invalid_workflow_state",
+              `The ${stage} stage is not ready for generation or already has an active job.`,
+            );
+          }
+          yield* sql`
+            UPDATE qa_releases
+            SET revision = revision + 1, updated_at = ${timestamp}
+            WHERE thread_id = ${threadId}
+          `;
+          return yield* requireSnapshot(threadId);
+        }),
+      ),
+    );
+
+  const releaseAgentStageGeneration = (threadId: QaGetSnapshotInput["threadId"], jobId: string) =>
+    mapQaFailure(
+      "releaseAgentStageGeneration",
+      sql.withTransaction(
+        Effect.gen(function* () {
+          const timestamp = yield* nowIso;
+          const released = yield* sql<{ readonly threadId: string }>`
+            UPDATE qa_stage_states
+            SET status = 'ready', progress = 0, active_job_id = NULL,
+                active_environment_id = NULL, active_conversation_thread_id = NULL,
+                active_provider_session_id = NULL,
+                blocked_reason = NULL, updated_at = ${timestamp}
+            WHERE thread_id = ${threadId}
+              AND active_job_id = ${jobId}
+              AND status IN ('queued', 'running')
+            RETURNING thread_id AS "threadId"
+          `;
+          if (released.length > 0) {
+            yield* sql`
+              UPDATE qa_releases
+              SET revision = revision + 1, updated_at = ${timestamp}
+              WHERE thread_id = ${threadId}
+            `;
+          }
+          return yield* requireSnapshot(threadId);
+        }),
+      ),
+    );
+
+  const releaseAgentStageGenerationForOwner = (
+    threadId: QaGetSnapshotInput["threadId"],
+    owner: QaAgentGenerationOwner,
+  ) =>
+    mapQaFailure(
+      "releaseAgentStageGenerationForOwner",
+      sql.withTransaction(
+        Effect.gen(function* () {
+          const timestamp = yield* nowIso;
+          const released = yield* sql<{ readonly threadId: string }>`
+            UPDATE qa_stage_states
+            SET status = 'ready', progress = 0, active_job_id = NULL,
+                active_environment_id = NULL, active_conversation_thread_id = NULL,
+                active_provider_session_id = NULL,
+                blocked_reason = NULL, updated_at = ${timestamp}
+            WHERE thread_id = ${threadId}
+              AND active_environment_id = ${owner.environmentId}
+              AND active_conversation_thread_id = ${owner.conversationThreadId}
+              AND active_provider_session_id = ${owner.providerSessionId}
+              AND active_job_id IS NOT NULL
+              AND status IN ('queued', 'running')
+            RETURNING thread_id AS "threadId"
+          `;
+          if (released.length > 0) {
+            yield* sql`
+              UPDATE qa_releases
+              SET revision = revision + 1, updated_at = ${timestamp}
+              WHERE thread_id = ${threadId}
+            `;
+          }
+          return {
+            released: released.length > 0,
+            snapshot: yield* requireSnapshot(threadId),
+          } satisfies QaAgentStageGenerationReleaseResult;
+        }),
+      ),
+    );
+
+  const recoverStaleAgentStageGenerations = (input: {
+    readonly environmentId: QaAgentGenerationClaimOwner["environmentId"];
+    readonly updatedBefore: string;
+  }) =>
+    mapQaFailure(
+      "recoverStaleAgentStageGenerations",
+      sql.withTransaction(
+        Effect.gen(function* () {
+          const timestamp = yield* nowIso;
+          const released = yield* sql<{ readonly threadId: string }>`
+            UPDATE qa_stage_states
+            SET status = 'ready', progress = 0, active_job_id = NULL,
+                active_environment_id = NULL, active_conversation_thread_id = NULL,
+                active_provider_session_id = NULL,
+                blocked_reason = NULL, updated_at = ${timestamp}
+            WHERE active_environment_id = ${input.environmentId}
+              AND active_job_id IS NOT NULL
+              AND status IN ('queued', 'running')
+              AND updated_at < ${input.updatedBefore}
+            RETURNING thread_id AS "threadId"
+          `;
+          const threadIds = [...new Set(released.map((row) => ThreadId.make(row.threadId)))];
+          for (const threadId of threadIds) {
+            yield* sql`
+              UPDATE qa_releases
+              SET revision = revision + 1, updated_at = ${timestamp}
+              WHERE thread_id = ${threadId}
+            `;
+          }
+          return yield* Effect.forEach(threadIds, (threadId) => requireSnapshot(threadId), {
+            concurrency: 1,
+          });
+        }),
+      ),
+    );
+
   const submitAgentRequirements = (
     threadId: QaGetSnapshotInput["threadId"],
+    owner: QaAgentGenerationOwner,
     input: QaAgentSubmitRequirementsInput,
   ) =>
     mapQaFailure(
@@ -2155,6 +2357,7 @@ const make = Effect.gen(function* () {
               `Requirement proposals are only accepted during the requirements stage; current stage is ${snapshot.activeStage}.`,
             );
           }
+          yield* requireAgentStageOwnership(threadId, "requirements", owner);
           const documentIds = new Set(snapshot.documents.map((document) => document.id));
           const invalidSource = input.requirements.find((requirement) => {
             const sourceDocumentId =
@@ -2318,6 +2521,8 @@ const make = Effect.gen(function* () {
           yield* sql`
             UPDATE qa_stage_states
             SET status = 'awaiting_review', progress = 0, active_job_id = NULL,
+                active_environment_id = NULL, active_conversation_thread_id = NULL,
+                active_provider_session_id = NULL,
                 blocked_reason = NULL, updated_at = ${timestamp}
             WHERE thread_id = ${threadId} AND stage = 'requirements'
           `;
@@ -2575,6 +2780,7 @@ const make = Effect.gen(function* () {
 
   const submitAgentStrategy = (
     threadId: QaGetSnapshotInput["threadId"],
+    owner: QaAgentGenerationOwner,
     input: QaAgentSubmitStrategyInput,
   ) =>
     mapQaFailure(
@@ -2588,6 +2794,7 @@ const make = Effect.gen(function* () {
               `Strategy proposals are only accepted during the strategy stage; current stage is ${snapshot.activeStage}.`,
             );
           }
+          yield* requireAgentStageOwnership(threadId, "strategy", owner);
           const existingStrategy = yield* loadStrategy(threadId);
           if (
             existingStrategy?.reviewStatus === "approved" ||
@@ -2661,7 +2868,10 @@ const make = Effect.gen(function* () {
           `;
           yield* sql`
             UPDATE qa_stage_states
-            SET status = 'awaiting_review', progress = 100, blocked_reason = NULL,
+            SET status = 'awaiting_review', progress = 100, active_job_id = NULL,
+                active_environment_id = NULL, active_conversation_thread_id = NULL,
+                active_provider_session_id = NULL,
+                blocked_reason = NULL,
                 updated_at = ${timestamp}
             WHERE thread_id = ${threadId} AND stage = 'strategy'
           `;
@@ -3080,6 +3290,7 @@ const make = Effect.gen(function* () {
     mapQaFailure("getScenarioPlan", loadScenarioPlan(input.threadId));
   const submitAgentScenarios = (
     threadId: QaGetSnapshotInput["threadId"],
+    owner: QaAgentGenerationOwner,
     input: QaAgentSubmitScenariosInput,
   ) =>
     mapQaFailure(
@@ -3095,6 +3306,7 @@ const make = Effect.gen(function* () {
               "invalid_workflow_state",
               "Scenario proposals require an approved strategy and active scenarios stage.",
             );
+          yield* requireAgentStageOwnership(threadId, "scenarios", owner);
           if (snapshot.scenarioPlan?.reviewStatus === "pending_review")
             return yield* operationError(
               "invalid_workflow_state",
@@ -3132,7 +3344,13 @@ const make = Effect.gen(function* () {
             for (const [position, value] of scenario.preconditions.entries())
               yield* sql`INSERT INTO qa_scenario_preconditions (scenario_id,position,value) VALUES (${id},${position},${value})`;
           }
-          yield* sql`UPDATE qa_stage_states SET status='awaiting_review',progress=100,updated_at=${timestamp} WHERE thread_id=${threadId} AND stage='scenarios'`;
+          yield* sql`
+            UPDATE qa_stage_states
+            SET status = 'awaiting_review', progress = 100, active_job_id = NULL,
+                active_environment_id = NULL, active_conversation_thread_id = NULL,
+                active_provider_session_id = NULL, updated_at = ${timestamp}
+            WHERE thread_id = ${threadId} AND stage = 'scenarios'
+          `;
           yield* sql`UPDATE qa_releases SET revision=${nextRevision},updated_at=${timestamp} WHERE thread_id=${threadId}`;
           return yield* requireSnapshot(threadId);
         }),
@@ -3315,6 +3533,7 @@ const make = Effect.gen(function* () {
     mapQaFailure("getTestCasePlan", loadTestCasePlan(input.threadId));
   const submitAgentTestCases = (
     threadId: QaGetSnapshotInput["threadId"],
+    owner: QaAgentGenerationOwner,
     input: QaAgentSubmitTestCasesInput,
   ) =>
     mapQaFailure(
@@ -3330,6 +3549,7 @@ const make = Effect.gen(function* () {
               "invalid_workflow_state",
               "Test case proposals require an approved scenario plan and active test case stage.",
             );
+          yield* requireAgentStageOwnership(threadId, "test_cases", owner);
           if (snapshot.testCasePlan?.reviewStatus === "pending_review")
             return yield* operationError(
               "invalid_workflow_state",
@@ -3387,7 +3607,13 @@ const make = Effect.gen(function* () {
             for (const step of tc.steps)
               yield* sql`INSERT INTO qa_test_case_steps(test_case_id,step_order,action,test_data,expected_result)VALUES(${id},${step.order},${step.action},${step.testData},${step.expectedResult})`;
           }
-          yield* sql`UPDATE qa_stage_states SET status='awaiting_review',progress=100,updated_at=${ts} WHERE thread_id=${threadId} AND stage='test_cases'`;
+          yield* sql`
+            UPDATE qa_stage_states
+            SET status = 'awaiting_review', progress = 100, active_job_id = NULL,
+                active_environment_id = NULL, active_conversation_thread_id = NULL,
+                active_provider_session_id = NULL, updated_at = ${ts}
+            WHERE thread_id = ${threadId} AND stage = 'test_cases'
+          `;
           yield* sql`UPDATE qa_releases SET revision=${next},updated_at=${ts} WHERE thread_id=${threadId}`;
           return yield* requireSnapshot(threadId);
         }),
@@ -3563,6 +3789,7 @@ const make = Effect.gen(function* () {
     mapQaFailure("getScriptPlan", loadScriptPlan(input.threadId));
   const submitAgentScripts = (
     threadId: QaGetSnapshotInput["threadId"],
+    owner: QaAgentGenerationOwner,
     input: QaAgentSubmitScriptsInput,
   ) =>
     mapQaFailure(
@@ -3578,6 +3805,7 @@ const make = Effect.gen(function* () {
               "invalid_workflow_state",
               "Script proposals require an approved test-case plan and active scripts stage.",
             );
+          yield* requireAgentStageOwnership(threadId, "scripts", owner);
           if (snapshot.scriptPlan?.reviewStatus === "pending_review")
             return yield* operationError(
               "invalid_workflow_state",
@@ -3628,7 +3856,13 @@ const make = Effect.gen(function* () {
             for (const requirementId of new Set(script.requirementIds))
               yield* sql`INSERT INTO qa_script_requirements(thread_id,script_id,requirement_id) VALUES(${threadId},${id},${requirementId})`;
           }
-          yield* sql`UPDATE qa_stage_states SET status='awaiting_review',progress=100,updated_at=${timestamp} WHERE thread_id=${threadId} AND stage='scripts'`;
+          yield* sql`
+            UPDATE qa_stage_states
+            SET status = 'awaiting_review', progress = 100, active_job_id = NULL,
+                active_environment_id = NULL, active_conversation_thread_id = NULL,
+                active_provider_session_id = NULL, updated_at = ${timestamp}
+            WHERE thread_id = ${threadId} AND stage = 'scripts'
+          `;
           yield* sql`UPDATE qa_releases SET revision=${nextRevision},updated_at=${timestamp} WHERE thread_id=${threadId}`;
           return yield* requireSnapshot(threadId);
         }),
@@ -3856,6 +4090,10 @@ const make = Effect.gen(function* () {
     uploadDocument,
     startIngestion,
     review,
+    claimAgentStageGeneration,
+    releaseAgentStageGeneration,
+    releaseAgentStageGenerationForOwner,
+    recoverStaleAgentStageGenerations,
     reportAgentStageProgress,
     submitAgentRequirements,
     submitAgentStrategy,

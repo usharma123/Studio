@@ -1,4 +1,4 @@
-import { WS_METHODS } from "@t3tools/contracts";
+import { WS_METHODS, type EnvironmentId } from "@t3tools/contracts";
 import {
   createAtomCommandScheduler,
   createEnvironmentRpcCommand,
@@ -7,12 +7,18 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 
 import { connectionAtomRuntime } from "~/connection/runtime";
+import { appAtomRegistry } from "~/rpc/atomRegistry";
 
 const qaMutationScheduler = createAtomCommandScheduler();
 const releaseSerialConcurrency = {
   mode: "serial" as const,
-  key: ({ environmentId, input }: { environmentId: string; input: { threadId: string } }) =>
-    `${environmentId}:${input.threadId}`,
+  key: ({
+    environmentId,
+    input,
+  }: {
+    environmentId: string;
+    input: { readonly threadId?: string; readonly releaseId?: string };
+  }) => `${environmentId}:${input.releaseId ?? input.threadId ?? "unknown-release"}`,
 };
 
 /** Typed client boundary for the durable QA control plane. */
@@ -21,6 +27,14 @@ export const qaEnvironment = {
     label: "environment-data:qa:assigned-releases",
     tag: WS_METHODS.qaListAssignedReleases,
     staleTimeMs: 10_000,
+    // The authorized subscription is the immediate path. Keep this lightweight
+    // PG query as a rollout fallback and periodic reconnect safety net.
+    refreshIntervalMs: 5_000,
+  }),
+  assignedReleaseDashboards: createEnvironmentRpcSubscriptionAtomFamily(connectionAtomRuntime, {
+    label: "environment-data:qa:assigned-release-dashboards",
+    tag: WS_METHODS.qaSubscribeAssignedReleases,
+    idleTtlMs: 30_000,
   }),
   releaseAccess: createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
     label: "environment-data:qa:release-access",
@@ -31,6 +45,9 @@ export const qaEnvironment = {
     label: "environment-data:qa:snapshot",
     tag: WS_METHODS.qaGetSnapshot,
     staleTimeMs: 2_000,
+    // LISTEN/NOTIFY is the fast path; periodic reads close startup and
+    // reconnect races without syncing any local conversation state.
+    refreshIntervalMs: 5_000,
   }),
   events: createEnvironmentRpcSubscriptionAtomFamily(connectionAtomRuntime, {
     label: "environment-data:qa:events",
@@ -40,6 +57,18 @@ export const qaEnvironment = {
   createProject: createEnvironmentRpcCommand(connectionAtomRuntime, {
     label: "environment-data:qa:create-project",
     tag: WS_METHODS.qaCreateProject,
+    scheduler: qaMutationScheduler,
+    concurrency: releaseSerialConcurrency,
+  }),
+  ensureReleaseConversation: createEnvironmentRpcCommand(connectionAtomRuntime, {
+    label: "environment-data:qa:ensure-release-conversation",
+    tag: WS_METHODS.qaEnsureReleaseConversation,
+    scheduler: qaMutationScheduler,
+    concurrency: releaseSerialConcurrency,
+  }),
+  startStageGeneration: createEnvironmentRpcCommand(connectionAtomRuntime, {
+    label: "environment-data:qa:start-stage-generation",
+    tag: WS_METHODS.qaStartStageGeneration,
     scheduler: qaMutationScheduler,
     concurrency: releaseSerialConcurrency,
   }),
@@ -205,3 +234,13 @@ export const qaEnvironment = {
     concurrency: releaseSerialConcurrency,
   }),
 };
+
+/** Revalidate the shared Postgres-backed release list after a QA mutation. */
+export function refreshQaAssignedReleases(environmentId: EnvironmentId): void {
+  appAtomRegistry.refresh(
+    qaEnvironment.listAssignedReleases({
+      environmentId,
+      input: {},
+    }),
+  );
+}

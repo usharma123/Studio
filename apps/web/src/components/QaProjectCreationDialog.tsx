@@ -1,15 +1,14 @@
-import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
+import { QaReleaseId } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
 import { LoaderCircleIcon, ShieldCheckIcon } from "lucide-react";
 import { useState, type FormEvent } from "react";
 
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
 import { useAtomCommand } from "../state/use-atom-command";
-import { qaEnvironment } from "../qa/client";
-import { useRightPanelStore } from "../rightPanelStore";
-import { newProjectId, newThreadId } from "../lib/utils";
-import { buildThreadRouteParams } from "../threadRoutes";
+import { qaEnvironment, refreshQaAssignedReleases } from "../qa/client";
+import { qaReleaseRouteTarget } from "../qaReleaseRoutes";
+import { newProjectId, randomUUID } from "../lib/utils";
 import { Button } from "./ui/button";
 import {
   Dialog,
@@ -73,14 +72,14 @@ export function QaProjectCreationDialog(props: {
     setError(null);
 
     const projectId = newProjectId();
-    const threadId = newThreadId();
+    const releaseId = QaReleaseId.make(randomUUID());
     const environmentId = environment.environmentId;
 
     const projectResult = await createProject({
       environmentId,
       input: {
         projectId,
-        threadId,
+        releaseId,
         projectTitle: trimmedProjectTitle,
         releaseTitle: trimmedReleaseTitle,
       },
@@ -91,14 +90,16 @@ export function QaProjectCreationDialog(props: {
       return;
     }
 
-    const threadRef = scopeThreadRef(environmentId, threadId);
-    useRightPanelStore.getState().open(threadRef, "qa");
+    const createdReleaseId = projectResult.value.releaseId;
+    refreshQaAssignedReleases(environmentId);
     resetForm();
     props.onOpenChange(false);
-    await navigate({
-      to: "/$environmentId/$threadId",
-      params: buildThreadRouteParams(threadRef),
-    });
+    await navigate(
+      qaReleaseRouteTarget({
+        environmentId,
+        releaseId: createdReleaseId,
+      }),
+    );
     toastManager.add({
       type: "success",
       title: `${trimmedProjectTitle} · ${trimmedReleaseTitle} created`,

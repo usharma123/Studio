@@ -187,6 +187,12 @@ export const layer = Layer.effect(
     });
 
     const reconcileBody = Effect.gen(function* () {
+      // Attached clients never own backend processes. This guard lives at the
+      // reconciler boundary so later IPC/settings calls cannot register a WSL
+      // child after DesktopApp deliberately skipped its bootstrap reconcile.
+      if (Option.isSome(configuration.attachedBackend ?? Option.none())) {
+        return;
+      }
       const settings = yield* appSettings.get;
       const available = yield* wslEnvironment.isAvailable;
       const existing = yield* findExistingWslInstance;

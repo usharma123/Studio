@@ -203,6 +203,25 @@ describe("DesktopAppIdentity", () => {
     ),
   );
 
+  it.effect("uses the supervisor-provided development user-data path", () =>
+    withIdentity(
+      Effect.gen(function* () {
+        const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
+        assert.equal(yield* identity.resolveUserDataPath, "/tmp/shared-clients/qa-maker/user-data");
+      }),
+      {
+        legacyPathExists: true,
+        environment: {
+          env: {
+            VITE_DEV_SERVER_URL: "http://localhost:5173",
+            T3CODE_DEV_PROFILE: "qa:maker",
+            T3CODE_DESKTOP_USER_DATA_PATH: "/tmp/shared-clients/qa-maker/user-data",
+          },
+        },
+      },
+    ),
+  );
+
   it.effect("configures app identity from the environment commit override", () => {
     const calls: ElectronAppCalls = {
       setAboutPanelOptions: [],

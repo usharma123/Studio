@@ -36,6 +36,7 @@ export interface IssuedSession {
   readonly method: ServerAuthSessionMethod;
   readonly client: AuthClientMetadata;
   readonly expiresAt: DateTime.DateTime;
+  readonly subject: string;
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
   readonly proofKeyThumbprint?: string;
 }
@@ -49,6 +50,13 @@ export interface VerifiedSession {
   readonly subject: string;
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
   readonly proofKeyThumbprint?: string;
+}
+
+export interface ActiveSessionAuthorization {
+  readonly sessionId: AuthSessionId;
+  readonly subject: string;
+  readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
+  readonly expiresAt: DateTime.DateTime;
 }
 
 export type SessionCredentialChange =
@@ -383,6 +391,28 @@ export class SessionStore extends Context.Service<
     readonly verifyWebSocketToken: (
       token: string,
     ) => Effect.Effect<VerifiedSession, SessionCredentialError>;
+    /**
+     * Revalidates the durable parent session for an already-established
+     * transport. Unlike websocket tickets, this check is not tied to the
+     * short-lived upgrade credential.
+     */
+    readonly assertActive: (
+      sessionId: AuthSessionId,
+    ) => Effect.Effect<void, SessionCredentialError>;
+    /**
+     * Resolves authorization data from the durable session record while also
+     * enforcing revocation and expiration. Downstream credentials must use
+     * this instead of trusting copied subject or scope fields.
+     */
+    readonly resolveActiveAuthorization: (
+      sessionId: AuthSessionId,
+    ) => Effect.Effect<ActiveSessionAuthorization, SessionCredentialError>;
+    /**
+     * Completes as soon as the durable session is revoked, expires, disappears,
+     * or can no longer be verified. Callers race this with a long-lived
+     * transport so invalidation closes the connection promptly.
+     */
+    readonly awaitInvalidation: (sessionId: AuthSessionId) => Effect.Effect<void>;
     readonly listActive: () => Effect.Effect<
       ReadonlyArray<AuthClientSession>,
       SessionCredentialInternalError
@@ -402,6 +432,7 @@ export class SessionStore extends Context.Service<
 const SIGNING_SECRET_NAME = "server-signing-key";
 const DEFAULT_SESSION_TTL = Duration.days(30);
 const DEFAULT_WEBSOCKET_TOKEN_TTL = Duration.minutes(5);
+const SESSION_INVALIDATION_RECHECK_MILLIS = Duration.toMillis(Duration.days(1));
 
 const SessionClaims = Schema.Struct({
   v: Schema.Literal(1),
@@ -645,6 +676,7 @@ export const make = Effect.gen(function* () {
         method: claims.method,
         client,
         expiresAt: expiresAt,
+        subject: claims.sub,
         scopes: claims.scopes,
         ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
       } satisfies IssuedSession;
@@ -817,6 +849,90 @@ export const make = Effect.gen(function* () {
     } satisfies VerifiedSession;
   });
 
+  const resolveActiveAuthorization = Effect.fn("SessionStore.resolveActiveAuthorization")(
+    function* (sessionId: AuthSessionId) {
+      const observedAt = yield* DateTime.now;
+      const row = yield* authSessions
+        .getById({ sessionId })
+        .pipe(
+          Effect.mapError((cause) => new WebSocketTokenVerificationError({ sessionId, cause })),
+        );
+      if (Option.isNone(row)) {
+        return yield* new UnknownWebSocketSessionError({ sessionId });
+      }
+      if (row.value.expiresAt.epochMilliseconds <= observedAt.epochMilliseconds) {
+        return yield* new WebSocketSessionExpiredError({
+          sessionId,
+          expiresAt: row.value.expiresAt,
+          observedAt,
+        });
+      }
+      if (row.value.revokedAt !== null) {
+        return yield* new WebSocketSessionRevokedError({
+          sessionId,
+          revokedAt: row.value.revokedAt,
+        });
+      }
+      return {
+        sessionId: row.value.sessionId,
+        subject: row.value.subject,
+        scopes: row.value.scopes,
+        expiresAt: row.value.expiresAt,
+      } satisfies ActiveSessionAuthorization;
+    },
+  );
+
+  const assertActive: SessionStore["Service"]["assertActive"] = (sessionId) =>
+    resolveActiveAuthorization(sessionId).pipe(Effect.asVoid);
+
+  const awaitInvalidation: SessionStore["Service"]["awaitInvalidation"] = Effect.fn(
+    "SessionStore.awaitInvalidation",
+  )((sessionId) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        // Subscribe before checking the repository. If revocation races this
+        // setup, it is either observed by the subscription or by assertActive.
+        const changes = yield* PubSub.subscribe(changesPubSub);
+        const active = yield* Effect.result(resolveActiveAuthorization(sessionId));
+        if (active._tag === "Failure") {
+          yield* Effect.logWarning("Closing websocket for an inactive auth session.", {
+            sessionId,
+            cause: active.failure,
+          });
+          return;
+        }
+
+        const revoked = Stream.fromSubscription(changes).pipe(
+          Stream.filter(
+            (change) => change.type === "clientRemoved" && change.sessionId === sessionId,
+          ),
+          Stream.runHead,
+          Effect.asVoid,
+        );
+        const expired = Effect.gen(function* () {
+          while (true) {
+            const observedAt = yield* DateTime.now;
+            const remainingMillis =
+              active.success.expiresAt.epochMilliseconds - observedAt.epochMilliseconds;
+            if (remainingMillis <= 0) {
+              return;
+            }
+
+            // Effect's live clock cannot represent sleeps beyond the
+            // JavaScript timer limit. Bounded chunks ensure long sessions
+            // still reach their exact deadline while the outer race remains
+            // immediately responsive to revocation.
+            yield* Effect.sleep(
+              Duration.millis(Math.min(remainingMillis, SESSION_INVALIDATION_RECHECK_MILLIS)),
+            );
+          }
+        });
+
+        yield* Effect.raceFirst(revoked, expired);
+      }),
+    ),
+  );
+
   const listActive: SessionStore["Service"]["listActive"] = Effect.fn("SessionStore.listActive")(
     function* () {
       const now = yield* DateTime.now;
@@ -901,6 +1017,9 @@ export const make = Effect.gen(function* () {
     verify,
     issueWebSocketToken,
     verifyWebSocketToken,
+    assertActive,
+    resolveActiveAuthorization,
+    awaitInvalidation,
     listActive,
     get streamChanges() {
       return Stream.fromPubSub(changesPubSub);

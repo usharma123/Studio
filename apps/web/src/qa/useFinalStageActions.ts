@@ -1,15 +1,16 @@
-import type { QaReleaseSnapshot, QaScript, ScopedThreadRef } from "@t3tools/contracts";
+import type { QaReleaseSnapshot, QaScript } from "@t3tools/contracts";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { qaEnvironment } from "./client";
+import { legacyQaThreadId, type QaReleaseRef } from "./releaseRef";
 interface Options {
-  readonly threadRef: ScopedThreadRef;
+  readonly releaseRef: QaReleaseRef;
   readonly snapshot: QaReleaseSnapshot | null;
   readonly setBusy: (busy: "script" | "readiness" | null) => void;
   readonly setError: (error: string | null) => void;
   readonly setLatestSnapshot: (snapshot: QaReleaseSnapshot) => void;
-  readonly onKickoffAgent: (snapshot: QaReleaseSnapshot) => Promise<void> | void;
 }
 export function useFinalStageActions(options: Options) {
+  const threadId = legacyQaThreadId(options.releaseRef.releaseId);
   const updateScript = useAtomCommand(qaEnvironment.updateScript, {
     reportFailure: false,
   });
@@ -30,9 +31,9 @@ export function useFinalStageActions(options: Options) {
     let revision = plan.revision;
     for (const script of scripts) {
       const result = await updateScript({
-        environmentId: options.threadRef.environmentId,
+        environmentId: options.releaseRef.environmentId,
         input: {
-          threadId: options.threadRef.threadId,
+          threadId,
           planId: plan.id,
           scriptId: script.id,
           expectedRevision: revision,
@@ -63,9 +64,9 @@ export function useFinalStageActions(options: Options) {
     if (!plan) return false;
     const next = await run(options, "script", () =>
       submitScriptPlan({
-        environmentId: options.threadRef.environmentId,
+        environmentId: options.releaseRef.environmentId,
         input: {
-          threadId: options.threadRef.threadId,
+          threadId,
           planId: plan.id,
           expectedRevision: plan.revision,
         },
@@ -78,9 +79,9 @@ export function useFinalStageActions(options: Options) {
     if (!plan) return false;
     const next = await run(options, "script", () =>
       reviewScriptPlan({
-        environmentId: options.threadRef.environmentId,
+        environmentId: options.releaseRef.environmentId,
         input: {
-          threadId: options.threadRef.threadId,
+          threadId,
           planId: plan.id,
           expectedRevision: plan.revision,
           decision,
@@ -92,7 +93,6 @@ export function useFinalStageActions(options: Options) {
         },
       }),
     );
-    if (next && decision === "approved") await options.onKickoffAgent(next);
     return next !== null;
   };
   const reviewReadiness = async (decision: "approved" | "rejected", note?: string) => {
@@ -100,9 +100,9 @@ export function useFinalStageActions(options: Options) {
     if (!dashboard) return false;
     const next = await run(options, "readiness", () =>
       reviewReadinessCommand({
-        environmentId: options.threadRef.environmentId,
+        environmentId: options.releaseRef.environmentId,
         input: {
-          threadId: options.threadRef.threadId,
+          threadId,
           expectedRevision: dashboard.revision,
           decision,
           ...(note

@@ -153,10 +153,10 @@ function EmptyScripts() {
   return (
     <section className="rounded-xl border bg-card px-5 py-10 text-center shadow-sm">
       <Code2 className="mx-auto size-5 text-muted-foreground" />
-      <h3 className="mt-3 text-sm font-medium">Script generation is coordinated from chat</h3>
+      <h3 className="mt-3 text-sm font-medium">Scripts not generated yet</h3>
       <p className="mx-auto mt-1 max-w-md text-xs leading-5 text-muted-foreground">
-        Generated scripts, real execution state, and persisted evidence will appear here. Missing
-        evidence remains visibly missing.
+        A maker can select Generate above. Generated scripts, real execution state, and persisted
+        evidence will appear here.
       </p>
     </section>
   );

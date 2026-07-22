@@ -28,10 +28,11 @@ export function resolvePreviewAutomationOpenTab(
   state: PreviewAutomationSessionIndex,
   requestedTabId: string | undefined,
   reuseExistingTab: boolean,
-): string | null {
-  if (!reuseExistingTab) return null;
+): { readonly tabId: string | null; readonly explicitTargetMissing: boolean } {
+  if (!reuseExistingTab) return { tabId: null, explicitTargetMissing: false };
   if (requestedTabId !== undefined) {
-    return state.sessions[requestedTabId]?.tabId ?? null;
+    const tabId = state.sessions[requestedTabId]?.tabId ?? null;
+    return { tabId, explicitTargetMissing: tabId === null };
   }
-  return state.snapshot?.tabId ?? null;
+  return { tabId: state.snapshot?.tabId ?? null, explicitTargetMissing: false };
 }

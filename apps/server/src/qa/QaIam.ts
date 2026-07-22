@@ -1,5 +1,6 @@
 import * as NodeCrypto from "node:crypto";
 
+import { QaProjectRole, type EnvironmentId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -7,9 +8,6 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import { QaDatabase } from "./QaDatabase.ts";
-
-export const QA_PROJECT_ROLES = ["root", "qa:maker", "qa:approver"] as const;
-export type QaProjectRole = (typeof QA_PROJECT_ROLES)[number];
 
 export const QA_IAM_CAPABILITIES = [
   "qa:read",
@@ -26,11 +24,11 @@ const ROLE_CAPABILITIES = {
   "qa:approver": ["qa:read", "qa:approve", "qa:chat", "qa:test-application"],
 } as const satisfies Record<QaProjectRole, ReadonlyArray<QaIamCapability>>;
 
-const roleSet = new Set<string>(QA_PROJECT_ROLES);
+const isContractQaProjectRole = Schema.is(QaProjectRole);
 const encodeUnknownJsonString = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 
 export function isQaProjectRole(value: string): value is QaProjectRole {
-  return roleSet.has(value);
+  return isContractQaProjectRole(value);
 }
 
 export function capabilitiesForQaProjectRole(role: QaProjectRole): ReadonlyArray<QaIamCapability> {
@@ -43,6 +41,7 @@ export const QaIamErrorCode = Schema.Literals([
   "capability_denied",
   "release_not_found",
   "conversation_not_found",
+  "conversation_access_denied",
   "conversation_conflict",
   "persistence_error",
 ]);
@@ -80,6 +79,7 @@ export interface QaReleaseConversationBinding {
   readonly releaseThreadId: string;
   readonly conversationThreadId: string;
   readonly principalId: string;
+  readonly environmentId: EnvironmentId;
 }
 
 export interface QaConversationAccess extends QaReleaseAccess {
@@ -117,11 +117,13 @@ type BindReleaseConversationInput = {
   readonly subject: string;
   readonly releaseThreadId: string;
   readonly conversationThreadId: string;
+  readonly environmentId: EnvironmentId;
 };
 
 type ResolveConversationInput = {
   readonly subject: string;
   readonly conversationThreadId: string;
+  readonly environmentId: EnvironmentId;
   readonly capability: QaIamCapability;
 };
 
@@ -132,6 +134,7 @@ type AppendAuditEventInput = {
   readonly projectId: string;
   readonly releaseThreadId?: string;
   readonly conversationThreadId?: string;
+  readonly environmentId?: EnvironmentId;
   readonly action: string;
   readonly targetType: string;
   readonly targetId: string;
@@ -161,9 +164,10 @@ type QaIamShape = {
   readonly authorizeConversation: (
     input: ResolveConversationInput,
   ) => Effect.Effect<QaConversationAccess, QaIamError>;
-  readonly resolveConversationContext: (
-    conversationThreadId: string,
-  ) => Effect.Effect<QaConversationAccess, QaIamError>;
+  readonly resolveConversationContext: (input: {
+    readonly conversationThreadId: string;
+    readonly environmentId: EnvironmentId;
+  }) => Effect.Effect<QaConversationAccess, QaIamError>;
   readonly appendAuditEvent: (
     input: AppendAuditEventInput,
   ) => Effect.Effect<QaAuditEventReceipt, QaIamError>;
@@ -202,6 +206,7 @@ type ConversationRow = {
   readonly releaseThreadId: string;
   readonly conversationThreadId: string;
   readonly principalId: string;
+  readonly environmentId: EnvironmentId;
 };
 
 const domainError = (code: QaIamErrorCode, message: string) => new QaIamError({ code, message });
@@ -326,7 +331,15 @@ export const make = Effect.gen(function* () {
     const existingAccess = assignedProjects.find(
       (candidate) => candidate.projectId === input.projectId,
     );
-    if (existingAccess) return existingAccess;
+    if (existingAccess) {
+      if (!existingAccess.capabilities.includes("qa:make")) {
+        return yield* domainError(
+          "capability_denied",
+          `The ${existingAccess.role} role does not grant qa:make.`,
+        );
+      }
+      return existingAccess;
+    }
 
     const existingProjects = yield* sql<ProjectOrganizationRow>`
       SELECT organization_id AS "organizationId"
@@ -373,6 +386,12 @@ export const make = Effect.gen(function* () {
       return yield* domainError(
         "project_access_denied",
         "The principal is not allowed to create a QA project.",
+      );
+    }
+    if (!capabilitiesForQaProjectRole(context.role).includes("qa:make")) {
+      return yield* domainError(
+        "capability_denied",
+        `The ${context.role} role does not grant qa:make.`,
       );
     }
 
@@ -456,14 +475,18 @@ export const make = Effect.gen(function* () {
   const loadConversationForPrincipal = Effect.fn("QaIam.loadConversationForPrincipal")(function* (
     releaseThreadId: string,
     principalId: string,
+    environmentId: EnvironmentId,
   ) {
     const rows = yield* sql<ConversationRow>`
         SELECT
           release_thread_id AS "releaseThreadId",
           conversation_thread_id AS "conversationThreadId",
-          principal_id AS "principalId"
+          principal_id AS "principalId",
+          environment_id AS "environmentId"
         FROM qa_release_conversations
-        WHERE release_thread_id = ${releaseThreadId} AND principal_id = ${principalId}
+        WHERE release_thread_id = ${releaseThreadId}
+          AND principal_id = ${principalId}
+          AND environment_id = ${environmentId}
       `.pipe(Effect.mapError((cause) => persistenceError("loadConversationForPrincipal", cause)));
     return rows[0] ?? null;
   });
@@ -479,6 +502,7 @@ export const make = Effect.gen(function* () {
     const existing = yield* loadConversationForPrincipal(
       input.releaseThreadId,
       access.principal.id,
+      input.environmentId,
     );
     if (existing) {
       if (existing.conversationThreadId !== input.conversationThreadId) {
@@ -493,15 +517,21 @@ export const make = Effect.gen(function* () {
     const timestamp = DateTime.formatIso(yield* DateTime.now);
     yield* sql`
       INSERT INTO qa_release_conversations (
-        release_thread_id, principal_id, conversation_thread_id, created_at, updated_at
+        release_thread_id, principal_id, environment_id, conversation_thread_id,
+        created_at, updated_at
       ) VALUES (
-        ${input.releaseThreadId}, ${access.principal.id}, ${input.conversationThreadId},
+        ${input.releaseThreadId}, ${access.principal.id}, ${input.environmentId},
+        ${input.conversationThreadId},
         ${timestamp}, ${timestamp}
       )
       ON CONFLICT DO NOTHING
     `.pipe(Effect.mapError((cause) => persistenceError("bindReleaseConversation", cause)));
 
-    const bound = yield* loadConversationForPrincipal(input.releaseThreadId, access.principal.id);
+    const bound = yield* loadConversationForPrincipal(
+      input.releaseThreadId,
+      access.principal.id,
+      input.environmentId,
+    );
     if (!bound || bound.conversationThreadId !== input.conversationThreadId) {
       return yield* domainError(
         "conversation_conflict",
@@ -519,10 +549,12 @@ export const make = Effect.gen(function* () {
       SELECT
         release_thread_id AS "releaseThreadId",
         conversation_thread_id AS "conversationThreadId",
-        principal_id AS "principalId"
+        principal_id AS "principalId",
+        environment_id AS "environmentId"
       FROM qa_release_conversations
       WHERE conversation_thread_id = ${input.conversationThreadId}
         AND principal_id = ${principal.id}
+        AND environment_id = ${input.environmentId}
     `.pipe(Effect.mapError((cause) => persistenceError("authorizeConversation", cause)));
     const conversation = rows[0];
     if (!conversation) {
@@ -539,33 +571,46 @@ export const make = Effect.gen(function* () {
     return { ...access, conversation } satisfies QaConversationAccess;
   });
 
-  const resolveConversationContext = Effect.fn("QaIam.resolveConversationContext")(function* (
-    conversationThreadId: string,
-  ) {
-    const rows = yield* sql<ConversationRow & { readonly subject: string }>`
+  const resolveConversationContext = Effect.fn("QaIam.resolveConversationContext")(
+    function* (input: {
+      readonly conversationThreadId: string;
+      readonly environmentId: EnvironmentId;
+    }) {
+      const rows = yield* sql<
+        ConversationRow & { readonly subject: string; readonly principalStatus: string }
+      >`
       SELECT
         conversations.release_thread_id AS "releaseThreadId",
         conversations.conversation_thread_id AS "conversationThreadId",
         conversations.principal_id AS "principalId",
-        principals.subject
+        conversations.environment_id AS "environmentId",
+        principals.subject,
+        principals.status AS "principalStatus"
       FROM qa_release_conversations conversations
       JOIN application_principals principals ON principals.id = conversations.principal_id
-      WHERE conversations.conversation_thread_id = ${conversationThreadId}
-        AND principals.status = 'active'
+      WHERE conversations.conversation_thread_id = ${input.conversationThreadId}
     `.pipe(Effect.mapError((cause) => persistenceError("resolveConversationContext", cause)));
-    const row = rows[0];
-    if (!row) {
-      return yield* domainError(
-        "conversation_not_found",
-        "No active QA release conversation has this thread identifier.",
-      );
-    }
-    return yield* authorizeConversation({
-      subject: row.subject,
-      conversationThreadId,
-      capability: "qa:chat",
-    });
-  });
+      const row = rows[0];
+      if (!row) {
+        return yield* domainError(
+          "conversation_not_found",
+          "No active QA release conversation has this thread identifier.",
+        );
+      }
+      if (row.environmentId !== input.environmentId || row.principalStatus !== "active") {
+        return yield* domainError(
+          "conversation_access_denied",
+          "The QA release conversation is not available to this environment or principal.",
+        );
+      }
+      return yield* authorizeConversation({
+        subject: row.subject,
+        conversationThreadId: input.conversationThreadId,
+        environmentId: input.environmentId,
+        capability: "qa:chat",
+      });
+    },
+  );
 
   const appendAuditEvent = Effect.fn("QaIam.appendAuditEvent")(function* (
     input: AppendAuditEventInput,
@@ -588,9 +633,16 @@ export const make = Effect.gen(function* () {
       );
     }
     if (input.conversationThreadId) {
+      if (input.environmentId === undefined) {
+        return yield* domainError(
+          "conversation_not_found",
+          "An environment is required for a release conversation audit event.",
+        );
+      }
       const conversationAccess = yield* authorizeConversation({
         subject: input.subject,
         conversationThreadId: input.conversationThreadId,
+        environmentId: input.environmentId,
         capability: "qa:read",
       });
       if (

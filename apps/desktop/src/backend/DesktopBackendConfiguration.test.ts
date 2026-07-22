@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
+import { DesktopBackendBootstrap } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -28,6 +29,7 @@ const PersistedServerObservabilitySettingsDocument = Schema.Struct({
 const encodePersistedServerObservabilitySettingsDocument = Schema.encodeEffect(
   Schema.fromJsonString(PersistedServerObservabilitySettingsDocument),
 );
+const encodeDesktopBackendBootstrap = Schema.encodeEffect(DesktopBackendBootstrap);
 
 const isDesktopBackendObservabilitySettingsReadError = Schema.is(
   DesktopBackendConfiguration.DesktopBackendObservabilitySettingsReadError,
@@ -125,6 +127,32 @@ const withHarness = <A, E, R>(
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 describe("DesktopBackendConfiguration", () => {
+  it.effect("encodes an explicit root profile for the packaged managed rollback path", () =>
+    withHarness(
+      Effect.gen(function* () {
+        const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+        const primary = yield* configuration.resolvePrimary;
+
+        assert.equal(primary.bootstrap.developmentProfile, "root");
+        const encoded = yield* encodeDesktopBackendBootstrap(primary.bootstrap);
+        assert.equal(encoded.developmentProfile, "root");
+      }),
+      { isPackaged: true },
+    ),
+  );
+
+  it.effect("fails closed when managed desktop development omits its profile", () =>
+    withHarness(
+      Effect.gen(function* () {
+        const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+        const error = yield* configuration.resolvePrimary.pipe(Effect.flip);
+
+        assert.equal(error._tag, "DesktopManagedDevelopmentProfileRequiredError");
+      }),
+      { isPackaged: false, devServerUrl: "http://localhost:5173" },
+    ),
+  );
+
   it.effect("propagates the trusted development profile to the backend bootstrap", () =>
     withHarness(
       Effect.gen(function* () {
@@ -159,14 +187,21 @@ describe("DesktopBackendConfiguration", () => {
         assert.isUndefined(first.env.T3CODE_DESKTOP_LAN_HOST);
 
         assert.equal(first.bootstrap.mode, "desktop");
+        if (first.bootstrap.mode !== "desktop") {
+          assert.fail(`expected desktop bootstrap mode, received ${first.bootstrap.mode}`);
+        }
         assert.equal(first.bootstrap.noBrowser, true);
         assert.equal(first.bootstrap.port, 4888);
         assert.equal(first.bootstrap.host, "0.0.0.0");
         assert.equal(first.bootstrap.t3Home, environment.baseDir);
         assert.equal(first.bootstrap.tailscaleServeEnabled, true);
         assert.equal(first.bootstrap.tailscaleServePort, 8443);
-        assert.match(first.bootstrap.desktopBootstrapToken, /^[0-9a-f]{48}$/i);
-        assert.equal(second.bootstrap.desktopBootstrapToken, first.bootstrap.desktopBootstrapToken);
+        const firstBootstrapToken = first.bootstrap.desktopBootstrapToken;
+        if (typeof firstBootstrapToken !== "string") {
+          assert.fail("expected desktop bootstrap token");
+        }
+        assert.match(firstBootstrapToken, /^[0-9a-f]{48}$/i);
+        assert.equal(second.bootstrap.desktopBootstrapToken, firstBootstrapToken);
       }),
     ),
   );
@@ -281,6 +316,7 @@ describe("DesktopBackendConfiguration", () => {
                 makeEnvironmentLayer(baseDir, {
                   appPath: baseDir,
                   devServerUrl,
+                  developmentProfile: "root",
                   dirname: path.join(baseDir, "apps/desktop/src"),
                   isPackaged: false,
                   platform: "win32",
@@ -451,6 +487,7 @@ describe("DesktopBackendConfiguration", () => {
               makeEnvironmentLayer(baseDir, {
                 isPackaged: false,
                 devServerUrl: "http://127.0.0.1:5733",
+                developmentProfile: "root",
               }),
             ),
           ),

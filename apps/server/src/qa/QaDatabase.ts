@@ -21,10 +21,11 @@ const liveConfig = Config.all({
   ),
 });
 
-export const layer = Layer.unwrap(
+/** Shared PostgreSQL pool for QA persistence and cross-process notifications. */
+export const postgresLayer = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* liveConfig;
-    const pgLayer = PgClient.layer({
+    return PgClient.layer({
       url: Redacted.make(config.databaseUrl),
       applicationName: "t3-qa-workflow",
       maxConnections: 8,
@@ -36,17 +37,17 @@ export const layer = Layer.unwrap(
         "service.name": "t3-server",
       },
     });
-
-    return Layer.effect(
-      QaDatabase,
-      Effect.gen(function* () {
-        const sql = yield* SqlClient.SqlClient;
-        yield* migrateQaDatabase(sql);
-        return sql;
-      }),
-    ).pipe(Layer.provide(pgLayer));
   }),
 );
+
+export const layer = Layer.effect(
+  QaDatabase,
+  Effect.gen(function* () {
+    const sql = yield* PgClient.PgClient;
+    yield* migrateQaDatabase(sql);
+    return sql;
+  }),
+).pipe(Layer.provide(postgresLayer));
 
 /** Test adapter: QA and orchestration share the in-memory SQLite client. */
 export const layerFromSqlClient = Layer.effect(

@@ -12,6 +12,8 @@ import type {
 } from "@t3tools/contracts";
 import {
   ApprovalRequestId,
+  AuthSessionId,
+  EnvironmentId,
   EventId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -22,6 +24,7 @@ import {
 import { createModelSelection } from "@t3tools/shared/model";
 import { it, assert, vi } from "@effect/vitest";
 
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -46,11 +49,16 @@ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
-import { makeProviderServiceLive } from "./ProviderService.ts";
+import {
+  makeProviderServiceLive as makeProviderServiceLiveBase,
+  type ProviderServiceLiveOptions,
+} from "./ProviderService.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
+import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 import {
   makeSqlitePersistenceLive,
   SqlitePersistenceMemory,
@@ -58,6 +66,68 @@ import {
 import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
+
+const makeTestMcpCredential = (
+  request: McpSessionRegistry.McpCredentialRequest,
+  providerSessionId = `provider-service-test:${request.threadId}`,
+): McpSessionRegistry.McpIssuedCredential => ({
+  config: {
+    initiatingSessionId: request.initiatingSessionId,
+    environmentId: EnvironmentId.make("provider-service-test"),
+    threadId: request.threadId,
+    providerSessionId,
+    providerInstanceId: request.providerInstanceId,
+    endpoint: "http://127.0.0.1/mcp",
+    authorizationHeader: `Bearer ${providerSessionId}`,
+    authorizationContext: {
+      kind: "standard",
+      principalSubject: "local:root",
+      workspaceAdministrator: true,
+    },
+  },
+  expiresAt: Number.MAX_SAFE_INTEGER,
+});
+
+const providerServiceTestAuthorization: ProviderService.ProviderSessionAuthorization = {
+  initiatingSessionId: AuthSessionId.make("provider-service-test-session"),
+};
+
+const makeProviderServiceLive = (options?: ProviderServiceLiveOptions) => {
+  const base = makeProviderServiceLiveBase({
+    ...options,
+    issueMcpCredential:
+      options?.issueMcpCredential ??
+      ((request) =>
+        Effect.sync(() => {
+          const credential = makeTestMcpCredential(request);
+          McpProviderSession.setMcpProviderSession(credential.config);
+          return credential;
+        })),
+    validateMcpCredential:
+      options?.validateMcpCredential ??
+      ((request) =>
+        Effect.sync(() => {
+          const current = McpProviderSession.readMcpProviderSession(request.threadId);
+          const isValid = current?.initiatingSessionId === request.initiatingSessionId;
+          if (!isValid) {
+            McpProviderSession.clearMcpProviderSession(request.threadId);
+          }
+          return isValid;
+        })),
+  });
+  return Layer.effect(
+    ProviderService.ProviderService,
+    Effect.map(ProviderService.ProviderService, (service) =>
+      ProviderService.ProviderService.of({
+        ...service,
+        startSession: (threadId, input, authorization = providerServiceTestAuthorization) =>
+          service.startSession(threadId, input, authorization),
+        sendTurn: (input, authorization = providerServiceTestAuthorization) =>
+          service.sendTurn(input, authorization),
+      }),
+    ),
+  ).pipe(Layer.provide(base));
+};
 
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
 
@@ -426,6 +496,687 @@ it.effect("ProviderServiceLive rejects new sessions for disabled providers", () 
     assert.instanceOf(failure, ProviderValidationError);
     assert.include(failure.issue, "Provider instance 'claudeAgent' is disabled");
     assert.equal(claude.startSession.mock.calls.length, 0);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "ProviderServiceLive fails before adapter startup when MCP authorization is unavailable",
+  () =>
+    Effect.gen(function* () {
+      const codex = makeFakeCodexAdapter();
+      const registry = makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter });
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const providerLayer = makeProviderServiceLive({
+        issueMcpCredential: () =>
+          Effect.fail(
+            new McpSessionRegistry.McpSessionRegistryUnavailableError({
+              message: "The provider MCP session registry is not active.",
+            }),
+          ),
+      }).pipe(
+        Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+        Layer.provide(directoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+
+      const failure = yield* Effect.flip(
+        Effect.gen(function* () {
+          const provider = yield* ProviderService.ProviderService;
+          return yield* provider.startSession(asThreadId("thread-mcp-unavailable"), {
+            provider: CODEX_DRIVER,
+            providerInstanceId: codexInstanceId,
+            threadId: asThreadId("thread-mcp-unavailable"),
+            runtimeMode: "full-access",
+          });
+        }).pipe(Effect.provide(providerLayer)),
+      );
+
+      assert.instanceOf(failure, ProviderValidationError);
+      assert.equal(failure.operation, "ProviderService.prepareMcpSession");
+      assert.include(failure.issue, "canonical provider authorization context");
+      assert.equal(codex.startSession.mock.calls.length, 0);
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("ProviderServiceLive rejects an active turn without session provenance", () =>
+  Effect.gen(function* () {
+    const threadId = asThreadId("thread-send-without-session-provenance");
+    const codex = makeFakeCodexAdapter();
+    const registry = makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter });
+    const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+      Layer.provide(SqlitePersistenceMemory),
+    );
+    const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+    const providerLayer = makeProviderServiceLiveBase({
+      issueMcpCredential: (request) =>
+        Effect.sync(() => {
+          const credential = makeTestMcpCredential(request);
+          McpProviderSession.setMcpProviderSession(credential.config);
+          return credential;
+        }),
+      validateMcpCredential: () => Effect.succeed(true),
+    }).pipe(
+      Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(directoryLayer),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+
+    const failure = yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      yield* provider.startSession(
+        threadId,
+        {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        },
+        providerServiceTestAuthorization,
+      );
+      return yield* provider
+        .sendTurn({
+          threadId,
+          input: "this must not reach the adapter",
+          attachments: [],
+        })
+        .pipe(Effect.flip);
+    }).pipe(
+      Effect.provide(providerLayer),
+      Effect.ensuring(Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
+    );
+
+    assert.instanceOf(failure, ProviderValidationError);
+    assert.equal(failure.operation, "ProviderService.sendTurn");
+    assert.include(failure.issue, "Authenticated session provenance");
+    assert.equal(codex.sendTurn.mock.calls.length, 0);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "ProviderServiceLive rotates an active MCP session when the initiating session changes",
+  () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-mcp-authorization-rotation");
+      yield* Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId));
+      const authorizationA: ProviderService.ProviderSessionAuthorization = {
+        initiatingSessionId: AuthSessionId.make("provider-session-a"),
+      };
+      const authorizationB: ProviderService.ProviderSessionAuthorization = {
+        initiatingSessionId: AuthSessionId.make("provider-session-b"),
+      };
+      const trace: Array<string> = [];
+      const issuedCredentials: Array<McpSessionRegistry.McpIssuedCredential> = [];
+      const codex = makeFakeCodexAdapter();
+      const baseStartSession = codex.startSession.getMockImplementation();
+      const baseSendTurn = codex.sendTurn.getMockImplementation();
+      const baseStopSession = codex.stopSession.getMockImplementation();
+      if (!baseStartSession || !baseSendTurn || !baseStopSession) {
+        return yield* Effect.die("The fake Codex adapter must define session lifecycle methods.");
+      }
+      const describeActiveCredential = () => {
+        const current = McpProviderSession.readMcpProviderSession(threadId);
+        return current ? `${current.initiatingSessionId}:${current.authorizationHeader}` : "none";
+      };
+      codex.startSession.mockImplementation((input) =>
+        Effect.sync(() => trace.push(`start:${describeActiveCredential()}`)).pipe(
+          Effect.andThen(baseStartSession(input)),
+        ),
+      );
+      codex.sendTurn.mockImplementation((input) =>
+        Effect.sync(() => trace.push(`send:${describeActiveCredential()}`)).pipe(
+          Effect.andThen(baseSendTurn(input)),
+        ),
+      );
+      codex.stopSession.mockImplementation((requestedThreadId) =>
+        Effect.sync(() => trace.push(`stop:${describeActiveCredential()}`)).pipe(
+          Effect.andThen(baseStopSession(requestedThreadId)),
+        ),
+      );
+      const registry = makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter });
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const providerLayer = makeProviderServiceLive({
+        issueMcpCredential: (request) =>
+          Effect.sync(() => {
+            trace.push(`issue-before:${request.initiatingSessionId}:${describeActiveCredential()}`);
+            const credential = makeTestMcpCredential(
+              request,
+              `authorization-rotation-${issuedCredentials.length + 1}`,
+            );
+            issuedCredentials.push(credential);
+            McpProviderSession.setMcpProviderSession(credential.config);
+            trace.push(
+              `issue:${credential.config.initiatingSessionId}:${credential.config.authorizationHeader}`,
+            );
+            return credential;
+          }),
+      }).pipe(
+        Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+        Layer.provide(directoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+
+      const result = yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const startInput = {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access" as const,
+        };
+        yield* provider.startSession(threadId, startInput, authorizationA);
+        const credentialA = McpProviderSession.readMcpProviderSession(threadId);
+        yield* provider.sendTurn(
+          {
+            threadId,
+            input: "same authenticated session",
+            attachments: [],
+          },
+          authorizationA,
+        );
+        const sameSessionTrace = [...trace];
+        trace.length = 0;
+
+        yield* provider.sendTurn(
+          {
+            threadId,
+            input: "different authenticated session",
+            attachments: [],
+          },
+          authorizationB,
+        );
+        return {
+          credentialA,
+          credentialB: McpProviderSession.readMcpProviderSession(threadId),
+          sameSessionTrace,
+          rotationTrace: [...trace],
+        };
+      }).pipe(
+        Effect.provide(providerLayer),
+        Effect.ensuring(Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
+      );
+
+      assert.isDefined(result.credentialA);
+      assert.isDefined(result.credentialB);
+      if (!result.credentialA || !result.credentialB) return;
+
+      const bearerA = result.credentialA.authorizationHeader;
+      const bearerB = result.credentialB.authorizationHeader;
+      assert.notEqual(bearerA, bearerB);
+      assert.equal(result.credentialA.initiatingSessionId, authorizationA.initiatingSessionId);
+      assert.equal(result.credentialB.initiatingSessionId, authorizationB.initiatingSessionId);
+      assert.equal(issuedCredentials.length, 2);
+      assert.equal(codex.stopSession.mock.calls.length, 1);
+      assert.equal(codex.startSession.mock.calls.length, 2);
+      assert.equal(codex.sendTurn.mock.calls.length, 2);
+      assert.deepEqual(result.sameSessionTrace, [
+        `issue-before:${authorizationA.initiatingSessionId}:none`,
+        `issue:${authorizationA.initiatingSessionId}:${bearerA}`,
+        `start:${authorizationA.initiatingSessionId}:${bearerA}`,
+        `send:${authorizationA.initiatingSessionId}:${bearerA}`,
+      ]);
+      assert.deepEqual(result.rotationTrace, [
+        "stop:none",
+        `issue-before:${authorizationB.initiatingSessionId}:none`,
+        `issue:${authorizationB.initiatingSessionId}:${bearerB}`,
+        `start:${authorizationB.initiatingSessionId}:${bearerB}`,
+        `send:${authorizationB.initiatingSessionId}:${bearerB}`,
+      ]);
+      assert.equal(
+        result.rotationTrace.some((entry) => entry.includes(bearerA)),
+        false,
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "ProviderServiceLive rotates an expired MCP credential for the same initiating session",
+  () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-mcp-expiry-rotation");
+      yield* Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId));
+      const authorization: ProviderService.ProviderSessionAuthorization = {
+        initiatingSessionId: AuthSessionId.make("provider-session-expired"),
+      };
+      const trace: Array<string> = [];
+      const issuedCredentials: Array<McpSessionRegistry.McpIssuedCredential> = [];
+      const codex = makeFakeCodexAdapter();
+      const baseStartSession = codex.startSession.getMockImplementation();
+      const baseSendTurn = codex.sendTurn.getMockImplementation();
+      const baseStopSession = codex.stopSession.getMockImplementation();
+      if (!baseStartSession || !baseSendTurn || !baseStopSession) {
+        return yield* Effect.die("The fake Codex adapter must define session lifecycle methods.");
+      }
+      const describeActiveCredential = () =>
+        McpProviderSession.readMcpProviderSession(threadId)?.authorizationHeader ?? "none";
+      codex.startSession.mockImplementation((input) =>
+        Effect.sync(() => trace.push(`start:${describeActiveCredential()}`)).pipe(
+          Effect.andThen(baseStartSession(input)),
+        ),
+      );
+      codex.sendTurn.mockImplementation((input) =>
+        Effect.sync(() => trace.push(`send:${describeActiveCredential()}`)).pipe(
+          Effect.andThen(baseSendTurn(input)),
+        ),
+      );
+      codex.stopSession.mockImplementation((requestedThreadId) =>
+        Effect.sync(() => trace.push(`stop:${describeActiveCredential()}`)).pipe(
+          Effect.andThen(baseStopSession(requestedThreadId)),
+        ),
+      );
+      const registry = makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter });
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const providerLayer = makeProviderServiceLive({
+        validateMcpCredential: () => Effect.succeed(false),
+        issueMcpCredential: (request) =>
+          Effect.sync(() => {
+            trace.push(`issue-before:${describeActiveCredential()}`);
+            const credential = makeTestMcpCredential(
+              request,
+              `expiry-rotation-${issuedCredentials.length + 1}`,
+            );
+            issuedCredentials.push(credential);
+            McpProviderSession.setMcpProviderSession(credential.config);
+            trace.push(`issue:${credential.config.authorizationHeader}`);
+            return credential;
+          }),
+      }).pipe(
+        Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+        Layer.provide(directoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+
+      const result = yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        yield* provider.startSession(
+          threadId,
+          {
+            provider: CODEX_DRIVER,
+            providerInstanceId: codexInstanceId,
+            threadId,
+            runtimeMode: "full-access",
+          },
+          authorization,
+        );
+        const credentialA = McpProviderSession.readMcpProviderSession(threadId);
+        trace.length = 0;
+        yield* provider.sendTurn(
+          {
+            threadId,
+            input: "rotate the expired credential",
+            attachments: [],
+          },
+          authorization,
+        );
+        return {
+          credentialA,
+          credentialB: McpProviderSession.readMcpProviderSession(threadId),
+          rotationTrace: [...trace],
+        };
+      }).pipe(
+        Effect.provide(providerLayer),
+        Effect.ensuring(Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
+      );
+
+      assert.isDefined(result.credentialA);
+      assert.isDefined(result.credentialB);
+      if (!result.credentialA || !result.credentialB) return;
+      const bearerA = result.credentialA.authorizationHeader;
+      const bearerB = result.credentialB.authorizationHeader;
+      assert.notEqual(bearerA, bearerB);
+      assert.equal(result.credentialB.initiatingSessionId, authorization.initiatingSessionId);
+      assert.equal(codex.stopSession.mock.calls.length, 1);
+      assert.equal(codex.startSession.mock.calls.length, 2);
+      assert.deepEqual(result.rotationTrace, [
+        "stop:none",
+        "issue-before:none",
+        `issue:${bearerB}`,
+        `start:${bearerB}`,
+        `send:${bearerB}`,
+      ]);
+      assert.equal(
+        result.rotationTrace.some((entry) => entry.includes(bearerA)),
+        false,
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("ProviderServiceLive cannot publish or clear a superseded concurrent credential", () =>
+  Effect.gen(function* () {
+    const threadId = asThreadId("thread-concurrent-mcp-publication");
+    const firstAdapterStarted = yield* Deferred.make<void>();
+    const releaseFirstAdapter = yield* Deferred.make<void>();
+    let issueSequence = 0;
+    let adapterStartSequence = 0;
+    const codex = makeFakeCodexAdapter();
+    const sessionFromInput = (input: ProviderSessionStartInput): ProviderSession => ({
+      provider: CODEX_DRIVER,
+      providerInstanceId: input.providerInstanceId,
+      status: "ready",
+      runtimeMode: input.runtimeMode,
+      threadId: input.threadId,
+      resumeCursor: { opaque: `resume-${input.threadId}` },
+      cwd: input.cwd ?? process.cwd(),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    const startConcurrentSession = (
+      input: ProviderSessionStartInput,
+    ): Effect.Effect<ProviderSession, ProviderAdapterError> =>
+      Effect.gen(function* () {
+        const sequence = yield* Effect.sync(() => {
+          adapterStartSequence += 1;
+          return adapterStartSequence;
+        });
+        if (sequence === 1) {
+          yield* Deferred.succeed(firstAdapterStarted, undefined);
+          yield* Deferred.await(releaseFirstAdapter);
+        }
+        return sessionFromInput(input);
+      });
+    const concurrentAdapter: ProviderAdapterShape<ProviderAdapterError> = {
+      ...codex.adapter,
+      startSession: startConcurrentSession,
+    };
+    const registry = makeAdapterRegistryMock({ [CODEX_DRIVER]: concurrentAdapter });
+    const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+      Layer.provide(SqlitePersistenceMemory),
+    );
+    const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+    const providerServiceLayer = makeProviderServiceLive({
+      issueMcpCredential: (request) =>
+        Effect.gen(function* () {
+          const sequence = yield* Effect.sync(() => {
+            issueSequence += 1;
+            return issueSequence;
+          });
+          const credential = makeTestMcpCredential(request, `provider-session-${sequence}`);
+          yield* Effect.sync(() => McpProviderSession.setMcpProviderSession(credential.config));
+          return credential;
+        }),
+    }).pipe(
+      Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(directoryLayer),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+
+    const results = yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const startInput = {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access" as const,
+      };
+      const first = yield* provider
+        .startSession(threadId, startInput)
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Deferred.await(firstAdapterStarted);
+      const second = yield* provider
+        .startSession(threadId, startInput)
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Effect.yieldNow;
+      const issueCountWhileFirstIsActive = issueSequence;
+      yield* Deferred.succeed(releaseFirstAdapter, undefined);
+      return {
+        first: yield* Fiber.join(first),
+        second: yield* Fiber.join(second),
+        issueCountWhileFirstIsActive,
+        currentProviderSessionId:
+          McpProviderSession.readMcpProviderSession(threadId)?.providerSessionId,
+      };
+    }).pipe(Effect.provide(providerServiceLayer));
+
+    assert.equal(results.issueCountWhileFirstIsActive, 1);
+    assert.equal(results.first._tag, "Success");
+    assert.equal(results.second._tag, "Success");
+    assert.equal(results.currentProviderSessionId, "provider-session-2");
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("ProviderServiceLive stop cannot revoke a concurrent replacement credential", () =>
+  Effect.gen(function* () {
+    const threadId = asThreadId("thread-concurrent-stop-start");
+    const stopEntered = yield* Deferred.make<void>();
+    const releaseStop = yield* Deferred.make<void>();
+    let credentialAtStopEntry: McpProviderSession.McpProviderSessionConfig | undefined;
+    let issueSequence = 0;
+    const codex = makeFakeCodexAdapter();
+    codex.stopSession.mockImplementation(() =>
+      Effect.sync(() => {
+        credentialAtStopEntry = McpProviderSession.readMcpProviderSession(threadId);
+      }).pipe(
+        Effect.andThen(Deferred.succeed(stopEntered, undefined)),
+        Effect.andThen(Deferred.await(releaseStop)),
+      ),
+    );
+    const registry = makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter });
+    const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+      Layer.provide(SqlitePersistenceMemory),
+    );
+    const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+    const providerServiceLayer = makeProviderServiceLive({
+      issueMcpCredential: (request) =>
+        Effect.sync(() => {
+          issueSequence += 1;
+          const credential = makeTestMcpCredential(
+            request,
+            `stop-start-provider-session-${issueSequence}`,
+          );
+          McpProviderSession.setMcpProviderSession(credential.config);
+          return credential;
+        }),
+    }).pipe(
+      Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(directoryLayer),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+    const providerLayer = Layer.mergeAll(providerServiceLayer, directoryLayer);
+
+    const result = yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const sessionDirectory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const startInput = {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access" as const,
+      };
+      yield* provider.startSession(threadId, startInput);
+      const stop = yield* provider.stopSession({ threadId }).pipe(Effect.result, Effect.forkChild);
+      yield* Deferred.await(stopEntered);
+      const credentialWhileStopIsBlocked = McpProviderSession.readMcpProviderSession(threadId);
+      const replacement = yield* provider
+        .startSession(threadId, startInput)
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Effect.yieldNow;
+      const issueCountWhileStopIsActive = issueSequence;
+      yield* Deferred.succeed(releaseStop, undefined);
+      const stopResult = yield* Fiber.join(stop);
+      const replacementResult = yield* Fiber.join(replacement);
+      const binding = Option.getOrUndefined(yield* sessionDirectory.getBinding(threadId));
+      return {
+        replacement: replacementResult,
+        stop: stopResult,
+        issueCountWhileStopIsActive,
+        credentialAtStopEntry,
+        credentialWhileStopIsBlocked,
+        bindingStatus: binding?.status,
+        currentProviderSessionId:
+          McpProviderSession.readMcpProviderSession(threadId)?.providerSessionId,
+      };
+    }).pipe(Effect.provide(providerLayer));
+
+    assert.equal(result.issueCountWhileStopIsActive, 1);
+    assert.equal(result.credentialAtStopEntry, undefined);
+    assert.equal(result.credentialWhileStopIsBlocked, undefined);
+    assert.equal(result.replacement._tag, "Success");
+    assert.equal(result.stop._tag, "Success");
+    assert.equal(result.bindingStatus, "running");
+    assert.equal(result.currentProviderSessionId, "stop-start-provider-session-2");
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("ProviderServiceLive serializes concurrent recovery for one persisted thread", () =>
+  Effect.gen(function* () {
+    const threadId = asThreadId("thread-concurrent-recovery");
+    const firstRecoveryStarted = yield* Deferred.make<void>();
+    const releaseFirstRecovery = yield* Deferred.make<void>();
+    let issueCount = 0;
+    let recoveryStartCount = 0;
+    const codex = makeFakeCodexAdapter();
+    const baseStartSession = codex.startSession.getMockImplementation();
+    if (!baseStartSession) {
+      return yield* Effect.die("The fake Codex adapter must define startSession.");
+    }
+    codex.startSession.mockImplementation((input) =>
+      Effect.gen(function* () {
+        recoveryStartCount += 1;
+        if (recoveryStartCount === 1) {
+          yield* Deferred.succeed(firstRecoveryStarted, undefined);
+          yield* Deferred.await(releaseFirstRecovery);
+        }
+        return yield* baseStartSession(input);
+      }),
+    );
+    const registry = makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter });
+    const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+      Layer.provide(SqlitePersistenceMemory),
+    );
+    const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+    const providerServiceLayer = makeProviderServiceLive({
+      issueMcpCredential: (request) =>
+        Effect.sync(() => {
+          issueCount += 1;
+          const credential = makeTestMcpCredential(
+            request,
+            `recovery-provider-session-${issueCount}`,
+          );
+          McpProviderSession.setMcpProviderSession(credential.config);
+          return credential;
+        }),
+    }).pipe(
+      Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(directoryLayer),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+    const providerLayer = Layer.mergeAll(providerServiceLayer, directoryLayer);
+
+    const result = yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const sessionDirectory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      yield* sessionDirectory.upsert({
+        threadId,
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        status: "stopped",
+        resumeCursor: { opaque: "resume-concurrent-recovery" },
+        runtimeMode: "full-access",
+        runtimePayload: {},
+      });
+      McpProviderSession.setMcpProviderSession(
+        makeTestMcpCredential({
+          threadId,
+          providerInstanceId: codexInstanceId,
+          initiatingSessionId: providerServiceTestAuthorization.initiatingSessionId,
+        }).config,
+      );
+      const first = yield* provider
+        .interruptTurn({ threadId })
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Deferred.await(firstRecoveryStarted);
+      const second = yield* provider
+        .interruptTurn({ threadId })
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Effect.yieldNow;
+      const startsWhileFirstIsActive = recoveryStartCount;
+      const issuesWhileFirstIsActive = issueCount;
+      yield* Deferred.succeed(releaseFirstRecovery, undefined);
+      const firstResult = yield* Fiber.join(first);
+      const secondResult = yield* Fiber.join(second);
+      const binding = Option.getOrUndefined(yield* sessionDirectory.getBinding(threadId));
+      return {
+        first: firstResult,
+        second: secondResult,
+        startsWhileFirstIsActive,
+        issuesWhileFirstIsActive,
+        bindingStatus: binding?.status,
+        currentProviderSessionId:
+          McpProviderSession.readMcpProviderSession(threadId)?.providerSessionId,
+      };
+    }).pipe(Effect.provide(providerLayer));
+
+    assert.equal(result.startsWhileFirstIsActive, 1);
+    assert.equal(result.issuesWhileFirstIsActive, 1);
+    assert.equal(result.first._tag, "Success");
+    assert.equal(result.second._tag, "Success");
+    assert.equal(recoveryStartCount, 1);
+    assert.equal(issueCount, 1);
+    assert.equal(result.bindingStatus, "running");
+    assert.equal(result.currentProviderSessionId, "recovery-provider-session-1");
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
@@ -810,6 +1561,11 @@ it.effect(
 
       yield* Effect.gen(function* () {
         const provider = yield* ProviderService.ProviderService;
+        yield* provider.sendTurn({
+          threadId: startedSession.threadId,
+          input: "reauthorize after restart",
+          attachments: [],
+        });
         yield* provider.rollbackConversation({
           threadId: startedSession.threadId,
           numTurns: 1,

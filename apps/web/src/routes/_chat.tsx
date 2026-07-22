@@ -2,7 +2,7 @@ import { Outlet, createFileRoute, redirect } from "@tanstack/react-router";
 import { useAtomValue } from "@effect/atom-react";
 import { useEffect } from "react";
 
-import { isCommandPaletteOpen } from "../commandPaletteState";
+import { isCommandPaletteOpen, useOpenAddProjectCommandPalette } from "../commandPaletteState";
 import { dispatchPreviewAction } from "../components/preview/previewActionBus";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import {
@@ -18,9 +18,8 @@ import { selectActiveRightPanel, useRightPanelStore } from "../rightPanelStore";
 import { useThreadSelectionStore } from "../threadSelectionStore";
 import { stackedThreadToast, toastManager } from "~/components/ui/toast";
 import { primaryServerKeybindingsAtom } from "~/state/server";
-import { DESKTOP_DEVELOPMENT_PROFILE } from "~/branding";
 import { useEnterpriseModeStore } from "~/enterpriseModeStore";
-import { isQaApproverDesktopProfile } from "~/qa/qaRole";
+import { useQaGlobalAccess } from "~/qa/useQaGlobalAccess";
 
 function ChatRouteGlobalShortcuts() {
   const clearSelection = useThreadSelectionStore((state) => state.clearSelection);
@@ -29,7 +28,8 @@ function ChatRouteGlobalShortcuts() {
     useHandleNewThread();
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const isQaMode = useEnterpriseModeStore((state) => state.mode === "qa");
-  const isQaApproverUi = isQaMode && isQaApproverDesktopProfile(DESKTOP_DEVELOPMENT_PROFILE);
+  const qaGlobalAccess = useQaGlobalAccess();
+  const openQaProjectCreation = useOpenAddProjectCommandPalette();
   const terminalOpen = useTerminalUiStateStore((state) =>
     routeThreadRef
       ? selectThreadTerminalUiState(state.terminalUiStateByThreadKey, routeThreadRef).terminalOpen
@@ -68,7 +68,10 @@ function ChatRouteGlobalShortcuts() {
       if (command === "chat.newLocal") {
         event.preventDefault();
         event.stopPropagation();
-        if (isQaApproverUi) return;
+        if (isQaMode) {
+          if (qaGlobalAccess.canCreateProject) openQaProjectCreation();
+          return;
+        }
         void startNewLocalThreadFromContext({
           activeDraftThread,
           activeThread: activeThread ?? undefined,
@@ -81,7 +84,10 @@ function ChatRouteGlobalShortcuts() {
       if (command === "chat.new") {
         event.preventDefault();
         event.stopPropagation();
-        if (isQaApproverUi) return;
+        if (isQaMode) {
+          if (qaGlobalAccess.canCreateProject) openQaProjectCreation();
+          return;
+        }
         void startNewThreadFromContext({
           activeDraftThread,
           activeThread: activeThread ?? undefined,
@@ -144,10 +150,12 @@ function ChatRouteGlobalShortcuts() {
     activeThread,
     clearSelection,
     handleNewThread,
-    isQaApproverUi,
+    isQaMode,
     keybindings,
     defaultProjectRef,
     previewOpen,
+    openQaProjectCreation,
+    qaGlobalAccess.canCreateProject,
     routeThreadRef,
     selectedThreadKeysSize,
     terminalOpen,

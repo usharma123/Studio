@@ -46,6 +46,34 @@ const defaultWslInstance: DesktopBackendManager.DesktopBackendInstance = {
 };
 
 describe("getLocalEnvironmentBootstraps", () => {
+  it.effect("never exposes the primary reusable bootstrap credential to the renderer", () => {
+    const { runningDistro: _runningDistro, ...primaryConfig } = readyWslConfig;
+    const primaryInstance: DesktopBackendManager.DesktopBackendInstance = {
+      ...defaultWslInstance,
+      id: DesktopBackendManager.PRIMARY_INSTANCE_ID,
+      label: Effect.succeed("Shared QA backend"),
+      currentConfig: Effect.succeed(
+        Option.some({
+          ...primaryConfig,
+          httpBaseUrl: new URL("http://127.0.0.1:3773"),
+        }),
+      ),
+    };
+
+    return Effect.gen(function* () {
+      const result = yield* getLocalEnvironmentBootstraps.handler();
+      assert.deepEqual(result, [
+        {
+          id: "primary",
+          label: "Shared QA backend",
+          runningDistro: null,
+          httpBaseUrl: "http://127.0.0.1:3773/",
+          wsBaseUrl: "ws://127.0.0.1:3773/",
+        },
+      ]);
+    }).pipe(Effect.provide(DesktopBackendPool.layerTest([primaryInstance])));
+  });
+
   it.effect("publishes the concrete running distro without replacing the stable instance id", () =>
     Effect.gen(function* () {
       const result = yield* getLocalEnvironmentBootstraps.handler();

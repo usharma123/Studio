@@ -1,4 +1,5 @@
 import { assert, it } from "@effect/vitest";
+import { EnvironmentId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -7,11 +8,14 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as QaDatabase from "./QaDatabase.ts";
 import { QaIam, layer as QaIamLayer } from "./QaIam.ts";
+import { LEGACY_QA_ENVIRONMENT_ID } from "./QaIamMigrations.ts";
 
 const ORGANIZATION_ID = "test-org";
 const PROJECT_ID = "test-project";
 const RELEASE_THREAD_ID = "test-release";
 const NOW = "2026-07-14T00:00:00.000Z";
+const ENVIRONMENT_ID = EnvironmentId.make("test-environment");
+const OTHER_ENVIRONMENT_ID = EnvironmentId.make("other-test-environment");
 const decodeUnknownJsonString = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
 
 const setupIamSchema = Layer.effectDiscard(
@@ -75,10 +79,11 @@ const setupIamSchema = Layer.effectDiscard(
       CREATE TABLE qa_release_conversations (
         release_thread_id TEXT NOT NULL,
         principal_id TEXT NOT NULL,
+        environment_id TEXT NOT NULL,
         conversation_thread_id TEXT NOT NULL UNIQUE,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        PRIMARY KEY (release_thread_id, principal_id)
+        PRIMARY KEY (release_thread_id, principal_id, environment_id)
       )
     `;
     yield* sql`
@@ -278,30 +283,90 @@ layer("QaIam", (it) => {
     }),
   );
 
-  it.effect("keeps one durable release conversation per principal", () =>
+  it.effect("requires live maker capability when registering an existing project", () =>
+    Effect.gen(function* () {
+      const iam = yield* QaIam;
+
+      const denied = yield* iam
+        .registerProject({
+          subject: "test:approver",
+          projectId: PROJECT_ID,
+          projectName: "Ignored existing project name",
+        })
+        .pipe(Effect.flip);
+
+      assert.equal(denied.code, "capability_denied");
+    }),
+  );
+
+  it.effect("requires live maker capability before creating a new project", () =>
+    Effect.gen(function* () {
+      const iam = yield* QaIam;
+      const sql = yield* SqlClient.SqlClient;
+      const projectId = "approver-forbidden-project";
+
+      const denied = yield* iam
+        .registerProject({
+          subject: "test:approver",
+          projectId,
+          projectName: "Approver forbidden project",
+        })
+        .pipe(Effect.flip);
+
+      assert.equal(denied.code, "capability_denied");
+      const rows = yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count FROM qa_projects WHERE id = ${projectId}
+      `;
+      assert.equal(rows[0]?.count, 0);
+    }),
+  );
+
+  it.effect("keeps one durable release conversation per principal and environment", () =>
     Effect.gen(function* () {
       const iam = yield* QaIam;
       const makerBinding = yield* iam.bindReleaseConversation({
         subject: "test:maker",
         releaseThreadId: RELEASE_THREAD_ID,
         conversationThreadId: "conversation-maker",
+        environmentId: ENVIRONMENT_ID,
+      });
+      const makerOtherEnvironmentBinding = yield* iam.bindReleaseConversation({
+        subject: "test:maker",
+        releaseThreadId: RELEASE_THREAD_ID,
+        conversationThreadId: "conversation-maker-other-environment",
+        environmentId: OTHER_ENVIRONMENT_ID,
       });
       const approverBinding = yield* iam.bindReleaseConversation({
         subject: "test:approver",
         releaseThreadId: RELEASE_THREAD_ID,
         conversationThreadId: "conversation-approver",
+        environmentId: ENVIRONMENT_ID,
       });
       assert.equal(makerBinding.principalId, "principal-maker");
+      assert.equal(makerBinding.environmentId, ENVIRONMENT_ID);
+      assert.equal(makerOtherEnvironmentBinding.environmentId, OTHER_ENVIRONMENT_ID);
       assert.equal(approverBinding.principalId, "principal-approver");
 
-      const canonical = yield* iam.resolveConversationContext("conversation-maker");
+      const canonical = yield* iam.resolveConversationContext({
+        conversationThreadId: "conversation-maker",
+        environmentId: ENVIRONMENT_ID,
+      });
       assert.equal(canonical.releaseThreadId, RELEASE_THREAD_ID);
       assert.equal(canonical.principal.subject, "test:maker");
+
+      const otherEnvironmentDenied = yield* iam
+        .resolveConversationContext({
+          conversationThreadId: "conversation-maker",
+          environmentId: OTHER_ENVIRONMENT_ID,
+        })
+        .pipe(Effect.flip);
+      assert.equal(otherEnvironmentDenied.code, "conversation_access_denied");
 
       const denied = yield* iam
         .authorizeConversation({
           subject: "test:maker",
           conversationThreadId: "conversation-approver",
+          environmentId: ENVIRONMENT_ID,
           capability: "qa:chat",
         })
         .pipe(Effect.flip);
@@ -312,10 +377,73 @@ layer("QaIam", (it) => {
           subject: "test:maker",
           releaseThreadId: RELEASE_THREAD_ID,
           conversationThreadId: "conversation-maker-replacement",
+          environmentId: ENVIRONMENT_ID,
         })
         .pipe(Effect.flip);
       assert.equal(conflict.code, "conversation_conflict");
     }),
+  );
+
+  it.effect(
+    "preserves migrated legacy bindings without authorizing them in a live environment",
+    () =>
+      Effect.gen(function* () {
+        const iam = yield* QaIam;
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`
+        DELETE FROM qa_release_conversations
+        WHERE release_thread_id = ${RELEASE_THREAD_ID}
+          AND principal_id = 'principal-maker'
+      `;
+        yield* sql`
+        INSERT INTO qa_release_conversations (
+          release_thread_id, principal_id, environment_id, conversation_thread_id,
+          created_at, updated_at
+        ) VALUES (
+          ${RELEASE_THREAD_ID}, 'principal-maker', ${LEGACY_QA_ENVIRONMENT_ID},
+          'conversation-maker-legacy', ${NOW}, ${NOW}
+        )
+      `;
+
+        const current = yield* iam.bindReleaseConversation({
+          subject: "test:maker",
+          releaseThreadId: RELEASE_THREAD_ID,
+          conversationThreadId: "conversation-maker-current",
+          environmentId: ENVIRONMENT_ID,
+        });
+        assert.equal(current.environmentId, ENVIRONMENT_ID);
+
+        const rows = yield* sql<{
+          readonly conversationThreadId: string;
+          readonly environmentId: string;
+        }>`
+        SELECT
+          conversation_thread_id AS "conversationThreadId",
+          environment_id AS "environmentId"
+        FROM qa_release_conversations
+        WHERE release_thread_id = ${RELEASE_THREAD_ID}
+          AND principal_id = 'principal-maker'
+        ORDER BY environment_id
+      `;
+        assert.deepEqual(rows, [
+          {
+            conversationThreadId: "conversation-maker-legacy",
+            environmentId: LEGACY_QA_ENVIRONMENT_ID,
+          },
+          {
+            conversationThreadId: "conversation-maker-current",
+            environmentId: ENVIRONMENT_ID,
+          },
+        ]);
+
+        const legacyDenied = yield* iam
+          .resolveConversationContext({
+            conversationThreadId: "conversation-maker-legacy",
+            environmentId: ENVIRONMENT_ID,
+          })
+          .pipe(Effect.flip);
+        assert.equal(legacyDenied.code, "conversation_access_denied");
+      }),
   );
 
   it.effect("records actor and scoped release context in an audit event", () =>
@@ -326,12 +454,14 @@ layer("QaIam", (it) => {
         subject: "test:root",
         releaseThreadId: RELEASE_THREAD_ID,
         conversationThreadId: "conversation-root",
+        environmentId: ENVIRONMENT_ID,
       });
       const receipt = yield* iam.appendAuditEvent({
         subject: "test:root",
         projectId: PROJECT_ID,
         releaseThreadId: RELEASE_THREAD_ID,
         conversationThreadId: "conversation-root",
+        environmentId: ENVIRONMENT_ID,
         action: "release.opened",
         targetType: "release",
         targetId: RELEASE_THREAD_ID,

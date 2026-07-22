@@ -461,6 +461,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           runtimeMode: targetThread.runtimeMode,
           interactionMode: targetThread.interactionMode,
           ...(sourceProposedPlan !== undefined ? { sourceProposedPlan } : {}),
+          ...(command.initiatingSessionId !== undefined
+            ? { initiatingSessionId: command.initiatingSessionId }
+            : {}),
           createdAt: command.createdAt,
         },
       };

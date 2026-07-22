@@ -613,6 +613,51 @@ describe("EnvironmentSupervisor", () => {
     }).pipe(Effect.provide(TestClock.layer())),
   );
 
+  it.effect("reconnects every client after a shared backend restart", () =>
+    Effect.gen(function* () {
+      const harnesses = yield* Effect.all([makeHarness(), makeHarness(), makeHarness()]);
+      const supervisors = yield* Effect.all(
+        harnesses.map((harness) =>
+          EnvironmentSupervisor.make(TARGET_ENTRY, { initiallyDesired: true }).pipe(
+            Effect.provide(harness.dependencies),
+          ),
+        ),
+      );
+
+      yield* Effect.all(
+        supervisors.map((supervisor) =>
+          awaitState(supervisor.state, (state) => state.phase === "connected"),
+        ),
+        { concurrency: "unbounded" },
+      );
+      yield* Effect.all(
+        harnesses.map((harness) => harness.closeLatestSession()),
+        { concurrency: "unbounded" },
+      );
+      yield* Effect.all(
+        supervisors.map((supervisor) =>
+          awaitState(supervisor.state, (state) => state.phase === "backoff" && state.attempt === 1),
+        ),
+        { concurrency: "unbounded" },
+      );
+
+      yield* TestClock.adjust("1 second");
+      yield* Effect.all(
+        supervisors.map((supervisor) =>
+          awaitState(
+            supervisor.state,
+            (state) => state.phase === "connected" && state.generation === 2,
+          ),
+        ),
+        { concurrency: "unbounded" },
+      );
+
+      expect(yield* Effect.all(harnesses.map((harness) => Ref.get(harness.sessionCount)))).toEqual([
+        2, 2, 2,
+      ]);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
   it.effect("keeps escalating backoff when a newly opened session flaps", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();

@@ -56,6 +56,7 @@ import Migration0040 from "./Migrations/040_QaRequirementEvidence.ts";
 import Migration0041 from "./Migrations/041_QaTraceabilityDesignNodeIds.ts";
 import Migration0042 from "./Migrations/042_QaAuthoredFlows.ts";
 import Migration0043 from "./Migrations/043_QaApprovalReview.ts";
+import Migration0044 from "./Migrations/044_QaAgentGenerationOwnership.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -111,6 +112,7 @@ export const migrationEntries = [
   [41, "QaTraceabilityDesignNodeIds", Migration0041],
   [42, "QaAuthoredFlows", Migration0042],
   [43, "QaApprovalReview", Migration0043],
+  [44, "QaAgentGenerationOwnership", Migration0044],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

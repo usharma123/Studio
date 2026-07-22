@@ -12,23 +12,27 @@ import * as Schema from "effect/Schema";
 import {
   DesktopBackendBootstrap,
   type DesktopBackendBootstrap as DesktopBackendBootstrapValue,
+  type LegacyDesktopBackendBootstrap,
 } from "@t3tools/contracts";
 import * as NetService from "@t3tools/shared/Net";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import { BootstrapEnvelopeDecodeError } from "../bootstrap.ts";
 import { deriveServerPaths } from "../config.ts";
 import { resolveServerConfig } from "./config.ts";
 
 const encodeDesktopBootstrap = Schema.encodeEffect(Schema.fromJsonString(DesktopBackendBootstrap));
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 
 const makeDesktopBootstrap = (
-  overrides: Partial<DesktopBackendBootstrapValue> = {},
-): DesktopBackendBootstrapValue => ({
+  overrides: Partial<LegacyDesktopBackendBootstrap> = {},
+): LegacyDesktopBackendBootstrap => ({
   mode: "desktop",
   noBrowser: true,
   port: 4888,
   t3Home: "/tmp/t3-bootstrap-home",
   host: "127.0.0.1",
   desktopBootstrapToken: "desktop-bootstrap-token",
+  developmentProfile: "root",
   tailscaleServeEnabled: false,
   tailscaleServePort: 443,
   ...overrides,
@@ -55,6 +59,42 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
     const { fd } = yield* fs.open(filePath, { flag: "r" });
     return fd;
   });
+
+  const openRawBootstrapFd = Effect.fn(function* (payload: unknown) {
+    const fs = yield* FileSystem.FileSystem;
+    const filePath = yield* fs.makeTempFileScoped({ prefix: "t3-bootstrap-", suffix: ".ndjson" });
+    yield* fs.writeFileString(filePath, `${encodeUnknownJson(payload)}\n`);
+    const { fd } = yield* fs.open(filePath, { flag: "r" });
+    return fd;
+  });
+
+  const resolveBootstrapFd = (fd: number) =>
+    resolveServerConfig(
+      {
+        mode: Option.none(),
+        port: Option.none(),
+        host: Option.none(),
+        baseDir: Option.none(),
+        cwd: Option.none(),
+        devUrl: Option.none(),
+        noBrowser: Option.none(),
+        bootstrapFd: Option.none(),
+        autoBootstrapProjectFromCwd: Option.none(),
+        logWebSocketEvents: Option.none(),
+        tailscaleServeEnabled: Option.none(),
+        tailscaleServePort: Option.none(),
+      },
+      Option.none(),
+    ).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          ConfigProvider.layer(
+            ConfigProvider.fromEnv({ env: { T3CODE_BOOTSTRAP_FD: String(fd) } }),
+          ),
+          NetService.layer,
+        ),
+      ),
+    );
 
   it.effect("falls back to effect/config values when flags are omitted", () =>
     Effect.gen(function* () {
@@ -251,7 +291,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         noBrowser: false,
         startupPresentation: "browser",
         desktopBootstrapToken: "desktop-bootstrap-token",
-        desktopDevelopmentProfile: undefined,
+        desktopDevelopmentProfile: "root",
         autoBootstrapProjectFromCwd: false,
         logWebSocketEvents: false,
         tailscaleServeEnabled: false,
@@ -334,6 +374,84 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         tailscaleServePort: 443,
       });
       assert.equal(join(baseDir, "userdata"), resolved.stateDir);
+    }),
+  );
+
+  it.effect("resolves exact v2 desktop grants without a process-wide profile", () =>
+    Effect.gen(function* () {
+      const grants = [
+        { profile: "root", credential: "1".repeat(48) },
+        { profile: "qa:maker", credential: "2".repeat(48) },
+        { profile: "qa:approver", credential: "3".repeat(48) },
+      ] as const;
+      const fd = yield* openRawBootstrapFd({
+        mode: "desktop",
+        version: 2,
+        grants,
+        noBrowser: true,
+        port: 4_888,
+        t3Home: "/tmp/t3-bootstrap-v2-home",
+        host: "127.0.0.1",
+        tailscaleServeEnabled: false,
+        tailscaleServePort: 443,
+      });
+
+      const resolved = yield* resolveBootstrapFd(fd);
+
+      expect(resolved.desktopBootstrapGrants).toEqual(grants);
+      expect(resolved.desktopBootstrapToken).toBeUndefined();
+      expect(resolved.desktopDevelopmentProfile).toBeUndefined();
+    }),
+  );
+
+  it.effect("rejects missing legacy profiles and malformed v2 without downgrade", () =>
+    Effect.gen(function* () {
+      const malformedInputs = [
+        {
+          mode: "desktop",
+          noBrowser: true,
+          port: 4_888,
+          t3Home: "/tmp/t3-bootstrap-home",
+          host: "127.0.0.1",
+          desktopBootstrapToken: "legacy-root-token",
+          tailscaleServeEnabled: false,
+          tailscaleServePort: 443,
+        },
+        {
+          mode: "desktop",
+          version: 2,
+          grants: [{ profile: "qa:maker" }],
+          noBrowser: true,
+          port: 4_888,
+          t3Home: "/tmp/t3-bootstrap-home",
+          host: "127.0.0.1",
+          desktopBootstrapToken: "legacy-root-token",
+          developmentProfile: "root",
+          tailscaleServeEnabled: false,
+          tailscaleServePort: 443,
+        },
+        {
+          mode: "desktop",
+          version: 2,
+          grants: [
+            { profile: "root", credential: "1".repeat(48), subject: "attacker:root" },
+            { profile: "qa:maker", credential: "2".repeat(48) },
+            { profile: "qa:approver", credential: "3".repeat(48) },
+          ],
+          noBrowser: true,
+          port: 4_888,
+          t3Home: "/tmp/t3-bootstrap-home",
+          host: "127.0.0.1",
+          tailscaleServeEnabled: false,
+          tailscaleServePort: 443,
+        },
+      ];
+
+      for (const input of malformedInputs) {
+        const fd = yield* openRawBootstrapFd(input);
+        const error = yield* resolveBootstrapFd(fd).pipe(Effect.flip);
+        expect(error).toBeInstanceOf(BootstrapEnvelopeDecodeError);
+      }
     }),
   );
 
@@ -453,7 +571,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         noBrowser: true,
         startupPresentation: "browser",
         desktopBootstrapToken: "desktop-token",
-        desktopDevelopmentProfile: undefined,
+        desktopDevelopmentProfile: "root",
         autoBootstrapProjectFromCwd: true,
         logWebSocketEvents: true,
         tailscaleServeEnabled: false,

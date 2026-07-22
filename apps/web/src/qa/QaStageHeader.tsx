@@ -1,4 +1,5 @@
 import { Check, ChevronRight, CircleDot, LockKeyhole, ShieldCheck } from "lucide-react";
+import type { ReactNode } from "react";
 
 import { cn } from "~/lib/utils";
 
@@ -12,6 +13,7 @@ interface QaStageHeaderProps {
   readonly viewedStage: QaStageId;
   readonly stages: readonly QaResolvedStage[];
   readonly onViewStage: (stage: QaStageId) => void;
+  readonly action?: ReactNode;
 }
 
 function StageStatusIcon({ stage }: { stage: QaResolvedStage }) {
@@ -78,11 +80,14 @@ export function QaStageHeader(props: QaStageHeaderProps) {
             <h2 className="text-sm font-medium">{route.label}</h2>
             <p className="mt-0.5 text-[11px] text-muted-foreground">{route.description}</p>
           </div>
-          {!viewingHistory ? (
-            <span className="shrink-0 rounded-full bg-primary/10 px-2 py-1 text-[10px] font-medium text-primary">
-              Active stage
-            </span>
-          ) : null}
+          <div className="flex shrink-0 items-center gap-2">
+            {props.action}
+            {!viewingHistory ? (
+              <span className="rounded-full bg-primary/10 px-2 py-1 text-[10px] font-medium text-primary">
+                Active stage
+              </span>
+            ) : null}
+          </div>
         </div>
       </div>
     </header>

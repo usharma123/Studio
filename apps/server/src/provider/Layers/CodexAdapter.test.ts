@@ -5,7 +5,9 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import {
   ApprovalRequestId,
+  AuthSessionId,
   CodexSettings,
+  EnvironmentId,
   EventId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -35,6 +37,7 @@ import * as Stream from "effect/Stream";
 import * as CodexErrors from "effect-codex-app-server/errors";
 
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterValidationError } from "../Errors.ts";
 import type { CodexAdapterShape } from "../Services/CodexAdapter.ts";
@@ -45,7 +48,11 @@ import {
   type CodexSessionRuntimeShape,
   type CodexThreadSnapshot,
 } from "./CodexSessionRuntime.ts";
-import { makeCodexAdapter } from "./CodexAdapter.ts";
+import {
+  makeCodexAdapter,
+  QA_CODEX_APP_SERVER_ARGS,
+  shouldUseQaCodexPermissionProfile,
+} from "./CodexAdapter.ts";
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
 
 // Test-local service tag so the rest of the file can keep using `yield* CodexAdapter`.
@@ -243,6 +250,48 @@ const validationLayer = it.layer(
 );
 
 validationLayer("CodexAdapterLive validation", (it) => {
+  it("quarantines the process-wide QA profile fallback to legacy desktop bootstrap", () => {
+    const standardContext = {
+      initiatingSessionId: AuthSessionId.make("session-root-coding"),
+      environmentId: EnvironmentId.make("environment-shared-backend"),
+      threadId: asThreadId("thread-root-coding"),
+      providerSessionId: "provider-session-standard",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      endpoint: "http://127.0.0.1:43123/mcp",
+      authorizationHeader: "Bearer standard-token",
+      authorizationContext: {
+        kind: "standard" as const,
+        principalSubject: "local:root",
+        workspaceAdministrator: true,
+      },
+    };
+
+    NodeAssert.equal(
+      shouldUseQaCodexPermissionProfile({
+        mcpSession: standardContext,
+        serverConfig: {
+          desktopDevelopmentProfile: "qa:maker",
+          desktopBootstrapGrants: [
+            {
+              profile: "qa:maker",
+              credential: "a".repeat(48),
+            },
+          ],
+        },
+      }),
+      false,
+    );
+    NodeAssert.equal(
+      shouldUseQaCodexPermissionProfile({
+        mcpSession: standardContext,
+        serverConfig: {
+          desktopDevelopmentProfile: "qa:maker",
+        },
+      }),
+      true,
+    );
+  });
+
   it.effect("returns validation error for non-codex provider on startSession", () =>
     Effect.gen(function* () {
       const adapter = yield* CodexAdapter;
@@ -291,6 +340,87 @@ validationLayer("CodexAdapterLive validation", (it) => {
       });
     }),
   );
+
+  it.effect("selects the QA permission preset only for an explicitly bound QA session", () => {
+    const standardThreadId = asThreadId("thread-root-coding");
+    const qaThreadId = asThreadId("thread-root-qa-release");
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const environmentId = EnvironmentId.make("environment-shared-backend");
+
+    return Effect.gen(function* () {
+      validationRuntimeFactory.factory.mockClear();
+      McpProviderSession.setMcpProviderSession({
+        initiatingSessionId: AuthSessionId.make("session-root-coding"),
+        environmentId,
+        threadId: standardThreadId,
+        providerSessionId: "provider-session-standard",
+        providerInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer standard-token",
+        authorizationContext: {
+          kind: "standard",
+          principalSubject: "local:root",
+          workspaceAdministrator: true,
+        },
+      });
+      McpProviderSession.setMcpProviderSession({
+        initiatingSessionId: AuthSessionId.make("session-root-qa"),
+        environmentId,
+        threadId: qaThreadId,
+        providerSessionId: "provider-session-qa",
+        providerInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer qa-token",
+        authorizationContext: {
+          kind: "qa-release",
+          releaseThreadId: asThreadId("release-shared-backend"),
+          principalSubject: "local:root",
+          workspaceAdministrator: true,
+        },
+      });
+
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: standardThreadId,
+        providerInstanceId,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: qaThreadId,
+        providerInstanceId,
+        runtimeMode: "full-access",
+      });
+
+      const standardOptions = validationRuntimeFactory.factory.mock.calls[0]?.[0];
+      const qaOptions = validationRuntimeFactory.factory.mock.calls[1]?.[0];
+      NodeAssert.ok(standardOptions);
+      NodeAssert.ok(qaOptions);
+      NodeAssert.equal(standardOptions.runtimeMode, "full-access");
+      NodeAssert.equal(standardOptions.useConfiguredPermissionProfile, undefined);
+      NodeAssert.equal(
+        standardOptions.appServerArgs?.some((argument) => argument.includes("default_permissions")),
+        false,
+      );
+      NodeAssert.equal(standardOptions.environment?.T3_MCP_BEARER_TOKEN, "standard-token");
+
+      NodeAssert.equal(qaOptions.runtimeMode, "approval-required");
+      NodeAssert.equal(qaOptions.useConfiguredPermissionProfile, true);
+      NodeAssert.deepStrictEqual(
+        qaOptions.appServerArgs?.slice(0, QA_CODEX_APP_SERVER_ARGS.length),
+        QA_CODEX_APP_SERVER_ARGS,
+      );
+      NodeAssert.equal(qaOptions.environment?.T3_MCP_BEARER_TOKEN, "qa-token");
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          McpProviderSession.clearMcpProviderSession(standardThreadId);
+          McpProviderSession.clearMcpProviderSession(qaThreadId);
+        }),
+      ),
+    );
+  });
 });
 
 const sessionRuntimeFactory = makeRuntimeFactory();
@@ -452,6 +582,80 @@ function startLifecycleRuntime() {
 }
 
 lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
+  it.effect("keeps the provider session identity captured before its binding is replaced", () => {
+    const threadId = asThreadId("thread-provider-session-identity");
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const environmentId = EnvironmentId.make("environment-provider-session-identity");
+    const originalProviderSessionId = "provider-session-original";
+
+    return Effect.gen(function* () {
+      McpProviderSession.setMcpProviderSession({
+        initiatingSessionId: AuthSessionId.make("auth-session-original"),
+        environmentId,
+        threadId,
+        providerSessionId: originalProviderSessionId,
+        providerInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer original-token",
+        authorizationContext: {
+          kind: "standard",
+          principalSubject: "local:root",
+          workspaceAdministrator: true,
+        },
+      });
+
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const originalRuntime = lifecycleRuntimeFactory.lastRuntime;
+      NodeAssert.ok(originalRuntime);
+
+      McpProviderSession.setMcpProviderSession({
+        initiatingSessionId: AuthSessionId.make("auth-session-replacement"),
+        environmentId,
+        threadId,
+        providerSessionId: "provider-session-replacement",
+        providerInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer replacement-token",
+        authorizationContext: {
+          kind: "standard",
+          principalSubject: "local:root",
+          workspaceAdministrator: true,
+        },
+      });
+
+      const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      yield* originalRuntime.emit({
+        id: asEventId("evt-original-session-closed"),
+        kind: "session",
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "session/closed",
+        message: "Original session stopped",
+      });
+
+      const firstEvent = yield* Fiber.join(firstEventFiber);
+      NodeAssert.equal(firstEvent._tag, "Some");
+      if (firstEvent._tag !== "Some") {
+        return;
+      }
+      NodeAssert.equal(firstEvent.value.type, "session.exited");
+      NodeAssert.equal(firstEvent.value.providerSessionId, originalProviderSessionId);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          McpProviderSession.clearMcpProviderSession(threadId);
+        }),
+      ),
+    );
+  });
+
   it.effect("maps completed agent message items to canonical item.completed events", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();

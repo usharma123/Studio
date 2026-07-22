@@ -58,6 +58,13 @@ export class DesktopEnvironment extends Context.Service<
     readonly appUpdateYmlPath: string;
     readonly devServerUrl: Option.Option<URL>;
     readonly developmentProfile: Option.Option<DesktopDevelopmentProfile>;
+    readonly developmentUserDataPath: Option.Option<string>;
+    readonly attachedBackend: Option.Option<{
+      readonly httpBaseUrl: URL;
+      readonly expectedEnvironmentId: string;
+      readonly credential: string;
+      readonly profile: DesktopDevelopmentProfile;
+    }>;
     readonly devRemoteT3ServerEntryPath: Option.Option<string>;
     readonly configuredBackendPort: Option.Option<number>;
     readonly commitHashOverride: Option.Option<string>;
@@ -178,6 +185,11 @@ const make = Effect.fn("desktop.environment.make")(function* (
     : "codex-studio";
   const legacyUserDataDirName = isDevelopment ? "Codex Studio (Dev)" : "Codex Studio (Alpha)";
   const resourcesPath = input.resourcesPath;
+  const defaultBackendEntryPath = path.join(appRoot, "apps/server/dist/bin.mjs");
+  const backendEntryPath =
+    isDevelopment && Option.isSome(config.developmentBackendEntryPath)
+      ? path.resolve(config.developmentBackendEntryPath.value)
+      : defaultBackendEntryPath;
 
   return DesktopEnvironment.of({
     path,
@@ -201,7 +213,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
     browserArtifactsDir: path.join(stateDir, "browser-artifacts"),
     rootDir,
     appRoot,
-    backendEntryPath: path.join(appRoot, "apps/server/dist/bin.mjs"),
+    backendEntryPath,
     backendCwd: isPackaged ? homeDirectory : appRoot,
     preloadPath: path.join(input.dirname, "preload.cjs"),
     appUpdateYmlPath: isPackaged
@@ -209,6 +221,8 @@ const make = Effect.fn("desktop.environment.make")(function* (
       : path.join(input.appPath, "dev-app-update.yml"),
     devServerUrl,
     developmentProfile,
+    developmentUserDataPath: isDevelopment ? config.developmentUserDataPath : Option.none(),
+    attachedBackend: config.attachedBackend,
     devRemoteT3ServerEntryPath: config.devRemoteT3ServerEntryPath,
     configuredBackendPort: config.configuredBackendPort,
     commitHashOverride: config.commitHashOverride,

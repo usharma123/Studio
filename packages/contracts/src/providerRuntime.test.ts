@@ -23,6 +23,33 @@ describe("ProviderRuntimeEvent", () => {
     expect(parsed.providerInstanceId).toBe("ollama_local");
   });
 
+  it("decodes a non-empty provider session identity when supplied", () => {
+    const parsed = decodeRuntimeEvent({
+      type: "session.exited",
+      eventId: "event-provider-session-identity",
+      provider: "codex",
+      providerSessionId: "provider-session-old",
+      createdAt: "2026-02-28T00:00:00.000Z",
+      threadId: "thread-1",
+      payload: {
+        exitKind: "graceful",
+      },
+    });
+
+    expect(parsed.providerSessionId).toBe("provider-session-old");
+    expect(() =>
+      decodeRuntimeEvent({
+        type: "session.exited",
+        eventId: "event-provider-session-empty",
+        provider: "codex",
+        providerSessionId: "   ",
+        createdAt: "2026-02-28T00:00:00.000Z",
+        threadId: "thread-1",
+        payload: {},
+      }),
+    ).toThrow();
+  });
+
   it("decodes turn.plan.updated for plan rendering", () => {
     const parsed = decodeRuntimeEvent({
       type: "turn.plan.updated",

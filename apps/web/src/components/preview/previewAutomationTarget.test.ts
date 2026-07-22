@@ -52,8 +52,28 @@ describe("preview automation target selection", () => {
       sessions: { [uiActive.tabId]: uiActive, [agentTab.tabId]: agentTab },
     };
 
-    expect(resolvePreviewAutomationOpenTab(state, agentTab.tabId, true)).toBe(agentTab.tabId);
-    expect(resolvePreviewAutomationOpenTab(state, undefined, true)).toBe(uiActive.tabId);
-    expect(resolvePreviewAutomationOpenTab(state, agentTab.tabId, false)).toBeNull();
+    expect(resolvePreviewAutomationOpenTab(state, agentTab.tabId, true)).toEqual({
+      tabId: agentTab.tabId,
+      explicitTargetMissing: false,
+    });
+    expect(resolvePreviewAutomationOpenTab(state, undefined, true)).toEqual({
+      tabId: uiActive.tabId,
+      explicitTargetMissing: false,
+    });
+    expect(resolvePreviewAutomationOpenTab(state, agentTab.tabId, false)).toEqual({
+      tabId: null,
+      explicitTargetMissing: false,
+    });
+  });
+
+  it("fails closed when an explicit open target is absent from the authorized session list", () => {
+    const active = snapshot("tab-active");
+    expect(
+      resolvePreviewAutomationOpenTab(
+        { snapshot: active, sessions: { [active.tabId]: active } },
+        "tab-foreign",
+        true,
+      ),
+    ).toEqual({ tabId: null, explicitTargetMissing: true });
   });
 });

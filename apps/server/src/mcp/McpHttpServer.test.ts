@@ -11,6 +11,7 @@ import { HttpBody, HttpClient, HttpRouter, HttpServerResponse } from "effect/uns
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
+import * as QaIam from "../qa/QaIam.ts";
 
 const environmentId = EnvironmentId.make("environment-mcp-test");
 const threadId = ThreadId.make("thread-mcp-test");
@@ -22,9 +23,17 @@ const invocation = {
   providerSessionId: "provider-session-mcp-test",
   providerInstanceId: ProviderInstanceId.make("codex"),
   capabilities: new Set(["preview"] as const),
+  principalSubject: "local:root",
+  workspaceAdministrator: true,
   issuedAt: 1,
   expiresAt: Number.MAX_SAFE_INTEGER,
 };
+const previewIdentity = {
+  subject: "local:root",
+  sessionId: "session-mcp-test",
+  environmentId,
+  workspaceAdministrator: true,
+} as const;
 const client = McpSchema.McpServerClient.of({
   clientId: 1,
   initializePayload: {
@@ -36,7 +45,12 @@ const client = McpSchema.McpServerClient.of({
 });
 const TestLayer = McpHttpServer.PreviewToolkitRegistrationLive.pipe(
   Layer.provideMerge(McpServer.McpServer.layer),
-  Layer.provideMerge(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
+  Layer.provideMerge(
+    PreviewAutomationBroker.layer.pipe(
+      Layer.provide(Layer.succeed(QaIam.QaIam, {} as QaIam.QaIam["Service"])),
+      Layer.provide(NodeServices.layer),
+    ),
+  ),
 );
 
 it("normalizes empty successful notification responses to accepted", () => {
@@ -56,24 +70,30 @@ it.effect("returns bounded structural preview snapshot failures", () =>
     Effect.gen(function* () {
       const server = yield* McpServer.McpServer;
       const broker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
-      const events = yield* broker.connect({
-        clientId: "mcp-failure-client",
-        environmentId,
-      });
+      const events = yield* broker.connect(
+        {
+          clientId: "mcp-failure-client",
+          environmentId,
+        },
+        previewIdentity,
+      );
       yield* Stream.runForEach(events, (event) =>
         event.type === "connected"
           ? Effect.void
-          : broker.respond({
-              clientId: "mcp-failure-client",
-              connectionId: event.connectionId,
-              requestId: event.request.requestId,
-              ok: false,
-              error: {
-                _tag: "PreviewAutomationExecutionError",
-                message: "sensitive renderer failure",
-                detail: { consoleOutput: "sensitive browser output" },
+          : broker.respond(
+              {
+                clientId: "mcp-failure-client",
+                connectionId: event.connectionId,
+                requestId: event.request.requestId,
+                ok: false,
+                error: {
+                  _tag: "PreviewAutomationExecutionError",
+                  message: "sensitive renderer failure",
+                  detail: { consoleOutput: "sensitive browser output" },
+                },
               },
-            }),
+              previewIdentity,
+            ),
       ).pipe(Effect.forkScoped);
       yield* Effect.yieldNow;
 
@@ -159,48 +179,54 @@ it.effect("registers annotated tools and preserves authenticated request context
         readonly operation: string;
         readonly tabId?: string | undefined;
       }> = [];
-      const events = yield* broker.connect({
-        clientId: "mcp-test-client",
-        environmentId,
-      });
+      const events = yield* broker.connect(
+        {
+          clientId: "mcp-test-client",
+          environmentId,
+        },
+        previewIdentity,
+      );
       yield* Stream.runForEach(events, (event) => {
         if (event.type === "connected") return Effect.void;
         routedRequests.push(event.request);
-        return broker.respond({
-          clientId: "mcp-test-client",
-          connectionId: event.connectionId,
-          requestId: event.request.requestId,
-          ok: true,
-          result:
-            event.request.operation === "snapshot"
-              ? {
-                  url: "http://example.test/",
-                  title: "Example",
-                  loading: false,
-                  visibleText: "Example",
-                  interactiveElements: [],
-                  accessibilityTree: {},
-                  consoleEntries: [],
-                  networkEntries: [],
-                  actionTimeline: [],
-                  screenshot: {
-                    mimeType: "image/png",
-                    data: Buffer.from("png").toString("base64"),
-                    width: 10,
-                    height: 5,
-                  },
-                }
-              : event.request.operation === "press"
-                ? undefined
-                : {
-                    available: true,
-                    visible: true,
-                    tabId,
+        return broker.respond(
+          {
+            clientId: "mcp-test-client",
+            connectionId: event.connectionId,
+            requestId: event.request.requestId,
+            ok: true,
+            result:
+              event.request.operation === "snapshot"
+                ? {
                     url: "http://example.test/",
                     title: "Example",
                     loading: false,
-                  },
-        });
+                    visibleText: "Example",
+                    interactiveElements: [],
+                    accessibilityTree: {},
+                    consoleEntries: [],
+                    networkEntries: [],
+                    actionTimeline: [],
+                    screenshot: {
+                      mimeType: "image/png",
+                      data: Buffer.from("png").toString("base64"),
+                      width: 10,
+                      height: 5,
+                    },
+                  }
+                : event.request.operation === "press"
+                  ? undefined
+                  : {
+                      available: true,
+                      visible: true,
+                      tabId,
+                      url: "http://example.test/",
+                      title: "Example",
+                      loading: false,
+                    },
+          },
+          previewIdentity,
+        );
       }).pipe(Effect.forkScoped);
       yield* Effect.yieldNow;
 

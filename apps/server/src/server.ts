@@ -25,6 +25,8 @@ import * as QaWorkflow from "./qa/QaWorkflow.ts";
 import * as QaDashboardQuery from "./qa/QaDashboardQuery.ts";
 import * as QaReviewService from "./qa/QaReviewService.ts";
 import * as QaReviewAiWorker from "./qa/QaReviewAiWorker.ts";
+import * as QaLocalRuntime from "./qa/QaLocalRuntime.ts";
+import * as QaStageGenerationReconciler from "./qa/QaStageGenerationReconciler.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import { ProviderSessionDirectoryLive } from "./provider/Layers/ProviderSessionDirectory.ts";
 import * as ProviderSessionRuntime from "./persistence/ProviderSessionRuntime.ts";
@@ -167,6 +169,7 @@ const PlatformServicesLive = Layer.unwrap(
 
 const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(QaReviewAiWorker.layer),
+  Layer.provideMerge(QaStageGenerationReconciler.layer),
   Layer.provideMerge(OrchestrationReactorLive),
   Layer.provideMerge(ProviderRuntimeIngestionLive),
   Layer.provideMerge(ProviderCommandReactorLive),
@@ -308,7 +311,7 @@ const RuntimeCoreInfrastructureLive = ReactorLayerLive.pipe(
   Layer.provideMerge(ProviderRuntimeLayerLive),
   Layer.provideMerge(Layer.mergeAll(TerminalLayerLive, PreviewLayerLive)),
   Layer.provideMerge(PersistenceLayerLive),
-  Layer.provideMerge(QaReleaseEventBus.layer),
+  Layer.provideMerge(QaReleaseEventBus.layerPostgres.pipe(Layer.provide(QaDatabase.postgresLayer))),
   Layer.provideMerge(Keybindings.layer),
   Layer.provideMerge(ProviderRegistryLive),
   // The instance registry is the new routing keystone — text generation,
@@ -363,12 +366,19 @@ const RuntimeServicesLive = ServerRuntimeStartup.layer.pipe(
   Layer.provideMerge(RuntimeDependenciesLive),
 );
 
+const QaLocalRuntimeLive = QaLocalRuntime.layer.pipe(
+  Layer.provide(RuntimeServicesLive),
+  Layer.provide(QaIam.layer.pipe(Layer.provide(QaDatabase.layer))),
+);
+
+const RuntimeServicesWithQaLive = Layer.mergeAll(RuntimeServicesLive, QaLocalRuntimeLive);
+
 export const makeRoutesLayer = Layer.mergeAll(
   Layer.mergeAll(
     HttpApiBuilder.layer(EnvironmentHttpApi).pipe(
       Layer.provide(authHttpApiLayer),
       Layer.provide(connectHttpApiLayer),
-      Layer.provide(orchestrationHttpApiLayer.pipe(Layer.provide(QaIam.layer))),
+      Layer.provide(orchestrationHttpApiLayer),
       Layer.provide(serverEnvironmentHttpApiLayer),
       Layer.provide(environmentAuthenticatedAuthLayer),
     ),
@@ -500,7 +510,8 @@ export const makeServerLayer = Layer.unwrap(
     );
 
     return serverApplicationLayer.pipe(
-      Layer.provideMerge(RuntimeServicesLive),
+      Layer.provideMerge(RuntimeServicesWithQaLive),
+      Layer.provideMerge(QaIam.layer.pipe(Layer.provide(QaDatabase.layer))),
       Layer.provideMerge(serverRelayBrokerTracingLayer),
       Layer.provideMerge(HttpServerLive),
       Layer.provide(ObservabilityLive),

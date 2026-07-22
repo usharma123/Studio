@@ -26,10 +26,13 @@ layer("QaDashboardQuery", (it) => {
       yield* sql`CREATE TABLE qa_project_assignments (organization_id TEXT NOT NULL, project_id TEXT NOT NULL, principal_id TEXT NOT NULL, role TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(project_id, principal_id))`;
 
       yield* sql`INSERT INTO application_principals VALUES ('approver', 'test:approver', 'Approver', 'user', 'active', ${timestamp}, ${timestamp})`;
+      yield* sql`INSERT INTO application_principals VALUES ('root', 'test:root', 'Root', 'user', 'active', ${timestamp}, ${timestamp})`;
       yield* sql`INSERT INTO organizations VALUES ('org', 'Organization', 'active', ${timestamp}, ${timestamp})`;
       yield* sql`INSERT INTO organization_memberships VALUES ('org', 'approver', 'active', ${timestamp}, ${timestamp})`;
+      yield* sql`INSERT INTO organization_memberships VALUES ('org', 'root', 'active', ${timestamp}, ${timestamp})`;
       yield* sql`INSERT INTO qa_projects VALUES ('project', 'org', 'project', 'QA Project', 'active', NULL, ${timestamp}, ${timestamp})`;
       yield* sql`INSERT INTO qa_project_assignments VALUES ('org', 'project', 'approver', 'qa:approver', ${timestamp}, ${timestamp})`;
+      yield* sql`INSERT INTO qa_project_assignments VALUES ('org', 'project', 'root', 'root', ${timestamp}, ${timestamp})`;
 
       const releases = [
         {
@@ -39,10 +42,17 @@ layer("QaDashboardQuery", (it) => {
           activeStage: "strategy",
           updated: timestamp,
         },
-        { id: "changes", number: 2, status: "active", activeStage: "strategy", updated: timestamp },
+        {
+          id: "requirements",
+          number: 2,
+          status: "active",
+          activeStage: "requirements",
+          updated: timestamp,
+        },
+        { id: "changes", number: 3, status: "active", activeStage: "strategy", updated: timestamp },
         {
           id: "completed",
-          number: 3,
+          number: 4,
           status: "closed",
           activeStage: "readiness",
           updated: "2026-07-01T12:00:00.000Z",
@@ -63,12 +73,20 @@ layer("QaDashboardQuery", (it) => {
             thread_id, stage, ordinal, status, progress, active_job_id, blocked_reason, updated_at
           ) VALUES (
             ${release.id}, ${release.activeStage},
-            ${release.activeStage === "strategy" ? 3 : 7},
+            ${release.activeStage === "requirements" ? 2 : release.activeStage === "strategy" ? 3 : 7},
             ${release.status === "closed" ? "complete" : "awaiting_review"},
             100, NULL, NULL, ${release.updated}
           )
         `;
       }
+      yield* sql`
+        INSERT INTO qa_approval_gates (
+          id, thread_id, kind, title, description, status, decision_note, created_at, updated_at
+        ) VALUES (
+          'requirements-gate', 'requirements', 'requirements_review', 'Requirements approval',
+          'Approve the requirements baseline.', 'pending', NULL, ${timestamp}, ${timestamp}
+        )
+      `;
       for (const [threadId, reviewStatus] of [
         ["awaiting", "pending_review"],
         ["changes", "rejected"],
@@ -111,7 +129,7 @@ layer("QaDashboardQuery", (it) => {
         subject: "test:approver",
         completedSince: "2026-06-15T00:00:00.000Z",
       });
-      assert.equal(result.awaitingReviewCount, 1);
+      assert.equal(result.awaitingReviewCount, 2);
       assert.equal(
         result.releases.find((release) => release.threadId === "awaiting")?.bucket,
         "awaiting_review",
@@ -127,6 +145,14 @@ layer("QaDashboardQuery", (it) => {
         1,
       );
       assert.equal(
+        result.releases.find((release) => release.threadId === "requirements")?.status,
+        "ready_for_review",
+      );
+      assert.equal(
+        result.releases.find((release) => release.threadId === "requirements")?.bucket,
+        "awaiting_review",
+      );
+      assert.equal(
         result.releases.find((release) => release.threadId === "changes")?.status,
         "changes_requested",
       );
@@ -134,6 +160,19 @@ layer("QaDashboardQuery", (it) => {
         result.releases.find((release) => release.threadId === "completed")?.bucket,
         "completed",
       );
+
+      const rootResult = yield* dashboard.listAssignedReleases({
+        subject: "test:root",
+        completedSince: "2026-06-15T00:00:00.000Z",
+      });
+      const rootRequirements = rootResult.releases.find(
+        (release) => release.threadId === "requirements",
+      );
+      assert.equal(rootResult.awaitingReviewCount, 2);
+      assert.equal(rootRequirements?.releaseId, "requirements");
+      assert.equal(rootRequirements?.activeStage, "requirements");
+      assert.equal(rootRequirements?.role, "root");
+      assert.equal(rootRequirements?.uiRole, "approver");
     }),
   );
 });

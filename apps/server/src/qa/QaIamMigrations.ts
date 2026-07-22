@@ -3,7 +3,12 @@ import type * as SqlClient from "effect/unstable/sql/SqlClient";
 
 const IAM_MIGRATION_VERSION = 2026071401;
 const IAM_MIGRATION_NAME = "qa_iam_project_authorization";
-const IAM_MIGRATION_LOCK_KEY = 1_940_718_351;
+const RELEASE_CONVERSATION_ENVIRONMENT_MIGRATION_VERSION = 2026071601;
+const RELEASE_CONVERSATION_ENVIRONMENT_MIGRATION_NAME =
+  "qa_release_conversations_environment_scope";
+
+/** Existing bindings are retained but isolated until a new environment-scoped binding is made. */
+export const LEGACY_QA_ENVIRONMENT_ID = "legacy:unscoped";
 
 export const LOCAL_REPRO_ORGANIZATION_ID = "local-repro-org";
 export const LOCAL_REPRO_PROJECT_ID = "0d847684-ce8e-438c-894f-76b9f7ef80fb";
@@ -105,10 +110,11 @@ const applyIamMigration = Effect.fn("QaIamMigrations.applyIamMigration")(functio
     CREATE TABLE IF NOT EXISTS qa_release_conversations (
       release_thread_id TEXT NOT NULL REFERENCES qa_releases(thread_id) ON DELETE CASCADE,
       principal_id TEXT NOT NULL REFERENCES application_principals(id) ON DELETE CASCADE,
+      environment_id TEXT NOT NULL DEFAULT 'legacy:unscoped',
       conversation_thread_id TEXT NOT NULL UNIQUE,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
-      PRIMARY KEY (release_thread_id, principal_id)
+      PRIMARY KEY (release_thread_id, principal_id, environment_id)
     )
   `;
 
@@ -250,14 +256,41 @@ const applyIamMigration = Effect.fn("QaIamMigrations.applyIamMigration")(functio
   yield* sql`ALTER TABLE qa_releases VALIDATE CONSTRAINT qa_releases_project_id_fkey`;
 });
 
-/**
- * Applies additive IAM migrations under a PostgreSQL advisory transaction lock.
- * The migration ledger makes repeated and concurrent desktop/server starts safe.
- */
-export const migrateQaIamDatabase = Effect.fn("QaIamMigrations.migrate")(function* (
-  sql: SqlClient.SqlClient,
-) {
+const applyReleaseConversationEnvironmentMigration = Effect.fn(
+  "QaIamMigrations.applyReleaseConversationEnvironmentMigration",
+)(function* (sql: SqlClient.SqlClient) {
   yield* sql`
+    ALTER TABLE qa_release_conversations
+    ADD COLUMN IF NOT EXISTS environment_id TEXT
+  `;
+  yield* sql`
+    UPDATE qa_release_conversations
+    SET environment_id = ${LEGACY_QA_ENVIRONMENT_ID}
+    WHERE environment_id IS NULL
+  `;
+  yield* sql`
+    ALTER TABLE qa_release_conversations
+    ALTER COLUMN environment_id SET NOT NULL
+  `;
+  yield* sql`
+    ALTER TABLE qa_release_conversations
+    ALTER COLUMN environment_id SET DEFAULT 'legacy:unscoped'
+  `;
+  yield* sql`
+    ALTER TABLE qa_release_conversations
+    DROP CONSTRAINT IF EXISTS qa_release_conversations_pkey
+  `;
+  yield* sql`
+    ALTER TABLE qa_release_conversations
+    ADD CONSTRAINT qa_release_conversations_pkey
+    PRIMARY KEY (release_thread_id, principal_id, environment_id)
+  `;
+});
+
+/** Applies ledgered IAM migrations inside the caller's QA migration lock and transaction. */
+export const migrateQaIamDatabaseUnderLock = Effect.fn("QaIamMigrations.migrateUnderLock")(
+  function* (sql: SqlClient.SqlClient) {
+    yield* sql`
     CREATE TABLE IF NOT EXISTS qa_postgres_migrations (
       version INTEGER PRIMARY KEY,
       name TEXT NOT NULL UNIQUE,
@@ -265,21 +298,34 @@ export const migrateQaIamDatabase = Effect.fn("QaIamMigrations.migrate")(functio
     )
   `;
 
-  yield* sql.withTransaction(
-    Effect.gen(function* () {
-      yield* sql`SELECT pg_advisory_xact_lock(${IAM_MIGRATION_LOCK_KEY})`;
-      const applied = yield* sql<{ readonly version: number }>`
-        SELECT version
-        FROM qa_postgres_migrations
-        WHERE version = ${IAM_MIGRATION_VERSION}
-      `;
-      if (applied.length > 0) return;
+    const applied = yield* sql<{ readonly version: number }>`
+    SELECT version
+    FROM qa_postgres_migrations
+    WHERE version IN (
+      ${IAM_MIGRATION_VERSION},
+      ${RELEASE_CONVERSATION_ENVIRONMENT_MIGRATION_VERSION}
+    )
+  `;
+    const appliedVersions = new Set(applied.map((migration) => migration.version));
 
+    if (!appliedVersions.has(IAM_MIGRATION_VERSION)) {
       yield* applyIamMigration(sql);
       yield* sql`
-        INSERT INTO qa_postgres_migrations (version, name, applied_at)
-        VALUES (${IAM_MIGRATION_VERSION}, ${IAM_MIGRATION_NAME}, CURRENT_TIMESTAMP)
-      `;
-    }),
-  );
-});
+      INSERT INTO qa_postgres_migrations (version, name, applied_at)
+      VALUES (${IAM_MIGRATION_VERSION}, ${IAM_MIGRATION_NAME}, CURRENT_TIMESTAMP)
+    `;
+    }
+
+    if (!appliedVersions.has(RELEASE_CONVERSATION_ENVIRONMENT_MIGRATION_VERSION)) {
+      yield* applyReleaseConversationEnvironmentMigration(sql);
+      yield* sql`
+      INSERT INTO qa_postgres_migrations (version, name, applied_at)
+      VALUES (
+        ${RELEASE_CONVERSATION_ENVIRONMENT_MIGRATION_VERSION},
+        ${RELEASE_CONVERSATION_ENVIRONMENT_MIGRATION_NAME},
+        CURRENT_TIMESTAMP
+      )
+    `;
+    }
+  },
+);
